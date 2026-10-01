@@ -408,6 +408,14 @@ pub fn adapt_rrf_k(query: &str) -> (f64, f64) {
 /// Search the codebase
 pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) -> Result<()> {
     let (db_path, project_path) = get_db_path(path.clone())?;
+    let requested_model = options
+        .model_override
+        .as_deref()
+        .map(|name| {
+            ModelType::parse(name)
+                .ok_or_else(|| anyhow::anyhow!("Unknown embedding model override '{name}'"))
+        })
+        .transpose()?;
 
     if !db_path.exists() {
         if options.create_index {
@@ -417,7 +425,8 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
                 "🚀 No index found, creating one...".bright_cyan()
             ));
             let cancel_token = tokio_util::sync::CancellationToken::new();
-            crate::index::index_quiet(path, false, false, cancel_token).await?;
+            crate::index::index_quiet_with_model(path, false, false, requested_model, cancel_token)
+                .await?;
             crate::output::print_info(format_args!("{}", "✅ Index created successfully!".green()));
         } else {
             println!("{}", "❌ No database found!".red());
@@ -437,21 +446,35 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
 
     // Read model metadata from database FIRST (needed for sync)
     let (model_type, dimensions, primary_language) =
-        if let Some(ref model_name) = options.model_override {
-            // User specified a model - use it (warning: may not match indexed data!)
-            let mt = ModelType::parse(model_name).unwrap_or_else(|| {
-                tracing::warn!(
-                    "Unrecognized model override '{}', falling back to default model",
-                    model_name
-                );
-                ModelType::default()
-            });
-            (mt, mt.dimensions(), None)
-        } else if let Some((model_name, dims, lang)) = read_metadata(&db_path) {
+        if let Some((model_name, dims, lang)) = read_metadata(&db_path) {
             // Use model from metadata
             if let Some(mt) = ModelType::parse(&model_name) {
+                if let Some(requested) = requested_model {
+                    if requested != mt {
+                        anyhow::bail!(
+                            "Index uses embedding model '{}', but '--model {}' was requested. \
+                             Rebuild the index with `codesearch --model {} index {} --force` \
+                             before searching.",
+                            mt.short_name(),
+                            requested.short_name(),
+                            requested.short_name(),
+                            project_path.display()
+                        );
+                    }
+                }
                 (mt, dims, lang)
             } else {
+                if let Some(requested) = requested_model {
+                    anyhow::bail!(
+                        "Index metadata names unknown embedding model '{}', so '--model {}' \
+                         cannot be verified. Rebuild the index with \
+                         `codesearch --model {} index {} --force`.",
+                        model_name,
+                        requested.short_name(),
+                        requested.short_name(),
+                        project_path.display()
+                    );
+                }
                 // Model name not recognized, fall back to default
                 tracing::warn!(
                     "Unrecognized model '{}' in database metadata, falling back to default model",
@@ -463,6 +486,14 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
                 );
                 (ModelType::default(), 384, None)
             }
+        } else if let Some(requested) = requested_model {
+            anyhow::bail!(
+                "Cannot verify '--model {}' because the index metadata is missing or invalid. \
+                 Rebuild the index with `codesearch --model {} index {} --force`.",
+                requested.short_name(),
+                requested.short_name(),
+                project_path.display()
+            );
         } else {
             // No metadata, fall back to default
             (ModelType::default(), 384, None)
@@ -962,7 +993,7 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
         let mut seen_files = std::collections::HashSet::new();
         for result in &results {
             if !seen_files.contains(&result.path) {
-                println!("{}", result.path);
+                println!("{}", sanitize_for_terminal(&result.path));
                 seen_files.insert(result.path.clone());
             }
         }
@@ -972,7 +1003,10 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
     // Standard output
     println!("{}", "🔍 Search Results".bright_cyan().bold());
     println!("{}", "=".repeat(60));
-    println!("Query: \"{}\"", query.bright_yellow());
+    println!(
+        "Query: \"{}\"",
+        sanitize_for_terminal(query).bright_yellow()
+    );
     if let Some(pf) = options.per_file {
         println!(
             "Found {} results (showing up to {} per file)",
@@ -1072,6 +1106,13 @@ fn sync_database(db_path: &Path, model_type: ModelType) -> Result<()> {
     // Load file metadata store
     let mut file_meta =
         FileMetaStore::load_or_create(db_path, model_type.short_name(), model_type.dimensions())?;
+    if !file_meta.is_empty() {
+        let mut vs = VectorStore::new(db_path, model_type.dimensions())?;
+        let mut fts = FtsStore::new_with_writer(db_path)?;
+        if crate::index::repair_legacy_index(project_path, &mut file_meta, &mut vs, &mut fts)? {
+            file_meta.save(db_path)?;
+        }
+    }
 
     // Walk the file system
     let walker = FileWalker::new(project_path.to_path_buf());
@@ -1087,14 +1128,18 @@ fn sync_database(db_path: &Path, model_type: ModelType) -> Result<()> {
 
     // Check for changed files
     for file in &files {
-        let (needs_reindex, old_chunk_ids) = file_meta.check_file(&file.path)?;
+        let key = crate::cache::storage_key(&file.path, project_path);
+        let (needs_reindex, old_chunk_ids) = file_meta.check_file(&file.path, &key)?;
 
         if !needs_reindex {
             continue;
         }
 
         changes += 1;
-        println!("  📝 {}", file.path.display());
+        println!(
+            "  📝 {}",
+            sanitize_for_terminal(&file.path.display().to_string())
+        );
 
         // Delete old chunks
         if !old_chunk_ids.is_empty() {
@@ -1107,28 +1152,29 @@ fn sync_database(db_path: &Path, model_type: ModelType) -> Result<()> {
             Err(_) => continue,
         };
 
-        let chunks = chunker.chunk_semantic(file.language, &file.path, &source_code)?;
+        let rel = std::path::PathBuf::from(key.clone());
+        let chunks = chunker.chunk_semantic(file.language, &rel, &source_code)?;
 
         if chunks.is_empty() {
-            file_meta.update_file(&file.path, vec![])?;
+            file_meta.update_file(&file.path, &key, vec![])?;
             continue;
         }
 
         // Embed and insert
         let embedded_chunks = embedding_service.embed_chunks(chunks)?;
         let chunk_ids = store.insert_chunks_with_ids(embedded_chunks)?;
-        file_meta.update_file(&file.path, chunk_ids)?;
+        file_meta.update_file(&file.path, &key, chunk_ids)?;
     }
 
     // Check for deleted files
-    let deleted_files = file_meta.find_deleted_files();
+    let deleted_files = file_meta.find_deleted_files(project_path);
     for (path, chunk_ids) in &deleted_files {
         changes += 1;
-        println!("  🗑️  {} (deleted)", path);
+        println!("  🗑️  {} (deleted)", sanitize_for_terminal(path));
         if !chunk_ids.is_empty() {
             store.delete_chunks(chunk_ids)?;
         }
-        file_meta.remove_file(std::path::Path::new(path));
+        file_meta.remove_file(path);
     }
 
     // Rebuild index if changes were made
@@ -1144,6 +1190,77 @@ fn sync_database(db_path: &Path, model_type: ModelType) -> Result<()> {
     Ok(())
 }
 
+/// Strip ANSI escape sequences and terminal-control bytes from a string.
+///
+/// Indexed content may contain CSI/OSC sequences (e.g. `\x1b[2J` clears the
+/// screen, `\x1b[8m` hides text, `\x1b]0;...\x07` rewrites the window title).
+/// If printed verbatim, the host terminal interprets them — enabling a range
+/// of attacks from screen-clearing DoS to hidden-text obfuscation. This
+/// helper strips:
+///   * CSI sequences: `ESC [ <params 0x30-0x3F> <intermediate 0x20-0x2F> <final 0x40-0x7E>`
+///   * OSC sequences: `ESC ] <data> (BEL | ESC \\)`
+///   * Single-char escape sequences: `ESC <0x40-0x5F>`
+///   * Stray control characters except `\n` and `\t`
+///
+/// Output is safe to feed into `Colorize` methods without risk of the inner
+/// content breaking out of the color wrapper. Mitigates Aikido group 30641757
+/// (ANSI escape sequence injection in search output).
+fn sanitize_for_terminal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            if c == '\n' || c == '\t' || !c.is_control() {
+                out.push(c);
+            }
+            continue;
+        }
+        // ESC sequence — consume per ECMA-48
+        match chars.peek().copied() {
+            None => break,
+            Some('[') => {
+                chars.next();
+                while let Some(p) = chars.peek().copied() {
+                    let code = p as u32;
+                    if (0x30..=0x3f).contains(&code) || (0x20..=0x2f).contains(&code) {
+                        chars.next();
+                    } else if (0x40..=0x7e).contains(&code) {
+                        chars.next();
+                        break;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                chars.next();
+                loop {
+                    match chars.next() {
+                        Some('\x07') => break,
+                        Some('\x1b') => {
+                            if matches!(chars.peek().copied(), Some('\\')) {
+                                chars.next();
+                            }
+                            break;
+                        }
+                        Some(_) => continue,
+                        None => break,
+                    }
+                }
+            }
+            Some(c2) => {
+                let code = c2 as u32;
+                if (0x40..=0x5f).contains(&code) {
+                    chars.next();
+                }
+                // ESC followed by something unexpected: drop the ESC, leave
+                // the next char to be processed normally on the next loop.
+            }
+        }
+    }
+    out
+}
+
 fn print_result(
     result: &crate::vectordb::SearchResult,
     show_file: bool,
@@ -1152,20 +1269,22 @@ fn print_result(
 ) -> Result<()> {
     if show_file {
         println!("{}", "─".repeat(60));
-        let file_display = format!("📄 {}", result.path);
+        let file_display = format!("📄 {}", sanitize_for_terminal(&result.path));
         println!("{}", file_display.bright_green());
     }
 
     // Show location and kind
     let location = format!(
         "   Lines {}-{} • {}",
-        result.start_line, result.end_line, result.kind
+        result.start_line,
+        result.end_line,
+        sanitize_for_terminal(&result.kind)
     );
     println!("{}", location.dimmed());
 
     // Show signature if available
     if let Some(sig) = &result.signature {
-        println!("   {}", sig.bright_cyan());
+        println!("   {}", sanitize_for_terminal(sig).bright_cyan());
     }
 
     // Show score if requested
@@ -1191,7 +1310,7 @@ fn print_result(
 
     // Show context if available
     if let Some(ctx) = &result.context {
-        println!("   Context: {}", ctx.dimmed());
+        println!("   Context: {}", sanitize_for_terminal(ctx).dimmed());
     }
 
     // Show content if requested
@@ -1200,13 +1319,13 @@ fn print_result(
         if let Some(ctx_prev) = &result.context_prev {
             println!("\n   {}:", "Context (before)".dimmed());
             for line in ctx_prev.lines() {
-                println!("   │ {}", line.bright_black());
+                println!("   │ {}", sanitize_for_terminal(line).bright_black());
             }
         }
 
         println!("\n   {}:", "Content".bright_yellow());
         for line in result.content.lines().take(10) {
-            println!("   │ {}", line.dimmed());
+            println!("   │ {}", sanitize_for_terminal(line).dimmed());
         }
         if result.content.lines().count() > 10 {
             println!("   │ {}", "...".dimmed());
@@ -1216,15 +1335,26 @@ fn print_result(
         if let Some(ctx_next) = &result.context_next {
             println!("\n   {}:", "Context (after)".dimmed());
             for line in ctx_next.lines() {
-                println!("   │ {}", line.bright_black());
+                println!("   │ {}", sanitize_for_terminal(line).bright_black());
             }
         }
     } else {
         // Show a snippet
-        let snippet: String = result.content.lines().take(3).collect::<Vec<_>>().join(" ");
+        let snippet: String = result
+            .content
+            .lines()
+            .take(3)
+            .map(sanitize_for_terminal)
+            .collect::<Vec<_>>()
+            .join(" ");
 
         let snippet = if snippet.len() > 100 {
-            format!("{}...", &snippet[..100])
+            // Truncate at the largest UTF-8 char boundary <= 100 bytes.
+            // Plain `&snippet[..100]` panics if byte 100 falls inside a
+            // multi-byte character (box-drawing separators, CJK, emoji) —
+            // see issue #148.
+            let cut = snippet.floor_char_boundary(100);
+            format!("{}...", &snippet[..cut])
         } else {
             snippet
         };
@@ -1238,259 +1368,5 @@ fn print_result(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::cache::{normalize_filter_path, normalize_path_str, path_matches_filter};
-    use crate::chunker::ChunkKind;
-
-    // ── detect_identifiers ───────────────────────────────────────────────────
-
-    #[test]
-    fn test_detect_identifiers_pascal_case() {
-        let ids = detect_identifiers("find the VectorStore struct");
-        assert!(ids.contains(&"VectorStore".to_string()));
-    }
-
-    #[test]
-    fn test_detect_identifiers_snake_case() {
-        let ids = detect_identifiers("where is find_git_root defined");
-        assert!(ids.contains(&"find_git_root".to_string()));
-    }
-
-    #[test]
-    fn test_detect_identifiers_camel_case() {
-        let ids = detect_identifiers("show me insertChunksWithIds");
-        assert!(ids.contains(&"insertChunksWithIds".to_string()));
-    }
-
-    #[test]
-    fn test_detect_identifiers_plain_words_ignored() {
-        // Plain lowercase words that are not identifiers
-        let ids = detect_identifiers("what does this function do");
-        assert!(ids.is_empty());
-    }
-
-    #[test]
-    fn test_detect_identifiers_mixed_query() {
-        let ids = detect_identifiers("how does VectorStore handle find_git_root");
-        assert!(ids.contains(&"VectorStore".to_string()));
-        assert!(ids.contains(&"find_git_root".to_string()));
-    }
-
-    // ── detect_structural_intent ─────────────────────────────────────────────
-
-    #[test]
-    fn test_detect_structural_intent_struct_keyword() {
-        let kind = detect_structural_intent("struct VectorStore definition");
-        assert_eq!(kind, Some(ChunkKind::Struct));
-    }
-
-    #[test]
-    fn test_detect_structural_intent_fn_keyword() {
-        let kind = detect_structural_intent("fn find_git_root implementation");
-        assert!(matches!(kind, Some(ChunkKind::Function)));
-    }
-
-    #[test]
-    fn test_detect_structural_intent_class_keyword() {
-        let kind = detect_structural_intent("class IndexManager definition");
-        assert_eq!(kind, Some(ChunkKind::Class));
-    }
-
-    #[test]
-    fn test_detect_structural_intent_enum_keyword() {
-        let kind = detect_structural_intent("enum ChunkKind variants");
-        assert_eq!(kind, Some(ChunkKind::Enum));
-    }
-
-    #[test]
-    fn test_detect_structural_intent_trait_keyword() {
-        let kind = detect_structural_intent("trait Searchable implementation");
-        assert_eq!(kind, Some(ChunkKind::Trait));
-    }
-
-    #[test]
-    fn test_detect_structural_intent_no_identifier_returns_none() {
-        // Structural keyword present but no identifier → None
-        let kind = detect_structural_intent("how does a struct work");
-        assert_eq!(kind, None);
-    }
-
-    #[test]
-    fn test_detect_structural_intent_no_keyword_returns_none() {
-        // Identifier present but no structural keyword → None
-        let kind = detect_structural_intent("show me VectorStore");
-        assert_eq!(kind, None);
-    }
-
-    #[test]
-    fn test_detect_structural_intent_plain_query_returns_none() {
-        let kind = detect_structural_intent("how does error handling work");
-        assert_eq!(kind, None);
-    }
-
-    #[test]
-    fn test_detect_structural_intent_respects_quiet_mode() {
-        // With quiet=true, info_print! calls inside detect_structural_intent
-        // must not panic — they should silently be suppressed.
-        crate::output::set_quiet(true);
-        let kind = detect_structural_intent("struct VectorStore");
-        assert_eq!(kind, Some(ChunkKind::Struct));
-        crate::output::set_quiet(false);
-    }
-
-    // ── JsonResult compact serialization ─────────────────────────────────────
-
-    #[test]
-    fn test_json_result_full_includes_content() {
-        let r = JsonResult {
-            path: "src/foo.rs".to_string(),
-            start_line: 1,
-            end_line: 10,
-            kind: "Function".to_string(),
-            content: Some("fn foo() {}".to_string()),
-            score: 0.9,
-            signature: None,
-            context_prev: None,
-            context_next: None,
-        };
-        let json = serde_json::to_string(&r).unwrap();
-        assert!(json.contains("\"content\""));
-        assert!(json.contains("fn foo()"));
-    }
-
-    #[test]
-    fn test_json_result_compact_omits_content() {
-        let r = JsonResult {
-            path: "src/foo.rs".to_string(),
-            start_line: 1,
-            end_line: 10,
-            kind: "Function".to_string(),
-            content: None,
-            score: 0.9,
-            signature: None,
-            context_prev: None,
-            context_next: None,
-        };
-        let json = serde_json::to_string(&r).unwrap();
-        assert!(!json.contains("\"content\""));
-        assert!(!json.contains("\"context_prev\""));
-        assert!(!json.contains("\"context_next\""));
-    }
-
-    #[test]
-    fn test_json_result_compact_retains_required_fields() {
-        let r = JsonResult {
-            path: "src/vectordb/store.rs".to_string(),
-            start_line: 42,
-            end_line: 80,
-            kind: "Struct".to_string(),
-            content: None,
-            score: 0.75,
-            signature: Some("VectorStore".to_string()),
-            context_prev: None,
-            context_next: None,
-        };
-        let json = serde_json::to_string(&r).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["path"], "src/vectordb/store.rs");
-        assert_eq!(v["start_line"], 42);
-        assert_eq!(v["end_line"], 80);
-        assert_eq!(v["kind"], "Struct");
-        assert_eq!(v["score"], 0.75);
-        assert_eq!(v["signature"], "VectorStore");
-        assert!(v.get("content").is_none());
-    }
-
-    #[test]
-    fn test_json_result_context_omitted_when_none() {
-        let r = JsonResult {
-            path: "src/foo.rs".to_string(),
-            start_line: 1,
-            end_line: 5,
-            kind: "Block".to_string(),
-            content: Some("let x = 1;".to_string()),
-            score: 0.5,
-            signature: None,
-            context_prev: None,
-            context_next: None,
-        };
-        let json = serde_json::to_string(&r).unwrap();
-        assert!(!json.contains("\"context_prev\""));
-        assert!(!json.contains("\"context_next\""));
-        assert!(!json.contains("\"signature\""));
-    }
-
-    // ── No stdout in search module ────────────────────────────────────────────
-
-    #[test]
-    fn test_no_raw_eprintln_in_search_module() {
-        // Verify the search module contains no bare eprintln! macro *calls*
-        // (calls that bypass quiet mode). All output must go through info_print!
-        // or warn_print!. This test scans source text and skips comment lines
-        // and lines where the token appears only inside a quoted string.
-        let src = include_str!("mod.rs");
-        let needle = concat!("eprint", "ln!("); // split so this literal doesn't self-trigger
-
-        let violations: Vec<(usize, &str)> = src
-            .lines()
-            .enumerate()
-            .filter(|(_, line)| {
-                let trimmed = line.trim();
-                if trimmed.starts_with("//") || trimmed.starts_with('*') {
-                    return false;
-                }
-                if !trimmed.contains(needle) {
-                    return false;
-                }
-                // Allow only if the needle appears exclusively inside a string literal
-                // (i.e. every occurrence is preceded by a quote character).
-                // Simple heuristic: reject if needle appears at a non-quoted position.
-                !trimmed
-                    .split(needle)
-                    .skip(1) // parts after each occurrence
-                    .zip(trimmed.split(needle)) // parts before each occurrence
-                    .all(|(_, before)| before.ends_with('"') || before.ends_with("concat!("))
-            })
-            .collect();
-
-        assert!(
-            violations.is_empty(),
-            "Found bare eprintln! calls in search/mod.rs (bypasses quiet mode):\n{}",
-            violations
-                .iter()
-                .map(|(i, l)| format!("  line {}: {}", i + 1, l.trim()))
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-    }
-
-    #[test]
-    fn test_path_filter_matches_absolute_windows_path_under_root() {
-        let project_root = normalize_path_str(r"C:\WorkArea\AI\codesearch");
-        let filter = normalize_filter_path("src/");
-        assert!(path_matches_filter(
-            r"\\?\C:\WorkArea\AI\codesearch\src\index\mod.rs",
-            &filter,
-            &project_root,
-        ));
-    }
-
-    #[test]
-    fn test_path_filter_rejects_non_matching_absolute_path_under_root() {
-        let project_root = normalize_path_str(r"C:\WorkArea\AI\codesearch");
-        let filter = normalize_filter_path("src/");
-        assert!(!path_matches_filter(
-            r"C:\WorkArea\AI\codesearch\tests\index_test.rs",
-            &filter,
-            &project_root,
-        ));
-    }
-
-    #[test]
-    fn test_path_filter_matches_relative_dot_slash_input() {
-        let project_root = normalize_path_str("C:/WorkArea/AI/codesearch");
-        let filter = normalize_filter_path("src/");
-        assert!(path_matches_filter("./src/lib.rs", &filter, &project_root));
-    }
-}
+#[path = "tests.rs"]
+mod tests;

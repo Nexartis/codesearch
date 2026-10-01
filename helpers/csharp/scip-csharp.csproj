@@ -47,4 +47,9 @@
     <None Include="tests/**/*.cs" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- KeyFormatTests exercise the internal key-building helpers directly. -->
+    <InternalsVisibleTo Include="ScipCsharp.Tests" />
+  </ItemGroup>
+
 </Project>

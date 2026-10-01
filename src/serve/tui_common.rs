@@ -52,12 +52,14 @@ use crossterm::event::{KeyCode, KeyEvent};
 #[derive(Debug, Clone)]
 pub struct RepoRow {
     pub alias: String,
-    /// Human-readable status: "open", "warm", "readonly", "closed", "indexing", "error", "no_index"
+    /// Human-readable status: "open", "warm", "readonly", "idle", "indexing", "error", "no_index"
     pub status: String,
     /// C# index status: "none", "ready", "indexing", "error" (empty also treated as none)
     pub csharp_index: String,
     /// Optional C# error message
     pub csharp_error: Option<String>,
+    /// TypeScript index status: same vocabulary as `csharp_index`.
+    pub typescript_index: String,
     /// Pending file changes detected by file watcher
     pub changes: u64,
     /// Total MCP tool calls since serve start
@@ -72,6 +74,16 @@ pub struct RepoRow {
     /// peer, surfaced locally via `project=<peer>/<alias>`). Rendered italic to
     /// signal it is not a local index.
     pub is_remote: bool,
+    /// True when this *remote* row's activity (`last_tool_call`) is considered
+    /// stale by the embedded TUI — i.e. the peer's `/status` hasn't been
+    /// refreshed within `REMOTE_ACTIVITY_FRESH_SECS`. There is no background
+    /// poll that could refresh it: a federated peer is contacted only when a
+    /// real tool call pokes an immediate refresh (or on the `i` keypress), so
+    /// for an idle mount this is the *normal* steady state, not a fault. When
+    /// stale, the activity column renders `-` instead of a possibly-hours-old
+    /// "Xh ago". Always `false` for local repos (which carry live serve state)
+    /// and for the standalone remote dashboard.
+    pub activity_stale: bool,
 }
 
 /// Actions returned by key handling.
@@ -98,6 +110,9 @@ pub enum KeyAction {
 /// mount, so these live on the peer).
 #[derive(Debug, Clone)]
 pub struct RemoteIndexStats {
+    /// On-disk path of the index database on the PEER (not the local
+    /// machine) — the peer's `.codesearch.db` directory for this repo.
+    pub path: String,
     pub chunks: usize,
     pub files: usize,
     pub db_size_human: String,
@@ -121,6 +136,10 @@ pub enum OverlayState {
     /// Info modal: repo name, chunks, files, db size, model, dims, etc.
     Info {
         alias: String,
+        /// On-disk path of this repo's index database (the `.codesearch.db`
+        /// directory), so a user staring at the info panel can find it on
+        /// disk without cross-referencing `repos.json`.
+        path: String,
         chunks: usize,
         files: usize,
         max_chunk_id: u32,
@@ -322,10 +341,14 @@ pub fn render_table(
     let max_alias_w = repos
         .iter()
         .map(|r| {
-            let extra = match r.csharp_index.as_str() {
-                "ready" | "error" | "indexing" => 4,
-                _ => 0,
-            };
+            // Each indicator (" C#·" / " TS·") is 4 display cols; account for both.
+            let mut extra = 0usize;
+            if matches!(r.csharp_index.as_str(), "ready" | "error" | "indexing") {
+                extra += 4;
+            }
+            if matches!(r.typescript_index.as_str(), "ready" | "error" | "indexing") {
+                extra += 4;
+            }
             r.alias.len() + extra
         })
         .max()
@@ -348,12 +371,21 @@ pub fn render_table(
             } else {
                 Cell::from("    -".to_string()).style(Style::default().fg(Color::DarkGray))
             };
-            let tool_cell = Cell::from(repo.last_tool_call.as_deref().unwrap_or("—").to_string())
-                .style(Style::default().fg(Color::DarkGray));
+            // Federated peers are polled on the slow idle-suspend cadence (no
+            // longer every 30s) so they can scale to zero; between refreshes the
+            // cached activity is stale and rendered as `-` rather than a
+            // misleading "Xh ago". Local repos are always live
+            // (`activity_stale == false`).
+            let tool_cell = if repo.activity_stale {
+                Cell::from("-".to_string()).style(Style::default().fg(Color::DarkGray))
+            } else {
+                Cell::from(repo.last_tool_call.as_deref().unwrap_or("—").to_string())
+                    .style(Style::default().fg(Color::DarkGray))
+            };
             let lock_cell = lock_cell(&repo.lock_mode);
 
             // Alias text with optional C# indicator suffix, plus its base style.
-            let (alias_text, mut alias_style) = match repo.csharp_index.as_str() {
+            let (mut alias_text, mut alias_style) = match repo.csharp_index.as_str() {
                 "ready" => (
                     format!("{} C#·", repo.alias),
                     Style::default().fg(Color::White),
@@ -374,6 +406,19 @@ pub fn render_table(
                 }
                 _ => (repo.alias.clone(), Style::default().fg(Color::White)),
             };
+
+            // Append the TypeScript indicator alongside the C# one when a TS
+            // index exists. The alias column is the canonical multi-language
+            // symbol-index indicator (the status cell only carries C#).
+            match repo.typescript_index.as_str() {
+                "ready" => alias_text.push_str(" TS·"),
+                "error" => {
+                    alias_text.push_str(" TS!");
+                    alias_style = alias_style.fg(Color::Red);
+                }
+                "indexing" => alias_text.push_str(" TS…"),
+                _ => {}
+            }
 
             // Red bold alias if the repo is in an error state.
             if repo.status == "error" {
@@ -524,8 +569,17 @@ pub fn render_detail(
         ),
     ];
 
-    // Third item: last tool call
-    if let Some(ref tool) = repo.last_tool_call {
+    // Third item: last tool call. For a stale federated row the cached value is
+    // possibly hours old (the peer hasn't been polled since the slow baseline
+    // cadence), so show `-` instead of a misleading age. Local repos are always
+    // live (`activity_stale == false`).
+    if repo.activity_stale {
+        info_spans.push(Span::styled(
+            "  last:",
+            Style::default().fg(Color::DarkGray),
+        ));
+        info_spans.push(Span::styled(" -", Style::default().fg(Color::DarkGray)));
+    } else if let Some(ref tool) = repo.last_tool_call {
         info_spans.push(Span::styled(
             "  last:",
             Style::default().fg(Color::DarkGray),
@@ -645,6 +699,7 @@ pub fn render_footer(
     active: u64,
     cpu: &str,
     csharp_helper: bool,
+    ts_helper: bool,
     flash: Option<&str>,
 ) {
     let selected = table_state.selected().unwrap_or(0);
@@ -657,7 +712,7 @@ pub fn render_footer(
     let sessions_str = format!("Sessions: {}", active);
     let cpu_str = format!("CPU: {}", cpu);
 
-    let right_len = cpu_str.len() + sessions_str.len() + 3 + "C# │ ".len();
+    let right_len = cpu_str.len() + sessions_str.len() + 3 + "C# │ ".len() + "TS │ ".len();
 
     let footer_inner = area.inner(Margin {
         vertical: 0,
@@ -711,8 +766,15 @@ pub fn render_footer(
         Span::styled("C# │ ", Style::default().fg(Color::DarkGray))
     };
 
+    let ts_indicator = if ts_helper {
+        Span::styled("TS │ ", Style::default().fg(Color::Green))
+    } else {
+        Span::styled("TS │ ", Style::default().fg(Color::DarkGray))
+    };
+
     let right_line = Line::from(vec![
         csharp_indicator,
+        ts_indicator,
         Span::styled(cpu_str, Style::default().fg(Color::Green)),
         Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
         Span::styled(sessions_str, Style::default().fg(Color::Cyan)),
@@ -735,6 +797,7 @@ pub fn render_overlay(f: &mut ratatui::Frame, area: Rect, overlay: &OverlayState
     match overlay {
         OverlayState::Info {
             alias,
+            path,
             chunks,
             files,
             max_chunk_id,
@@ -746,6 +809,10 @@ pub fn render_overlay(f: &mut ratatui::Frame, area: Rect, overlay: &OverlayState
         } => {
             let title = format!(" {} — Index Info ", alias);
             let lines = vec![
+                Line::from(vec![
+                    Span::styled("  Path:        ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(path.clone(), Style::default().fg(Color::White)),
+                ]),
                 Line::from(vec![
                     Span::styled("  Chunks:      ", Style::default().fg(Color::DarkGray)),
                     Span::styled(format!("{}", chunks), Style::default().fg(Color::White)),
@@ -813,6 +880,10 @@ pub fn render_overlay(f: &mut ratatui::Frame, area: Rect, overlay: &OverlayState
             // db-size/model detail a local repo shows in its Info overlay.
             let stat_lines: Vec<Line> = match stats {
                 RemoteStatsState::Ready(s) => vec![
+                    Line::from(vec![
+                        Span::styled("  Path (peer): ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(s.path.clone(), Style::default().fg(Color::White)),
+                    ]),
                     Line::from(vec![
                         Span::styled("  Chunks:      ", Style::default().fg(Color::DarkGray)),
                         Span::styled(format!("{}", s.chunks), Style::default().fg(Color::White)),
@@ -1040,74 +1111,102 @@ pub fn render_centered_modal_with_border_color(
 // ---------------------------------------------------------------------------
 
 fn status_cell(status: &str, csharp: &str) -> Cell<'static> {
+    let (text, style) = status_cell_spec(status, csharp);
+    Cell::from(text).style(style)
+}
+
+/// Pure (text, style) decision behind `status_cell`, kept separate so tests can
+/// assert on it (0.30 `Cell::style` is a setter, not a getter).
+fn status_cell_spec(status: &str, csharp: &str) -> (String, Style) {
     let bright = pulse_bright();
     match status {
         "open" => match csharp {
-            "ready" => Cell::from("✓ ready C#·  ".to_string()).style(
+            "ready" => (
+                "✓ ready C#·  ".to_string(),
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
             ),
             "indexing" => {
                 if bright {
-                    Cell::from("⟳ idx C#…    ".to_string()).style(
+                    (
+                        "⟳ idx C#…    ".to_string(),
                         Style::default()
                             .fg(Color::Yellow)
                             .add_modifier(Modifier::BOLD),
                     )
                 } else {
-                    Cell::from("⟳ idx C#…    ".to_string())
-                        .style(Style::default().fg(Color::DarkGray))
+                    (
+                        "⟳ idx C#…    ".to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    )
                 }
             }
-            "error" => Cell::from("✓ ready C#!  ".to_string())
-                .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-            _ => Cell::from("✓ ready      ".to_string()).style(
+            "error" => (
+                "✓ ready C#!  ".to_string(),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            _ => (
+                "✓ ready      ".to_string(),
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
             ),
         },
         "warm" => match csharp {
-            "ready" => {
-                Cell::from("◐ warm C#·   ".to_string()).style(Style::default().fg(Color::Yellow))
-            }
+            "ready" => (
+                "◐ warm C#·   ".to_string(),
+                Style::default().fg(Color::Yellow),
+            ),
             "indexing" => {
                 if bright {
-                    Cell::from("⟳ idx C#…    ".to_string()).style(
+                    (
+                        "⟳ idx C#…    ".to_string(),
                         Style::default()
                             .fg(Color::Yellow)
                             .add_modifier(Modifier::BOLD),
                     )
                 } else {
-                    Cell::from("⟳ idx C#…    ".to_string())
-                        .style(Style::default().fg(Color::DarkGray))
+                    (
+                        "⟳ idx C#…    ".to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    )
                 }
             }
-            "error" => {
-                Cell::from("◐ warm C#!   ".to_string()).style(Style::default().fg(Color::Yellow))
-            }
-            _ => Cell::from("◐ warm       ".to_string()).style(Style::default().fg(Color::Yellow)),
+            "error" => (
+                "◐ warm C#!   ".to_string(),
+                Style::default().fg(Color::Yellow),
+            ),
+            _ => (
+                "◐ warm       ".to_string(),
+                Style::default().fg(Color::Yellow),
+            ),
         },
-        "readonly" => {
-            Cell::from("◑ ro         ".to_string()).style(Style::default().fg(Color::Cyan))
-        }
+        "readonly" => (
+            "◑ ro         ".to_string(),
+            Style::default().fg(Color::Cyan),
+        ),
         "indexing" => {
             if bright {
                 match csharp {
-                    "ready" => Cell::from("⟳ idx… C#·   ".to_string()).style(
+                    "ready" => (
+                        "⟳ idx… C#·   ".to_string(),
                         Style::default()
                             .fg(Color::Yellow)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    "indexing" => Cell::from("⟳ idx… C#…   ".to_string()).style(
+                    "indexing" => (
+                        "⟳ idx… C#…   ".to_string(),
                         Style::default()
                             .fg(Color::Yellow)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    "error" => Cell::from("⟳ idx… C#!   ".to_string())
-                        .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-                    _ => Cell::from("⟳ idx…       ".to_string()).style(
+                    "error" => (
+                        "⟳ idx… C#!   ".to_string(),
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    ),
+                    _ => (
+                        "⟳ idx…       ".to_string(),
                         Style::default()
                             .fg(Color::Yellow)
                             .add_modifier(Modifier::BOLD),
@@ -1115,24 +1214,38 @@ fn status_cell(status: &str, csharp: &str) -> Cell<'static> {
                 }
             } else {
                 match csharp {
-                    "ready" => Cell::from("⟳ idx… C#·   ".to_string())
-                        .style(Style::default().fg(Color::DarkGray)),
-                    "indexing" => Cell::from("⟳ idx… C#…   ".to_string())
-                        .style(Style::default().fg(Color::DarkGray)),
-                    "error" => Cell::from("⟳ idx… C#!   ".to_string())
-                        .style(Style::default().fg(Color::DarkGray)),
-                    _ => Cell::from("⟳ idx…       ".to_string())
-                        .style(Style::default().fg(Color::DarkGray)),
+                    "ready" => (
+                        "⟳ idx… C#·   ".to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    "indexing" => (
+                        "⟳ idx… C#…   ".to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    "error" => (
+                        "⟳ idx… C#!   ".to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    _ => (
+                        "⟳ idx…       ".to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    ),
                 }
             }
         }
-        "closed" => Cell::from("○ closed     ".to_string()).style(Style::default().fg(Color::Gray)),
-        "error" => Cell::from("✗ error      ".to_string())
-            .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-        "no_index" => {
-            Cell::from("— no idx     ".to_string()).style(Style::default().fg(Color::Gray))
-        }
-        _ => Cell::from(format!("{:<14}", status)).style(Style::default().fg(Color::White)),
+        "idle" | "closed" => (
+            "○ idle       ".to_string(),
+            Style::default().fg(Color::Gray),
+        ),
+        "error" => (
+            "✗ error      ".to_string(),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        "no_index" => (
+            "— no idx     ".to_string(),
+            Style::default().fg(Color::Gray),
+        ),
+        _ => (format!("{:<14}", status), Style::default().fg(Color::White)),
     }
 }
 
@@ -1175,7 +1288,7 @@ fn detail_status_style(status: &str, csharp: &str) -> (String, Color) {
             _ => ("Warm".to_string(), Color::Yellow),
         },
         "readonly" => ("Readonly".to_string(), Color::Cyan),
-        "closed" => ("Closed".to_string(), Color::Gray),
+        "idle" | "closed" => ("Idle".to_string(), Color::Gray),
         "indexing" => match csharp {
             "indexing" => (
                 "Index C#…".to_string(),
@@ -1214,4 +1327,47 @@ pub fn restore_terminal(
     crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_cell_renders_idle_and_legacy_closed_as_gray() {
+        let expected = (
+            "○ idle       ".to_string(),
+            Style::default().fg(Color::Gray),
+        );
+        assert_eq!(status_cell_spec("idle", "ready"), expected);
+        assert_eq!(status_cell_spec("closed", ""), expected);
+    }
+
+    #[test]
+    fn detail_status_style_maps_idle_and_legacy_closed_to_idle_label() {
+        assert_eq!(
+            detail_status_style("idle", ""),
+            ("Idle".to_string(), Color::Gray)
+        );
+        assert_eq!(
+            detail_status_style("closed", ""),
+            ("Idle".to_string(), Color::Gray)
+        );
+    }
+
+    #[test]
+    fn unknown_status_falls_back_without_idle_treatment() {
+        assert_ne!(
+            status_cell_spec("future_state", "").1,
+            Style::default().fg(Color::Gray)
+        );
+        assert_eq!(
+            status_cell_spec("future_state", "").0,
+            "future_state  ".to_string()
+        );
+        assert_eq!(
+            detail_status_style("future_state", ""),
+            ("future_state".to_string(), Color::White)
+        );
+    }
 }

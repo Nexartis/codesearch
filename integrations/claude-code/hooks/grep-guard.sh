@@ -1,125 +1,208 @@
 #!/usr/bin/env bash
 # PreToolUse hook: enforce codesearch-first for Grep on internal repo paths.
 # Bash/macOS/Linux twin of grep-guard.ps1 — see that file for full rationale.
-# Requires: jq
+# Requires: jq, curl
+#
+# Grep is auto-allowed ONLY when the codesearch serve hub is genuinely
+# unreachable ("plat"). A low-confidence / empty codesearch *result* is a
+# SUCCESSFUL call ("reformulate your query"), NOT "codesearch is down" — so it
+# must never open the grep escape hatch. The previous version used a blind
+# "same query retried within 5 min" proxy that could not tell those two apart
+# and leaked grep on every low-confidence result. We now probe the
+# unauthenticated /healthz liveness endpoint directly.
+#
+# The target repo is resolved from the GREP TARGET itself (its own git root),
+# never from the hook's cwd — absolute paths into a different repo resolve
+# against THAT repo (#54, and see the #199 note below: POSIX absolute paths
+# used to slip through this very test). Coverage is decided by REGISTRATION
+# with the local serve hub (repos.json), not by a .codesearch.db directory
+# (#199). When the target repo is covered and LIVE but MID-REINDEX
+# (branch-switch full refresh, #55), the deny is a WAIT-AND-RETRY
+# instruction instead: searching a mid-rebuild index returns stale/empty
+# results and must not degrade into a manual grep approval on every checkout.
 #
 # Install: see ../README.md (or run ../install.sh to wire this up automatically).
 
 set -euo pipefail
 
+# Shared coverage/target-resolution helpers (repos.json registration, path
+# normalization) live in codesearch-common.sh, shared with edit-guard.
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/codesearch-common.sh"
+
 raw="$(cat)"
 [ -z "$raw" ] && exit 0
 
-tool=$(echo "$raw" | jq -r '.tool_name // empty')
+tool=$(echo "$raw" | jq -r '.tool_name // empty' | jq_str)
 [ "$tool" != "Grep" ] && exit 0
 
-pattern=$(echo "$raw" | jq -r '.tool_input.pattern // empty')
-path=$(echo "$raw" | jq -r '.tool_input.path // empty')
+path=$(echo "$raw" | jq -r '.tool_input.path // empty' | jq_str)
 
 # ------------------------------------------------------------------
-# 1. Is the path internal to the current repo?
-# ------------------------------------------------------------------
-is_internal=true
-if [ -n "$path" ] && [ "$path" != "." ] && [ "$path" != "./" ]; then
-    case "$path" in
-        /*)
-            git_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
-            if [ -n "$git_root" ]; then
-                case "$path" in
-                    "$git_root"*) is_internal=true ;;
-                    *) is_internal=false ;;
-                esac
-            else
-                is_internal=false  # can't determine git root -> assume external, allow grep
-            fi
-            ;;
-        *) is_internal=true ;;  # relative path stays internal
-    esac
-fi
-
-[ "$is_internal" = false ] && exit 0
-
-# ------------------------------------------------------------------
-# 2. Is codesearch actually available FOR THIS REPO?
+# 1+2. Resolve the TARGET repo (the repo this Grep is aimed at) and check
+#      codesearch coverage THERE — never in the hook's cwd.
 #
-# NOTE: we deliberately do NOT treat "a codesearch process is running" as
-# sufficient. codesearch commonly runs as a persistent background `serve`
-# hub covering many registered repos (`codesearch index list`) — that
-# process is alive nearly all the time on a dev machine, regardless of
-# whether the CURRENT directory is one of the repos it actually indexes.
-# Using process-presence alone made this hook fire in every directory on
-# the machine, including ones with no index at all. A local `.codesearch.db`
-# at the git root is the precise, fast signal that THIS repo is indexed.
+# History (#54): coverage used to be resolved from the hook's cwd. An
+# absolute-path Grep into a DIFFERENT indexed repo then failed the
+# startswith(cwd-repo-root) test, looked "external", and was allowed even
+# though its target repo was fully covered. The guard now follows the
+# target: empty/relative paths resolve against the cwd repo (they are
+# relative to it by definition), absolute paths resolve against the git
+# root of the path itself.
+#
+# History (#199): the #54 rewrite still mis-binned POSIX absolute paths
+# (/home/..., /tmp/...): its absolute-detection pattern only matched
+# Windows-style roots (C:\, C:/, MSYS /c/, UNC //server), so a POSIX
+# absolute target fell into the relative branch and resolved against the
+# hook's cwd — with a session cwd that is not itself a git repo (a parent
+# directory holding several repos) the target resolved to NOTHING, looked
+# external, and the guard silently allowed every grep. `/*` now covers
+# every absolute path.
+#
+# Coverage signal (#199): the target's git root is REGISTERED with the
+# local serve hub (~/.codesearch/repos.json — the same registration list
+# the hub itself resolves queries by). A `.codesearch.db` directory at
+# the git root was only ever a proxy for that and is wrong in both
+# directions: a stale db from a since-unregistered repo denied Grep while
+# the hub could not actually answer for it (unknown alias), and a
+# registered repo whose db directory was gone slipped through uncovered.
+# Matching the git ROOT (never a path prefix) also carves out nested
+# repos for free: an unregistered clone nested inside a registered repo
+# resolves to its OWN git root, equals no registration, and is correctly
+# treated as uncovered. The explicit CODESEARCH_SERVER opt-in stays for
+# pure remote-serve setups with no local repos.json (#199 tracks that it
+# is a URL override rather than a coverage signal — to be reworked
+# separately).
 # ------------------------------------------------------------------
-codesearch_available=false
-git_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
-if [ -n "$git_root" ] && [ -d "$git_root/.codesearch.db" ]; then
-    codesearch_available=true
-elif [ -n "${CODESEARCH_SERVER:-}" ]; then
-    # Explicit opt-in escape hatch for pure remote-serve setups with no local
-    # .codesearch.db. Requires the user to consciously set this env var, so
-    # it can't spuriously fire the way "any process running" did.
-    codesearch_available=true
-fi
+target_root="$(resolve_target_git_root "$path")"
 
-[ "$codesearch_available" = false ] && exit 0
+# Not inside any git repo (or git unusable) -> external target: grep is right.
+[ -z "$target_root" ] && exit 0
+
+# Covered = the target's git root is registered with the serve hub
+# (repos.json), or CODESEARCH_SERVER opts a pure remote-serve setup in.
+target_registered "$target_root" || exit 0
 
 # ------------------------------------------------------------------
-# 3. Retry cache: same (pattern, path) blocked recently -> let it through.
+# 3. Is the codesearch serve hub actually UP right now? (Liveness probe.)
+#
+# This is the ONLY condition under which grep is auto-allowed: codesearch is
+# genuinely unreachable ("plat"). We probe the unauthenticated /healthz
+# liveness endpoint (fixed {"status":"ok"} body, no API key required). A
+# reachable server -> DENY grep and force a codesearch reformulation, even when
+# a previous codesearch call returned a low-confidence / empty result — an empty
+# *result* is a SUCCESSFUL call, not a dead server, so it must NOT open the
+# escape hatch. Only a connection-level failure means the server is down.
+#
+# Base URL resolution (mirrors codesearch src/constants.rs):
+#   CODESEARCH_SERVER (full base URL) > http://127.0.0.1:$CODESEARCH_SERVE_PORT
+#   > http://127.0.0.1:39725  (DEFAULT_SERVE_URL / DEFAULT_SERVE_PORT)
 # ------------------------------------------------------------------
-cache_file="${TMPDIR:-/tmp}/.codesearch-grep-guard.json"
-cache_ttl=300
-now=$(date +%s)
-cache_key="${pattern}|${path}"
-
-# NOTE: feed the cache file to jq via stdin redirection (`< file`), never as a
-# positional path argument. On Windows/Git-Bash with a native jq.exe, POSIX-style
-# paths (/tmp/...) passed as jq CLI args fail to resolve ("Could not open file")
-# even though the same path works fine for bash builtins and stdin redirection,
-# since bash itself resolves the path for `<` before jq ever sees it.
-if [ -f "$cache_file" ]; then
-    blocked_at=$(jq -r --arg k "$cache_key" '.[$k] // empty' < "$cache_file" 2>/dev/null || true)
-    if [ -n "$blocked_at" ] && [ $((now - blocked_at)) -lt "$cache_ttl" ]; then
-        exit 0  # already blocked once this window -> allow the retry
-    fi
-fi
-
-# Prune stale entries and record this block
-if [ -f "$cache_file" ]; then
-    tmp=$(mktemp)
-    jq --arg k "$cache_key" --argjson now "$now" --argjson ttl "$cache_ttl" \
-        'with_entries(select(($now - .value) < $ttl)) + {($k): $now}' \
-        < "$cache_file" > "$tmp" 2>/dev/null && mv "$tmp" "$cache_file" || true
+if [ -n "${CODESEARCH_SERVER:-}" ]; then
+    base="${CODESEARCH_SERVER%/}"
+elif [ -n "${CODESEARCH_SERVE_PORT:-}" ]; then
+    base="http://127.0.0.1:${CODESEARCH_SERVE_PORT}"
 else
-    jq -n --arg k "$cache_key" --argjson now "$now" '{($k): $now}' > "$cache_file" 2>/dev/null || true
+    base="http://127.0.0.1:39725"
+fi
+
+# curl: -sS quiet (errors to stderr), --max-time 2 short timeout; the body is
+# discarded via the shell redirect below. We deliberately do NOT use curl's
+# `-o /dev/null` — on Windows/Git-Bash a native curl.exe fails writing to the
+# translated /dev/null path (exit 23) even on a healthy 200, which would
+# misreport an UP server as down. Shell-level `>/dev/null` avoids that.
+# Without -f, any HTTP response (even 4xx/5xx) yields exit 0 = reachable/up;
+# only a connection-level failure (exit 7/28/…) means it's down -> allow grep.
+if ! curl -sS --max-time 2 "${base}/healthz" >/dev/null 2>&1; then
+    exit 0  # codesearch is DOWN -> grep is genuinely all you have, let it through
+fi
+
+# ------------------------------------------------------------------
+# 3.5 Is the TARGET repo mid-reindex right now? (Freshness probe, #55.)
+#
+# Liveness (/healthz) says the server is UP; it says nothing about index
+# FRESHNESS. Right after a branch switch the serve watcher fires a full
+# refresh, and searches against the mid-rebuild index return stale/empty
+# results — which used to push the agent into a manual grep approval on
+# every routine checkout. GET /indexing?path=<repo root> resolves the
+# target to its registered repo and reports an active reindex. When one is
+# in flight, deny with a WAIT-AND-RETRY instruction: the tree did not
+# change, the index is just catching up — waiting beats grepping.
+#
+# Backward compat: an older serve without this endpoint answers 404; the
+# probe is skipped and behaviour is exactly the pre-#55 deny. The ?path=
+# value is percent-encoded (jq @uri) — a repo root containing spaces, +,
+# &, # or non-ASCII would otherwise make the probe fail or answer for the
+# WRONG repo prefix, silently disabling the wait-and-retry path.
+# ------------------------------------------------------------------
+enc=$(printf '%s' "$target_root" | jq -sRr @uri)
+if fresh_json=$(curl -sS --max-time 2 "${base}/indexing?path=${enc}" 2>/dev/null); then
+    covered=$(echo "$fresh_json" | jq -r '.covered // false' 2>/dev/null || echo false)
+    indexing=$(echo "$fresh_json" | jq -r '.indexing // false' 2>/dev/null || echo false)
+    if [ "$covered" = "true" ] && [ "$indexing" = "true" ]; then
+        msg=$(cat <<'EOF'
+codesearch is LIVE, but THIS repo's index is being rebuilt right now (a
+branch switch or file change fired the serve watcher's full refresh).
+Searching immediately would return stale or empty results — that is the
+rebuild in progress, not a miss, and NOT a reason to grep.
+
+WAIT 15-30 seconds (Bash: sleep 20), then RETRY your codesearch call — it
+will answer normally once the rebuild lands. The working tree did not
+change; only the index is catching up, so grep adds nothing here.
+
+If the rebuild still has not landed after ~2 minutes, run your codesearch
+call anyway (a partially fresh index still beats grep) or ask the user how
+to proceed.
+EOF
+)
+        jq -n --arg msg "$msg" '{
+          hookSpecificOutput: {
+            hookEventName: "PreToolUse",
+            permissionDecision: "deny",
+            permissionDecisionReason: $msg
+          }
+        }'
+        exit 0
+    fi
 fi
 
 # ------------------------------------------------------------------
 # 4. Block with actionable guidance
 # ------------------------------------------------------------------
-msg=$(cat <<EOF
-codesearch is active for this repo — try it before Grep for code discovery.
+msg=$(cat <<'EOF'
+codesearch is LIVE for this repo (its /healthz probe just answered) — use it,
+do NOT fall back to Grep. Grep on an indexed internal path is only auto-allowed
+when the codesearch serve hub is actually DOWN, which it is not right now.
+
+IMPORTANT: a low-confidence or EMPTY codesearch result is a SUCCESSFUL call that
+means "reformulate your query" — it does NOT mean codesearch is down and it will
+NOT unblock Grep. Reformulate instead of grepping.
 
 Step 1 — load the deferred MCP tool schemas (Claude Code defers all MCP tools;
 this is a one-time step per conversation):
   ToolSearch("select:mcp__codesearch__search,mcp__codesearch__find,mcp__codesearch__explore,mcp__codesearch__get_chunk")
 
-Step 2 — search:
-  mcp__codesearch__search(query="$pattern", mode="semantic")             -- concepts, identifiers, cross-file
-  mcp__codesearch__search(query="$pattern", mode="literal", regex=true)  -- exact pattern / regex
-  mcp__codesearch__find(symbol="...", kind="definition")                 -- symbol definition
-  mcp__codesearch__find(symbol="...", kind="usages")                     -- all call sites
+Step 2 — pick the RIGHT tool (this is usually why a query came back empty):
+  find(symbol="Name", kind="definition")   -- known symbol / type / function definition
+  find(symbol="Name", kind="usages")       -- all call sites of a known symbol
+  explore(kind="outline", target="path")   -- every symbol in one file
+  search(query="concept", mode="semantic") -- concepts / cross-file, the DEFAULT
+  search(query="exact", mode="literal", regex=true) -- exact syntax / pattern
 
-Multi-repo serve mode: if the search returns a "scope_required" or
-"Unknown alias" error, you MUST pass project="<repo-alias>" (single repo) or
-group="<group>" (cross-repo). The error response LISTS the valid
-available_projects / available_groups — pick from that list (the alias may
-differ from the folder name). Example:
-  mcp__codesearch__search(query="$pattern", mode="semantic", project="<alias-from-error>")
+Query hygiene (this is what produces "low_confidence: []"):
+  * Do NOT paste grep-style multi-term alternations ("a|b|c", "::", "fn foo(")
+    into search — BM25 tokenises on punctuation and the match scores below the
+    relevance floor, so you get an empty result even though the string exists.
+  * Use ONE clean term, or switch to find()/explore() for exact symbols.
 
-This exact Grep call is auto-unblocked if you retry it within 5 minutes
-(i.e. codesearch returned nothing useful — go ahead and grep).
-Grep is always allowed for paths outside the current repo.
+Multi-repo serve mode: if the call returns a "scope_required" or "Unknown alias"
+error, you MUST pass project="<repo-alias>" (single repo) or group="<group>"
+(cross-repo). The error response LISTS the valid available_projects /
+available_groups — pick from that list (the alias may differ from the folder
+name).
+
+Grep is always allowed for targets outside any git repo, for repos that are
+not registered with the codesearch serve hub (repos.json), and for pure
+remote-serve setups opted in via CODESEARCH_SERVER.
 EOF
 )
 

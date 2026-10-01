@@ -15,7 +15,7 @@ codesearch gives AI agents (OpenCode, Claude Code, Cursor, and any MCP client) d
 - **Multi-repo serve mode**: Fan-out queries across repository groups with cross-repo RRF ranking
 - **Hybrid retrieval**: Vector embeddings + BM25 full-text search fused with Reciprocal Rank Fusion
 - **Symbol navigation**: Jump to definitions, find usages, trace imports and dependents — in the same tool
-- **AST-aware chunking**: Tree-sitter parsing for 16 languages — chunks align to functions/classes (and Markdown sections), not arbitrary line ranges
+- **AST-aware chunking**: Tree-sitter parsing for 17 languages — chunks align to functions/classes (and Markdown sections), not arbitrary line ranges
 - **Token-efficient**: Returns metadata by default; agents fetch full code only when needed via `get_chunk`
 - **Lightweight footprint**: Hundreds of MB on disk, runs on CPU only, no runtime model downloads (works behind enterprise proxies)
 - **Zero config for single repos**: `codesearch index && codesearch mcp` — done
@@ -117,6 +117,36 @@ codesearch index /path/to/my-project --force
 
 `codesearch index add` is intended to be run from inside the repo you want to register — pass the path explicitly if launched from elsewhere. First-time indexing takes 2–5 minutes; subsequent runs are incremental (10–30s) and branch switches re-index automatically. Use `codesearch index list/rm/prune` to manage registrations (see [Serve Mode](#serve-mode-multi-repo)).
 
+### Embedding model
+
+The default quantized MiniLM model favors startup speed and a small download. For
+multilingual text and notes, EmbeddingGemma 300M is available as a quantized ONNX
+model with retrieval-specific query and document prompts:
+
+```bash
+codesearch --model embeddinggemma-q4 index /path/to/notes --force
+```
+
+Changing models requires a full reindex because embedding dimensions and vector
+spaces are model-specific. Keep the same model selected for later indexing runs.
+Search rejects a `--model` value that differs from the indexed model and points
+to the required `--force` rebuild instead of mixing incompatible vector spaces.
+
+In **serve** mode the model is resolved **per repository**, from each index's own
+metadata, not from a hub-wide setting: a hub may hold indexes built with
+different models, and every query is embedded with the model of the repo it
+targets (mixed-model groups are fine). `codesearch serve --model <name>` sets a
+**default for newly created indexes**: a repo added without an explicit model
+(e.g. `codesearch index add` with no `--model`, delegated to serve) is indexed
+with it, and it is reported in `GET /status` as `default_model`. It never
+overrides an index that already records its own model — to change an existing
+repo's model, re-index that repo
+(`codesearch --model <name> index <path> --force`) and restart serve. A repo
+whose `metadata.json` records no model (a legacy index built before the
+recording contract) is queried with the built-in 384-dim default rather than the
+serve default, and the search response carries a warning naming the assumed model
+and the re-index command.
+
 ## MCP Configuration
 
 codesearch connects to AI agents via MCP. Two modes:
@@ -207,10 +237,11 @@ OpenCode: put this in the user-level `~/.config/opencode/AGENTS.md` (applies acr
 
 **Claude Code specifically** tends to ignore this advice more than other clients — its MCP tool schemas are deferred (an extra `ToolSearch` call is needed before codesearch tools are even callable), while Grep/Glob are always fully loaded and zero-friction, and spawned subagents don't inherit `AGENTS.md` or the MCP `initialize` instructions at all.
 
-To make the preference **structural** instead of advisory, this repo ships three Claude Code `PreToolUse` hooks:
+To make the preference **structural** instead of advisory, this repo ships five Claude Code hooks (four `PreToolUse` guards plus one `PostToolUse` companion):
 
-- **`grep-guard`** — on `Grep`. Blocks the first grep against an in-repo path when codesearch looks available (a local `.codesearch.db` at the git root, or a `CODESEARCH_SERVER` env var for remote-serve setups), with a message telling the model how to load and call codesearch instead. A retry of the same query within 5 minutes is let through unblocked — the legitimate "codesearch found nothing, falling back" path. Greps outside the current repo are never blocked, and the hook fails open (never traps the model).
-- **`subagent-preamble`** — on `Agent` (the subagent-spawn tool). Prepends a short codesearch preamble to every subagent prompt, since subagents otherwise don't inherit `AGENTS.md` or MCP instructions at all.
+- **`grep-guard`** — on `Grep`. Blocks a grep against an in-repo path when codesearch covers that repo (the target repo — resolved from the grep target's own git root — is registered with the serve hub in `~/.codesearch/repos.json`, or a `CODESEARCH_SERVER` env var is set for remote-serve setups), with a message telling the model how to load and call codesearch instead. Grep is auto-allowed **only when the serve hub is genuinely down**, established by a live probe of the unauthenticated `/healthz` endpoint (`CODESEARCH_SERVER` > `127.0.0.1:$CODESEARCH_SERVE_PORT` > `127.0.0.1:39725`); only a connection-level failure counts as down. A low-confidence or empty codesearch result is a *successful* call meaning "reformulate the query", so it does **not** open the escape hatch — the deny message steers to `find`/`explore`/a single clean term instead. Greps outside any registered repo are never blocked, and the hook fails open (never traps the model).
+- **`edit-guard`** — on `Edit`/`Write`/`MultiEdit`. Blocks an edit to a file in a codesearch-registered repo until codesearch was consulted for that exact path within the last 5 minutes — `find_impact` for SCIP-backed languages (`.cs .ts .tsx .mts .cts`), `find(kind="usages")` for everything else — making the caller-aware-editing protocol structural. Its companion **`edit-guard-post`** (`PostToolUse`) records the markers on every `find_impact` call and every `find(kind="usages")`; any outcome counts ("no results" included), so the guard can never wedge. Unregistered repos, non-git paths and hook failures fail open.
+- **`subagent-preamble`** — on `Agent` (the subagent-spawn tool). Prepends a short codesearch preamble to every subagent prompt, since subagents otherwise don't inherit `AGENTS.md` or MCP instructions at all — including the edit-guard protocol above.
 - **`web-guard`** — on `WebSearch`/`WebFetch`. When you have remote documentation projects mounted (`codesearch remote mount`, e.g. `cloud/inriver`, `cloud/example-dam`), it blocks the first web call with guidance to search those indexed mounts first — often more precise and current than the open web. Same 5-minute retry-escape; when no mounts are configured it does nothing.
 
 Install (idempotent — user scope applies to every project; `--project` is this repo only):
@@ -222,7 +253,7 @@ codesearch hooks claude install --project  # project scope (./.claude)
 
 The native command embeds the hook scripts in the binary (no source tree needed) and merges the registrations into `settings.json`. The equivalent from-source installers still live in [`integrations/claude-code/`](integrations/claude-code/) (`install.ps1` / `install.sh`) if you'd rather run them directly.
 
-Note: the grep-guard detects "codesearch is available **for this repo**" via a local `.codesearch.db` or `CODESEARCH_SERVER` — **not** by checking whether a `codesearch` process is running (that runs almost constantly as a multi-repo hub and would false-fire in every directory). For a remote-serve setup with no local index, set `CODESEARCH_SERVER` to opt back into enforcement.
+Note: the grep-guard detects "codesearch is available **for this repo**" via that repo's registration with the serve hub (`~/.codesearch/repos.json`, honoring the `CODESEARCH_REPOS_CONFIG` override) or `CODESEARCH_SERVER` — **not** by checking whether a `codesearch` process is running (that runs almost constantly as a multi-repo hub and would false-fire in every directory), and **not** via a local `.codesearch.db` directory (a stale db from a since-unregistered repo used to deny Grep even though the hub could not answer for it). For a remote-serve setup with no local registration, set `CODESEARCH_SERVER` to opt back into enforcement.
 
 ## MCP Tools Reference
 
@@ -291,7 +322,7 @@ In multi-repo mode: auto-routes when chunk_id is unique; returns candidates list
 
 ### `find_impact` — Symbol Reference Impact
 
-Find all call-sites and references to a symbol with file/line precision, powered by per-language semantic analysis. Currently supports **C#** (via the bundled `scip-csharp` helper).
+Find all call-sites and references to a symbol with file/line precision — the recommended tool for "who calls X?" / "what breaks if I rename X?". Powered by per-language SCIP semantic analysis; precision backends ship per language: **C#** (bundled `scip-csharp` helper) and **TypeScript** (via `npx scip-typescript`, resolved on the host on demand — no bundle shipped), more planned. When no backend is available for a language, `find_impact` reports it — fall back to `find kind="usages"` (lexical) only then.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
@@ -303,7 +334,9 @@ Find all call-sites and references to a symbol with file/line precision, powered
 
 Returns a list of references with `file`, `start_line`, `end_line`, and `kind` (e.g. `"call"`, `"definition"`). Exposes `index_age_seconds` so agents can reason about staleness.
 
-> **Note:** Requires the `-with-csharp` release variant or a separately installed `scip-csharp` helper. See [C# Semantic Search](#c-semantic-search).
+> **Note:** SCIP precision requires the `-with-csharp` release variant (or a separately installed `scip-csharp` helper) for C#, and `npx` (with `scip-typescript`, fetched on first use) on the host's PATH for TypeScript. Without a backend for a language, `find_impact` returns a clear message — use `find kind="usages"` as the lexical fallback. See [C# Semantic Search](#c-semantic-search).
+
+On a running `codesearch serve` the same lookup is available over plain REST — `POST /find-impact` with the identical request body, no MCP session required (same auth class as the other read-only REST endpoints).
 
 ### `status` — Index Info
 
@@ -333,9 +366,9 @@ This starts a background HTTP server with:
 | `↑` / `↓` | Navigate repo list |
 | `i` | Show info overlay (chunks, files, model, DB size) |
 | `d` | Run doctor diagnostics on selected repo |
-| `f` | Force reindex selected repo |
+| `n` | Force reindex selected repo |
 | `r` | Remove selected repo (with confirmation dialog) |
-| `s` | Reload repos config from disk |
+| `l` | Reload repos config from disk |
 | `q` | Quit serve |
 
 ### Repository Registration
@@ -411,7 +444,9 @@ When using `git worktree add` to create parallel working directories, codesearch
 codesearch hooks git install
 ```
 
-This writes a `post-checkout` hook to `.git/hooks/` that POSTs the worktree path to the running serve instance whenever a new worktree is checked out. The hook reads the serve URL from `~/.codesearch/serve_url` (automatically managed by `codesearch serve`).
+This installs a `post-checkout` hook that POSTs the worktree path to the running serve instance whenever a new worktree is checked out. The hook reads the serve URL from `~/.codesearch/serve_url` (automatically managed by `codesearch serve`).
+
+The install target is resolved with `git rev-parse --git-path hooks`, so it honours `core.hooksPath` (and, inside a linked worktree, the shared common-dir hooks) rather than assuming `.git/hooks/`. An existing `post-checkout` is not overwritten — codesearch's logic is chained in as a marker-delimited block.
 
 **How it works:**
 1. `codesearch serve` writes its URL to `~/.codesearch/serve_url` on startup (deletes on shutdown)
@@ -420,7 +455,7 @@ This writes a `post-checkout` hook to `.git/hooks/` that POSTs the worktree path
 
 ### Claude Code Guard Hooks
 
-`codesearch hooks claude install` (`--project` for repo scope) installs the `PreToolUse` guard hooks that steer agents to codesearch before `Grep`/`WebSearch`/`WebFetch`. See [Agent Guidance](#agent-guidance-making-agents-use-codesearch-not-grep) above for what each guard does.
+`codesearch hooks claude install` (`--project` for repo scope) installs the four `PreToolUse` guard hooks that steer agents to codesearch before `Grep`/`WebSearch`/`WebFetch`/`Edit`/`Write`/`MultiEdit`, plus the `PostToolUse` marker hook (`edit-guard-post`) that records the consultations `edit-guard` requires. See [Agent Guidance](#agent-guidance-making-agents-use-codesearch-not-grep) above for what each guard does.
 
 ### MCP Connection Modes
 
@@ -535,10 +570,13 @@ In the `codesearch serve` TUI, mounts appear in **italic/cyan**, distinguishing 
 | `CODESEARCH_SERVE_PORT` | Serve mode port (default: 39725) |
 | `CODESEARCH_SERVE_API_KEY` | API key for management endpoints + all endpoints when serve binds to a non-localhost address (unset = no auth) |
 | `CODESEARCH_ALLOWED_ROOTS` | Semicolon-separated allowed roots for repo registration (unset = all allowed) |
+| `CODESEARCH_ALLOWED_HOSTS` | Comma-separated hostname allowlist for the MCP streamable-HTTP transport (unset = loopback only: `localhost`, `127.0.0.1`, `::1`). Set this to your container/service hostname when serve runs behind a container network or reverse proxy — see [Security](#security). |
+| `CODESEARCH_DISABLE_HOST_VALIDATION` | `1`/`true` disables the MCP transport's Host-header allowlist entirely (DNS-rebinding protection off). Only safe behind a reverse proxy/firewall that already restricts inbound Host headers — see [Security](#security). |
 | `CODESEARCH_MCP_MODE` | MCP mode: auto, client, local |
 | `CODESEARCH_REPOS_CONFIG` | Path to repos.json |
 | `CODESEARCH_REPO_IDLE_TIMEOUT_SECS` | Idle eviction timeout (default: 1800) |
 | `CODESEARCH_CACHE_MAX_MEMORY` | Embedding cache MB (default: 500) |
+| `CODESEARCH_MAX_LMDB_MAP_SIZE_MB` | Hard cap (MB) for LMDB auto-resize on `MDB_MAP_FULL`, applied to both the vector store and the persistent embedding cache (default: 16384 = 16GB; clamped to at least 1024). Raise this for very large corpora (millions of chunks) that legitimately exceed the default cap — see #189. |
 | `CODESEARCH_BATCH_SIZE` | Embedding batch size |
 | `CODESEARCH_SCIP_CSHARP` | Override path to `scip-csharp` helper |
 | `CODESEARCH_EXTENSION_MAP` | Path to the extension→language map (default: `~/.codesearch/extensions.json`) — see [Extension map](#extension-map) |
@@ -612,6 +650,29 @@ When `codesearch serve` is exposed beyond a single trusted user (shared dev mach
 
 Both are backward compatible: unset means no restriction (on a localhost bind).
 
+### MCP transport host allowlist (DNS-rebinding protection)
+
+The MCP streamable-HTTP transport (via `rmcp`) validates the incoming `Host` header against an allowlist to defend against DNS-rebinding attacks. By default this allowlist is **loopback-only** (`localhost`, `127.0.0.1`, `::1`), which rejects requests carrying a container hostname or service-discovery name — a common trip-up in containerised/orchestrated deployments (Docker, Kubernetes, etc.) where the client connects via a non-loopback Host header.
+
+- **`CODESEARCH_ALLOWED_HOSTS`** — comma-separated list of extra allowed hostnames (e.g. `codesearch-serve,codesearch-serve.internal`), replacing the loopback-only default. Prefer this over disabling validation.
+- **`CODESEARCH_DISABLE_HOST_VALIDATION`** — set to `1` or `true` to disable Host-header validation entirely. This removes the DNS-rebinding protection outright; only use it when serve is already fenced off by a reverse proxy or network policy that restricts which Host headers can reach it.
+
+Precedence: disable > custom allowlist > default (loopback-only).
+
+### Hardening against path traversal and injection
+
+Beyond the access-control gates above, codesearch applies several defense-in-depth mitigations at the filesystem and CLI boundary:
+
+- Project-path resolution (`index`, repo registration) fails fast on an unresolvable/malformed path instead of silently falling back to the raw, unvalidated input.
+- The `.NET` symbol-helper CLI (`scip-csharp`) canonicalizes every path argument (`--solution`, `--project`, `--output`, `--symbols-file`) before use.
+- Registering a project root that is itself a VCS/build-artifact directory (`.git`, `.svn`, `node_modules`, etc.) is rejected, preventing accidental indexing/exposure of internal VCS metadata.
+- Terminal output (search results, sync/reindex logs) strips ANSI/control-sequence injection from indexed file content before printing, so a maliciously crafted file can't manipulate the user's terminal.
+- On Unix, path-cache keys no longer collapse a literal backslash in a filename with a path separator (a Windows-only normalization rule is now gated to Windows).
+
+### Operational note: file-descriptor limits under process supervisors
+
+`codesearch serve`'s file-descriptor demand scales with the number of registered repos (each warm repo holds LMDB + full-text-index + file-watcher handles). Under a process supervisor with a low default open-file limit (notably **macOS launchd**, default soft `ulimit -n 256`), a large repo count can silently exhaust file descriptors: `accept()` then fails with `EMFILE` and the daemon looks alive to its supervisor while refusing new connections. Serve now raises its own soft `RLIMIT_NOFILE` to the hard limit at startup (Unix only) and logs a warning if the effective limit still looks insufficient for the registered repo count — but if you see repeated `EMFILE`/"Too many open files" in the logs, raise the **hard** limit for the service (e.g. launchd `SoftResourceLimits`/`HardResourceLimits`, systemd `LimitNOFILE=`, or `ulimit -n` in the service's environment).
+
 ### Federation security model
 
 Federation is **operator-to-operator**, not end-user-facing. The only inputs that decide *where* requests go and *which key* they carry are the peer entries you register locally with `codesearch remote add` (stored in `~/.codesearch/repos.json`). No search query, MCP argument, or remote response ever becomes a request target or selects a key.
@@ -675,6 +736,7 @@ Tree-sitter AST-aware chunking:
 | JSON | `.json` |
 | Markdown | `.md`, `.markdown`, `.txt` |
 | Jupyter | `.ipynb` |
+| Protobuf | `.proto` |
 
 Markdown uses the tree-sitter-md **block** grammar — chunks align to sections,
 headings, and code fences. Jupyter notebooks are parsed as JSON; code and

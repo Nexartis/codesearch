@@ -77,7 +77,7 @@ mod roles {
 
 /// The only scip-csharp output version this parser understands (index, find-refs, batch-find-refs).
 /// Bump together with the helper whenever any JSON schema changes.
-pub const SUPPORTED_INDEX_VERSION: &str = "1.0";
+pub const SUPPORTED_INDEX_VERSION: &str = "2.0";
 
 // ── find-refs output format ───────────────────────────────────────
 
@@ -85,6 +85,11 @@ pub const SUPPORTED_INDEX_VERSION: &str = "1.0";
 pub struct FindRefsResult {
     /// Reference locations (kind = "reference"). Does not include definitions.
     pub references: Vec<ScipReference>,
+    /// Non-fatal problems the helper survived while resolving (project
+    /// compile failures, FindReferencesAsync exceptions). Non-empty means
+    /// `references` may be incomplete. Empty when the helper pre-dates the
+    /// field (serde default) or the run was clean.
+    pub warnings: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -93,6 +98,10 @@ struct JsonFindRefsOutput {
     #[allow(dead_code)]
     symbol: String,
     references: Vec<JsonFindRefsOccurrence>,
+    /// Absent in helper output from before warnings existed — default to
+    /// empty so old binaries keep parsing as "complete".
+    #[serde(default)]
+    warnings: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -127,7 +136,10 @@ pub fn parse_find_refs_output(data: &[u8]) -> Result<FindRefsResult> {
         })
         .collect();
 
-    Ok(FindRefsResult { references })
+    Ok(FindRefsResult {
+        references,
+        warnings: output.warnings,
+    })
 }
 
 /// Parse a JSON byte slice into a symbol -> references map.
@@ -230,7 +242,7 @@ mod tests {
     #[test]
     fn test_parse_json_index_basic() {
         let json = r#"{
-            "metadata": {"version": "1.0", "tool_info": "scip-csharp"},
+            "metadata": {"version": "2.0", "tool_info": "scip-csharp"},
             "documents": [{
                 "relative_path": "src/Program.cs",
                 "occurrences": [{
@@ -263,7 +275,7 @@ mod tests {
     #[test]
     fn test_parse_json_index_empty_symbol_skipped() {
         let json = r#"{
-            "metadata": {"version": "1.0", "tool_info": "test"},
+            "metadata": {"version": "2.0", "tool_info": "test"},
             "documents": [{
                 "relative_path": "src/A.cs",
                 "occurrences": [{
@@ -283,7 +295,7 @@ mod tests {
     #[test]
     fn test_parse_json_index_rejects_unknown_version() {
         let json = r#"{
-            "metadata": {"version": "2.0", "tool_info": "x"},
+            "metadata": {"version": "9.9", "tool_info": "x"},
             "documents": [],
             "external_symbols": []
         }"#;
@@ -292,6 +304,58 @@ mod tests {
             err.to_string().contains("Unsupported"),
             "expected 'Unsupported' in error, got: {}",
             err
+        );
+    }
+
+    #[test]
+    fn test_parse_find_refs_output_carries_warnings_through() {
+        let json = r#"{
+            "version": "2.0",
+            "symbol": "csharp Ns . V#Validate().",
+            "references": [{
+                "file": "src/A.cs",
+                "start_line": 3,
+                "end_line": 3,
+                "kind": "reference"
+            }],
+            "warnings": [
+                "could not compile project 'Broken' — its symbols are missing from the map",
+                "FindReferencesAsync failed for Validate: InvalidOperationException: boom"
+            ]
+        }"#;
+
+        let result = parse_find_refs_output(json.as_bytes()).unwrap();
+        assert_eq!(result.references.len(), 1);
+        assert_eq!(result.warnings.len(), 2, "warnings must survive the parse");
+        assert!(result.warnings[0].contains("could not compile"));
+        assert!(
+            result.warnings[1].contains("FindReferencesAsync failed for Validate"),
+            "warning text must round-trip verbatim, got: {}",
+            result.warnings[1]
+        );
+    }
+
+    #[test]
+    fn test_parse_find_refs_output_without_warnings_field_is_complete() {
+        // Old helper binaries emit no warnings field: the serde default must
+        // parse them as EMPTY (complete), never fail.
+        let json = r#"{
+            "version": "2.0",
+            "symbol": "csharp Ns . V#Validate().",
+            "references": [{
+                "file": "src/A.cs",
+                "start_line": 3,
+                "end_line": 3,
+                "kind": "reference"
+            }]
+        }"#;
+
+        let result = parse_find_refs_output(json.as_bytes()).unwrap();
+        assert_eq!(result.references.len(), 1);
+        assert!(
+            result.warnings.is_empty(),
+            "missing field must default to complete, got: {:?}",
+            result.warnings
         );
     }
 }

@@ -17,11 +17,13 @@
 .DS_Store
 Thumbs.db
 
-# Ignore all hidden folders at any level (except .githooks)
+# Ignore all hidden folders at any level (except .githooks and .github)
 .*/ 
 **/.*/ 
 !.githooks/
 !**/.githooks/
+!.github/
+!**/.github/
 
 # Project specific
 /data/
@@ -34,6 +36,22 @@ criterion/
 # Testing
 /test-repos/
 
+# Local-only markdown (diagnoses, plans, worklogs, test scenarios).
+# The repo root keeps only its allowlisted .md files — see AGENTS.md
+# "Root file hygiene (markdown)". Also covered by the `.*/` rule above;
+# listed explicitly so the intent survives a future edit of that rule.
+.docs/
+
 # codesearch database (local index, binary files)
 .codesearch.db/
 test_tools.jsonl
+
+# Customer-reference patterns for the pre-push leak scan (.githooks/README.md).
+# Must never be tracked: the pattern list is a list of customer names, so
+# committing it would leak exactly what the scan exists to catch. This rule sits
+# last on purpose — .gitignore is last-match-wins, and the `!.githooks/` negation
+# above would otherwise re-admit it.
+.githooks/customer-patterns.local
+
+# build.ps1 output logs
+.tmp/

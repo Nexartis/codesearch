@@ -1,0 +1,11 @@
+#!/bin/bash
+# pre-merge-commit hook — branch-aware root-md allowlist guard on the merge
+# result. A CLEAN merge never invokes pre-commit, so without this gate
+# AGENTS.md/CLAUDE.md could ride a clean feature→develop merge back onto the
+# integration branch.
+#
+# Installed via `git config core.hooksPath .githooks` — see .githooks/README.md.
+
+. "$(dirname "$0")/lib/root-md-guard.sh"
+root_md_guard || exit 1
+exit 0

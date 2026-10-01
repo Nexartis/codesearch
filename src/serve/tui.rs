@@ -21,9 +21,9 @@ use tokio_util::sync::CancellationToken;
 use super::tui_common::{
     self, KeyAction, OverlayKeyAction, OverlayState, RemoteIndexStats, RemoteStatsState, RepoRow,
 };
-use super::ServeState;
+use super::{IndexingOwner, ServeState};
 use crate::cli::doctor;
-use crate::constants::{DB_DIR_NAME, LANG_CSHARP};
+use crate::constants::{DB_DIR_NAME, LANG_CSHARP, LANG_TYPESCRIPT};
 use crate::index::IndexManager;
 
 /// Footer flash shown when a local-index action key (doctor / reindex / remove)
@@ -98,19 +98,85 @@ async fn run_tui_loop(
     // Monotonic id of the most recent doctor request; bumped on every spawn.
     let mut doctor_gen: u64 = 0;
 
-    // Mounted remote projects (peer-hosted indexes, shown italic). Discovered on
-    // a slow background cadence so per-peer HTTP never blocks the render tick;
-    // the latest snapshot is cached here and appended after the local rows.
-    let (remote_tx, mut remote_rx) = tokio::sync::mpsc::channel::<Vec<RepoRow>>(1);
+    // Mounted remote projects (peer-hosted indexes, shown italic). The background
+    // task rebuilds these rows from config alone and NEVER polls a peer on a
+    // timer; the only refresh trigger is a poke sent the moment a real tool call
+    // hits a peer (so a scale-to-zero peer is never woken by the dashboard). The
+    // latest snapshot is cached here and appended after the local rows.
+    let (remote_tx, mut remote_rx) = tokio::sync::mpsc::channel::<RemoteDiscoveryUpdate>(1);
+    // Poke channel: the render loop sends a peer name here when it detects that
+    // peer's activity advanced (a real tool call), triggering an immediate
+    // single-peer `/status` refresh in the discovery task.
+    let (poke_tx, poke_rx) = tokio::sync::mpsc::channel::<String>(8);
     let mut remote_rows: Vec<RepoRow> = Vec::new();
-    spawn_remote_discovery(state.clone(), remote_tx, cancel_token.clone());
+    // Per-peer wall-clock of the last successful `/status` refresh (reported by
+    // the discovery task). A row whose peer hasn't been refreshed within
+    // `REMOTE_ACTIVITY_FRESH_SECS` renders its activity as a stale `-`.
+    let mut remote_refreshed_at: std::collections::HashMap<String, std::time::Instant> =
+        std::collections::HashMap::new();
+    // High-water mark of each peer's last real activity (from
+    // `ServeState::remote_peer_last_activity`). An advance vs. the previous tick
+    // means a tool call just used that peer → poke an immediate refresh.
+    let mut peer_activity_hwm: std::collections::HashMap<String, std::time::Instant> =
+        std::collections::HashMap::new();
+    spawn_remote_discovery(state.clone(), remote_tx, poke_rx, cancel_token.clone());
 
     // Main loop
     loop {
         // Absorb the newest remote-projects snapshot, if the background task
         // produced one since the last tick (keep the previous list otherwise).
-        while let Ok(latest) = remote_rx.try_recv() {
-            remote_rows = latest;
+        while let Ok(update) = remote_rx.try_recv() {
+            remote_rows = update.rows;
+            for (peer, t) in update.refreshed_at {
+                remote_refreshed_at.insert(peer, t);
+            }
+        }
+
+        // Federation-only housekeeping (local repos are untouched): for each
+        // mounted remote project, (a) mark its activity stale/fresh from its
+        // peer's last refresh time, and (b) detect peers whose real activity
+        // advanced since the last tick and poke the discovery task to refresh
+        // just them. A peer with no mounts contributes nothing and is never
+        // polled — the activity poke is the *only* thing that ever contacts a
+        // peer from here, so a federated peer can stay scaled to zero for as
+        // long as nobody actually queries it.
+        let fresh_window = Duration::from_secs(crate::constants::REMOTE_ACTIVITY_FRESH_SECS);
+        let mut alias_to_peer: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let mut peers_to_poke: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (local_name, target) in state.config_snapshot().mounted_remote_projects() {
+            if let crate::db_discovery::repos::Target::RemoteProject { peer_name, .. } = target {
+                alias_to_peer.insert(local_name, peer_name);
+            }
+        }
+        for row in remote_rows.iter_mut() {
+            let Some(peer) = alias_to_peer.get(&row.alias) else {
+                continue;
+            };
+            // (a) staleness: fresh only if refreshed within the window.
+            let fresh = remote_refreshed_at
+                .get(peer)
+                .is_some_and(|t| t.elapsed() < fresh_window);
+            row.activity_stale = !fresh;
+            // (b) activity advance → poke an immediate per-peer refresh.
+            if let Some(activity) = state.remote_peer_last_activity(peer) {
+                match peer_activity_hwm.get(peer).copied() {
+                    None => {
+                        // Seed: don't poke for activity that predates the TUI.
+                        peer_activity_hwm.insert(peer.clone(), activity);
+                    }
+                    Some(prev) if activity > prev => {
+                        peers_to_poke.insert(peer.clone());
+                        peer_activity_hwm.insert(peer.clone(), activity);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for peer in peers_to_poke {
+            // try_send on a capacity-8 channel; a dropped poke just means the
+            // discovery task already has a refresh queued for this peer.
+            let _ = poke_tx.try_send(peer);
         }
 
         // Draw the UI — local repos first, mounted remote projects appended.
@@ -134,6 +200,12 @@ async fn run_tui_loop(
         let csharp_helper = state
             .symbol_registry
             .get(LANG_CSHARP)
+            .map(|i| i.is_available())
+            .unwrap_or(false);
+
+        let ts_helper = state
+            .symbol_registry
+            .get(LANG_TYPESCRIPT)
             .map(|i| i.is_available())
             .unwrap_or(false);
 
@@ -167,6 +239,7 @@ async fn run_tui_loop(
                 active,
                 &cpu,
                 csharp_helper,
+                ts_helper,
                 flash_msg,
             );
 
@@ -362,7 +435,7 @@ fn map_repo_rows(
                 super::RepoStateLabel::Open => "open",
                 super::RepoStateLabel::Warm => "warm",
                 super::RepoStateLabel::Readonly => "readonly",
-                super::RepoStateLabel::Closed => "closed",
+                super::RepoStateLabel::Idle => "idle",
                 super::RepoStateLabel::Indexing => "indexing",
                 super::RepoStateLabel::Error => "error",
                 super::RepoStateLabel::NoIndex => "no_index",
@@ -370,6 +443,14 @@ fn map_repo_rows(
             .to_string();
 
             let csharp_str = match info.csharp_index {
+                super::CSharpIndexStatus::Ready => "ready",
+                super::CSharpIndexStatus::Indexing => "indexing",
+                super::CSharpIndexStatus::Error => "error",
+                super::CSharpIndexStatus::None => "none",
+            }
+            .to_string();
+
+            let ts_str = match info.typescript_index {
                 super::CSharpIndexStatus::Ready => "ready",
                 super::CSharpIndexStatus::Indexing => "indexing",
                 super::CSharpIndexStatus::Error => "error",
@@ -394,12 +475,15 @@ fn map_repo_rows(
                 status: status_str,
                 csharp_index: csharp_str,
                 csharp_error: info.csharp_error.clone(),
+                typescript_index: ts_str,
                 changes: info.changes,
                 tool_call_count: info.tool_call_count,
                 last_tool_call: info.last_tool_call.clone(),
                 lock_mode,
                 path,
                 is_remote: false,
+                // Local repos carry live serve state — never stale.
+                activity_stale: false,
             }
         })
         .collect()
@@ -409,16 +493,63 @@ fn map_repo_rows(
 // Mounted remote projects (federation) — background discovery
 // ---------------------------------------------------------------------------
 
-/// Spawn the background task that periodically re-discovers mounted remote
-/// projects and pushes the latest `RepoRow` list through `tx`.
+/// One background-discovery snapshot pushed from [`spawn_remote_discovery`] to
+/// the render loop: the rebuilt remote rows plus the per-peer wall-clock of the
+/// last successful `/status` refresh (used to mark cached activity stale).
+struct RemoteDiscoveryUpdate {
+    rows: Vec<RepoRow>,
+    refreshed_at: std::collections::HashMap<String, std::time::Instant>,
+}
+
+/// Query one peer's `/status`, returning its repo list on success or `None` if
+/// the peer is unreachable / errored this round (caller keeps the cached row).
+async fn poll_peer_status(
+    client: &crate::federation::FederationClient,
+    peer: &crate::db_discovery::repos::RemotePeer,
+) -> Option<Vec<crate::federation::RemoteRepoStatus>> {
+    use crate::federation::ManagementOutcome;
+    match client.list_repos(peer).await {
+        ManagementOutcome::Ok(status) => Some(status.repos),
+        _ => None,
+    }
+}
+
+/// Spawn the background task that discovers mounted remote projects and pushes
+/// snapshots through `tx`.
 ///
-/// Runs off the render loop so per-peer HTTP never blocks a frame. Each round
-/// queries every configured peer's `/status` concurrently; peers that answer
-/// refresh an in-memory "last-known" alias list, and peers that fail this round
-/// reuse it — so a transient blip doesn't make a mount vanish from the table.
+/// **Scale-to-zero design: a federated peer is NEVER polled on a timer.** Local
+/// repos are refreshed freely by the render loop; a *federated* peer is
+/// contacted only when there is a real reason to:
+///
+/// - an **activity poke** — a genuine federated tool call just hit that peer, so
+///   it is already awake and refreshing it costs nothing. The render loop detects
+///   the advance via [`ServeState::remote_peer_last_activity`] and sends the peer
+///   name on `poke_rx`; only that peer is refreshed, never a full fan-out, so an
+///   idle sibling peer is not touched.
+/// - an explicit operator keypress — `i` on a remote row fetches that peer's
+///   index stats for the info overlay (see `spawn_remote_info`). That is a
+///   deliberate human action, not background traffic. `l` (reload) only re-reads
+///   the local config and contacts nobody.
+///
+/// The periodic tick below is **config-only**
+/// ([`crate::constants::REMOTE_ROW_REFRESH_SECS`]): it rebuilds the rows from the
+/// `remote_mounts` allowlist so mount/unmount edits and `l` reloads appear
+/// promptly, and issues no HTTP whatsoever. Outside of active use a mount
+/// therefore renders its activity as a stale `-` and a scale-to-zero peer stays
+/// asleep indefinitely. A peer that blips on a poke keeps its cached row (a mount
+/// never vanishes on a transient failure).
+///
+/// **Why there is no baseline poll.** An earlier version ran a `/status` fan-out
+/// on the *local* serve's idle-suspend window (2h by default), on the theory that
+/// polling no faster than the suspend term was harmless. It is not: each poll
+/// *woke* a sleeping replica, which then held itself warm for its own full idle
+/// window (1h on the cloud deploy) — a ~50% duty cycle on a peer nobody queried.
+/// Not keeping a peer awake past its suspend term is not the same as not waking
+/// it, and the two windows were unrelated values besides (local vs. peer).
 fn spawn_remote_discovery(
     state: Arc<ServeState>,
-    tx: tokio::sync::mpsc::Sender<Vec<RepoRow>>,
+    tx: tokio::sync::mpsc::Sender<RemoteDiscoveryUpdate>,
+    mut poke_rx: tokio::sync::mpsc::Receiver<String>,
     cancel: CancellationToken,
 ) {
     tokio::spawn(async move {
@@ -430,65 +561,101 @@ fn spawn_remote_discovery(
                 return;
             }
         };
-        let interval = Duration::from_secs(crate::constants::REMOTE_DISCOVERY_INTERVAL_SECS);
+        // Cadence of the CONFIG-ONLY row rebuild. This tick contacts no peer, so
+        // it cannot wake a scale-to-zero replica and is safe to run often; it
+        // exists purely so mount/unmount edits and `l` reloads surface promptly.
+        let row_refresh = Duration::from_secs(crate::constants::REMOTE_ROW_REFRESH_SECS.max(1));
+
+        // Cached per-(peer, remote_alias) status, retained across cycles so a
+        // peer that blips this round keeps showing its last-known row.
+        let mut status_lookup: std::collections::HashMap<
+            (String, String),
+            crate::federation::RemoteRepoStatus,
+        > = std::collections::HashMap::new();
+        // Per-peer wall-clock of the last successful `/status` refresh; shipped
+        // with each snapshot so the render loop can mark stale activity.
+        let mut refreshed_at: std::collections::HashMap<String, std::time::Instant> =
+            std::collections::HashMap::new();
 
         loop {
+            // ── Config-only snapshot. Rows come from the `remote_mounts`
+            // allowlist and are merely *enriched* by whatever status is already
+            // cached, so this issues no HTTP and cannot wake a sleeping peer. A
+            // mount with no cached refresh (`refreshed_at` miss) renders its
+            // activity as a stale `-`, which is the correct display for a peer
+            // that is scaled to zero.
+            //
+            // Emitted UNCONDITIONALLY, including when no peers are configured:
+            // the old code gated this on `!cfg.remotes.is_empty()`, so removing
+            // the last peer from `repos.json` left the previously emitted rows
+            // rendered forever (no snapshot was ever sent to clear them). With
+            // no peers `build_remote_rows` yields an empty vec, which clears
+            // them. Still zero HTTP, so this costs nothing.
             let cfg = state.config_snapshot();
-            if !cfg.remotes.is_empty() {
-                let rows = discover_remote_rows(&client, &cfg).await;
-                // Capacity-1 channel: replace the pending snapshot if the render
-                // loop hasn't consumed it yet (try_send drops on Full — fine, the
-                // next round supersedes it anyway).
-                let _ = tx.try_send(rows);
-            }
+            // Capacity-1 channel: replace the pending snapshot if the render
+            // loop hasn't consumed it yet (try_send drops on Full — fine, the
+            // next tick supersedes it anyway).
+            let _ = tx.try_send(RemoteDiscoveryUpdate {
+                rows: build_remote_rows(&status_lookup, &cfg),
+                refreshed_at: refreshed_at.clone(),
+            });
 
+            // ── Wait: config-only tick OR an activity poke. ──
+            // The tick merely loops back and re-emits rows. A poke means a real
+            // federated tool call just landed on that peer, so it is provably
+            // awake already — refresh that ONE peer; idle sibling peers are never
+            // contacted. There is deliberately no timer branch that polls peers.
             tokio::select! {
-                _ = cancel.cancelled() => break,
-                _ = tokio::time::sleep(interval) => {}
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(row_refresh) => {}
+                peer = poke_rx.recv() => {
+                    // poke_rx closes only when the render loop is shutting
+                    // down (it owns poke_tx) → exit the discovery task.
+                    let Some(first) = peer else { return; };
+                    // Drain queued pokes; refresh each unique peer once.
+                    let mut targets = std::collections::HashSet::new();
+                    targets.insert(first);
+                    while let Ok(more) = poke_rx.try_recv() {
+                        targets.insert(more);
+                    }
+                    let cfg = state.config_snapshot();
+                    for peer_name in targets {
+                        let Some(peer) = cfg.remotes.get(&peer_name) else {
+                            continue;
+                        };
+                        if let Some(repos) = poll_peer_status(&client, peer).await {
+                            // Drop stale entries for this peer before inserting the
+                            // fresh set (handles repos that vanished on the peer).
+                            status_lookup.retain(|(p, _), _| p != &peer_name);
+                            for r in repos {
+                                status_lookup
+                                    .insert((peer_name.clone(), r.alias.clone()), r);
+                            }
+                            refreshed_at.insert(peer_name, std::time::Instant::now());
+                        }
+                        // An unreachable peer keeps its cached row + aged refresh
+                        // time (→ stale `-`), never vanishing from the table.
+                    }
+                    // Loop back: the snapshot at the top ships the refreshed rows.
+                }
             }
         }
     });
 }
 
-/// Build the mounted remote-project rows for the TUI.
-///
-/// Rows come from the opt-in [`remote_mounts`](crate::db_discovery::repos::ReposConfig::remote_mounts)
-/// allowlist (config-driven, so they always show). Every peer's `/status` is
-/// polled concurrently only to *enrich* those rows with live per-repo state;
-/// a mount whose peer is unreachable this round simply falls back to a "warm"
-/// default. Discovery never defines which projects are mounted.
-async fn discover_remote_rows(
-    client: &crate::federation::FederationClient,
+/// Build the mounted remote-project rows from a cached `(peer, alias) → status`
+/// map. Rows always come from the opt-in `remote_mounts` allowlist
+/// (config-driven, so they always show); the status map only *enriches* them
+/// with live per-repo state. A mount whose peer is unreachable simply falls back
+/// to a "warm" default — discovery never defines which projects are mounted.
+fn build_remote_rows(
+    status_lookup: &std::collections::HashMap<
+        (String, String),
+        crate::federation::RemoteRepoStatus,
+    >,
     cfg: &crate::db_discovery::repos::ReposConfig,
 ) -> Vec<RepoRow> {
     use crate::db_discovery::repos::Target;
-    use crate::federation::ManagementOutcome;
-
-    // 1) Fan out /status to all peers concurrently, keyed (peer, remote_alias).
-    let mut status_lookup: std::collections::HashMap<
-        (String, String),
-        crate::federation::RemoteRepoStatus,
-    > = std::collections::HashMap::new();
-
-    let mut join = tokio::task::JoinSet::new();
-    for (peer_name, peer) in cfg.remotes.iter() {
-        let client = client.clone();
-        let peer = peer.clone();
-        let peer_name = peer_name.clone();
-        join.spawn(async move {
-            let outcome = client.list_repos(&peer).await;
-            (peer_name, outcome)
-        });
-    }
-    while let Some(res) = join.join_next().await {
-        if let Ok((peer_name, ManagementOutcome::Ok(status))) = res {
-            for r in status.repos {
-                status_lookup.insert((peer_name.clone(), r.alias.clone()), r);
-            }
-        }
-    }
-
-    // 2) Build one row per mounted project, enriched with live status.
     cfg.mounted_remote_projects()
         .into_iter()
         .map(|(local_name, target)| {
@@ -511,6 +678,7 @@ async fn discover_remote_rows(
                     .unwrap_or_else(|| "warm".to_string()),
                 csharp_index: "none".to_string(),
                 csharp_error: None,
+                typescript_index: "none".to_string(),
                 changes: st.map(|s| s.changes).unwrap_or(0),
                 tool_call_count: st.and_then(|s| s.tool_call_count).unwrap_or(0),
                 last_tool_call: st.and_then(|s| s.last_tool_call.clone()),
@@ -518,6 +686,9 @@ async fn discover_remote_rows(
                 // Detail panel shows where the mount lives.
                 path: peer.url.clone(),
                 is_remote: true,
+                // Computed per-tick by the render loop from the per-peer refresh
+                // time; discovery itself leaves it fresh-neutral.
+                activity_stale: false,
             }
         })
         .collect()
@@ -639,6 +810,7 @@ fn build_info_overlay(
 
     Some(OverlayState::Info {
         alias: alias.clone(),
+        path: db_path.display().to_string(),
         chunks,
         files,
         max_chunk_id,
@@ -835,6 +1007,7 @@ fn spawn_remote_info(
         let stats = match FederationClient::new() {
             Ok(client) => match client.repo_info(&peer, &remote_alias).await {
                 ManagementOutcome::Ok(info) => RemoteStatsState::Ready(RemoteIndexStats {
+                    path: info.path,
                     chunks: info.chunks,
                     files: info.files,
                     db_size_human: info.db_size_human,
@@ -887,7 +1060,7 @@ fn with_remote_stats(overlay: OverlayState, stats: RemoteStatsState) -> OverlayS
 /// Outcome of a TUI force-reindex launch — used to drive immediate footer
 /// feedback. Only describes whether the background task *started*; the actual
 /// indexing result is reported later via the status column / logs.
-enum ReindexLaunch {
+pub(crate) enum ReindexLaunch {
     /// Background reindex task spawned successfully.
     Started,
     /// A reindex was already running for this alias — request ignored.
@@ -898,9 +1071,9 @@ enum ReindexLaunch {
 
 /// Spawn a background force reindex task for the given repo alias.
 /// Follows the same flow as the HTTP `reindex_handler`.
-fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> ReindexLaunch {
+pub(crate) fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> ReindexLaunch {
     // Guard against concurrent reindex
-    if !state.begin_indexing(&alias) {
+    if !state.begin_indexing(&alias, IndexingOwner::Reindex) {
         tracing::warn!(
             "Force reindex already in progress for '{}', skipping TUI request",
             alias
@@ -912,7 +1085,7 @@ fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> ReindexLaunch 
         Ok(c) => c,
         Err(e) => {
             tracing::error!("Config lock poisoned: {}", e);
-            state.end_indexing(&alias);
+            state.end_indexing(&alias, IndexingOwner::Reindex);
             return ReindexLaunch::Failed;
         }
     };
@@ -920,10 +1093,23 @@ fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> ReindexLaunch 
         Some(p) => p,
         None => {
             tracing::error!("Cannot resolve alias '{}' for force reindex", alias);
-            state.end_indexing(&alias);
+            state.end_indexing(&alias, IndexingOwner::Reindex);
             return ReindexLaunch::Failed;
         }
     };
+    // Same guard as the HTTP reindex route: a force reindex opens the repo
+    // write-mode and rebuilds its index, which for a read-only repo means both a
+    // memory blow-up on a constrained replica and divergence from the index its
+    // owning job publishes.
+    if config.repo_read_only.get(&alias) == Some(&true) {
+        tracing::warn!(
+            "Refusing force reindex of '{}': marked read-only (repo_read_only) — its index is \
+             owned by another writer",
+            alias
+        );
+        state.end_indexing(&alias, IndexingOwner::Reindex);
+        return ReindexLaunch::Failed;
+    }
     drop(config); // release read lock
 
     let db_path = project_path.join(DB_DIR_NAME);
@@ -934,7 +1120,7 @@ fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> ReindexLaunch 
         None => {
             // Try to open stores (allow_create=true for recovery)
             let cancel = CancellationToken::new();
-            match state.try_open_stores(&alias, &db_path, true) {
+            match state.try_open_stores(&alias, &db_path, true, false, None) {
                 Ok(super::OpenedStores::Write(s)) => {
                     state.repos.insert(
                         alias.clone(),
@@ -952,12 +1138,12 @@ fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> ReindexLaunch 
                         "Repo {} opened read-only; cannot force-reindex from TUI",
                         alias
                     );
-                    state.end_indexing(&alias);
+                    state.end_indexing(&alias, IndexingOwner::Reindex);
                     return ReindexLaunch::Failed;
                 }
                 Err(e) => {
                     tracing::error!("Cannot open stores for '{}': {}", alias, e);
-                    state.end_indexing(&alias);
+                    state.end_indexing(&alias, IndexingOwner::Reindex);
                     return ReindexLaunch::Failed;
                 }
             }
@@ -966,28 +1152,71 @@ fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> ReindexLaunch 
 
     let alias_bg = alias.clone();
     let state_bg = state.clone();
-    tokio::spawn(async move {
+    let pool = state.embedding_pool();
+    // Fresh cancellation token for this reindex task, registered in
+    // `index_tasks` so `remove_repo` can cancel + await it (BUG1).
+    let reindex_token = CancellationToken::new();
+    let reindex_token_task = reindex_token.clone();
+    let handle = tokio::spawn(async move {
         tracing::info!(
             "TUI: Force reindex for '{}': clearing stores and reindexing",
             alias_bg
         );
 
-        match IndexManager::force_reindex_with_stores(&project_path, &db_path, &stores, None).await
+        match IndexManager::force_reindex_with_stores(
+            &project_path,
+            &db_path,
+            &stores,
+            None,
+            &reindex_token_task,
+            Some(&pool),
+        )
+        .await
         {
             Ok(()) => {
                 tracing::info!("TUI: Force reindex complete for '{}'", alias_bg);
             }
             Err(e) => {
+                if reindex_token_task.is_cancelled() {
+                    // Cancellation (e.g. remove_repo ran mid-reindex): the repo
+                    // is already being torn down by remove_repo — do NOT restart
+                    // the FSW, which would resurrect the removed alias with a
+                    // fresh, uncancellable task.
+                    tracing::info!("TUI: Reindex cancelled for '{}': {}", alias_bg, e);
+                    state_bg.end_indexing(&alias_bg, IndexingOwner::Reindex);
+                    return;
+                }
                 tracing::error!("TUI: Force reindex failed for '{}': {}", alias_bg, e);
             }
         }
 
-        // Restart FSW with fresh IndexManager
+        // Guard: even if force_reindex returned Ok, the repo may have been
+        // removed (or the task cancelled) during the embed pass. Do NOT restart
+        // the FSW — that would resurrect the removed alias. restart_fsw's own
+        // config check is insufficient here because remove_repo unregisters
+        // config AFTER awaiting this task.
+        if !state_bg.is_alias_live(&alias_bg, &reindex_token_task) {
+            // Alias removed during force_reindex (whose final build_index is
+            // uninterruptible). `remove_repo` gave up awaiting this task and
+            // reported its own outcome; drop our stores handle (closes the
+            // LMDB env) and self-clean the orphaned DB dir.
+            tracing::info!(
+                "TUI: Repo '{}' removed mid-reindex; dropping stores and self-cleaning DB dir",
+                alias_bg
+            );
+            drop(stores);
+            state_bg.self_clean_if_unregistered(&alias_bg, &db_path);
+            state_bg.end_indexing(&alias_bg, IndexingOwner::Reindex);
+            return;
+        }
+
+        // Restart FSW with fresh IndexManager.
         state_bg.restart_fsw(&alias_bg, stores).await;
 
         // Remove guard
-        state_bg.end_indexing(&alias_bg);
+        state_bg.end_indexing(&alias_bg, IndexingOwner::Reindex);
     });
+    state.index_tasks.insert(alias, (handle, reindex_token));
 
     ReindexLaunch::Started
 }

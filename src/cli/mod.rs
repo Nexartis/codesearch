@@ -26,6 +26,14 @@ pub enum IndexCommands {
         #[arg(long)]
         model: Option<String>,
 
+        /// Build locally even if a serve instance is running
+        #[arg(long)]
+        local: bool,
+
+        /// Write a clean build log to this path (default: <db>/.codesearch.db/build.log when stdout is not a TTY)
+        #[arg(long)]
+        log_file: Option<PathBuf>,
+
         /// Register the repo on a remote peer (name from `codesearch remote list`).
         /// When set, <path> is a path on the remote's filesystem.
         #[arg(long)]
@@ -261,10 +269,9 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub store: Option<String>,
 
-    /// Embedding model to use (e.g., bge-small, minilm-l6-q, jina-code)
-    /// Available: minilm-l6, minilm-l6-q, minilm-l12, minilm-l12-q, paraphrase-minilm,
-    ///            bge-small, bge-small-q, bge-base, nomic-v1, nomic-v1.5, nomic-v1.5-q,
-    ///            jina-code, e5-multilingual, mxbai-large, modernbert-large
+    /// Embedding model to use (e.g., bge-small, jina-code, embeddinggemma-q4).
+    /// On `serve`, this is the default for newly created indexes; each repo's
+    /// existing index keeps the model recorded in its own metadata.
     #[arg(long, global = true)]
     pub model: Option<String>,
 }
@@ -372,6 +379,10 @@ pub enum Commands {
         #[arg(long)]
         symbols: bool,
 
+        /// Write a clean build log to this path (default: <db>/.codesearch.db/build.log when stdout is not a TTY)
+        #[arg(long)]
+        log_file: Option<PathBuf>,
+
         // Backward-compat flags (predate subcommands)
         /// Add a repository to the index (creates local or global index)
         #[arg(long)]
@@ -452,6 +463,12 @@ pub enum Commands {
         /// For `tui` action: serve URL to connect to
         #[arg(long, default_value = DEFAULT_SERVE_URL)]
         url: String,
+
+        /// For `tui` action: API key for an authenticated remote serve. When
+        /// omitted, the key is looked up in `~/.codesearch/repos.json` by
+        /// matching `--url` against a configured remote peer's URL.
+        #[arg(long)]
+        api_key: Option<String>,
     },
 
     /// Show statistics about the vector database
@@ -514,11 +531,34 @@ pub enum Commands {
         )]
         create_index: bool,
 
+        /// Serve a caller-owned local index without writing to it.
+        ///
+        /// Opens the database read-only and never runs incremental refresh or
+        /// file watching. On its own this still serves an index another process
+        /// is building; pair it with --require-ready to reject that case.
+        /// Requires --mode local.
+        #[arg(long)]
+        readonly: bool,
+
+        /// Refuse to start unless the existing local index is complete.
+        ///
+        /// Verifies the vector and full-text stores hold data before the MCP
+        /// transport opens, so an incomplete index fails startup instead of
+        /// answering `status` with "building" and `search` with no results.
+        /// Requires --mode local.
+        #[arg(long)]
+        require_ready: bool,
+
         /// MCP connection mode (default: auto, override with CODESEARCH_MCP_MODE)
         ///
         /// - auto:   Connect to serve if running, otherwise use local DB
         /// - client: Always connect to serve; fail if not running
         /// - local:  Always use local DB (classic stdio behavior)
+        ///
+        /// In auto/client mode the connection to serve is closed after 60s
+        /// without traffic (so a scale-to-zero remote can suspend) and reopened
+        /// on the next request. Tune with
+        /// CODESEARCH_MCP_PROXY_IDLE_DISCONNECT_SECS; 0 keeps it always open.
         #[arg(short, long, env = crate::constants::MCP_MODE_ENV, default_value = "auto")]
         mode: crate::mcp::McpMode,
     },
@@ -729,13 +769,75 @@ fn unwrap_management<T>(
     }
 }
 
+/// Print one `<peer>/<alias>` project row for `codesearch remote available`
+/// and `codesearch index list --remote`, marking whether it's mounted.
+/// `tag` is the live peer status (e.g. "warm") or "cached" for an offline
+/// fallback row.
+fn print_remote_project_row(canonical: &str, mounted: bool, tag: &str) {
+    let mark = if mounted { "✓ mounted" } else { "  -      " };
+    println!("  {mark}  {canonical}  [{tag}]");
+}
+
 /// `codesearch index list --remote <peer>` — list repos registered on a peer.
 async fn run_remote_list(peer_name: &str, json: bool) -> Result<()> {
+    use crate::federation::ManagementOutcome;
     use colored::Colorize;
 
     let peer = resolve_remote_peer(peer_name)?;
+    let mut config = crate::db_discovery::load_repos_config()?;
     let client = crate::federation::FederationClient::new().map_err(anyhow::Error::msg)?;
-    let status = unwrap_management(peer_name, client.list_repos(&peer).await)?;
+
+    let status = match client.list_repos(&peer).await {
+        ManagementOutcome::Ok(status) => {
+            // Write-through: remember this peer's alias list so a later call
+            // can fall back to it if the peer is temporarily unreachable.
+            let aliases: Vec<String> = status.repos.iter().map(|r| r.alias.clone()).collect();
+            config.cache_remote_projects(peer_name, aliases);
+            if let Err(e) = config.save() {
+                tracing::warn!("failed to persist remote_project_cache: {e}");
+            }
+            status
+        }
+        ManagementOutcome::Unreachable(reason) => {
+            // Offline fallback: we only ever cached bare aliases (no live
+            // status/lock/changes), so this degrades to an alias-only listing
+            // rather than the full table below.
+            match config.cached_remote_project_aliases(peer_name) {
+                Some(aliases) if !aliases.is_empty() => {
+                    if json {
+                        let cached = serde_json::json!({
+                            "peer": peer_name,
+                            "unreachable": true,
+                            "reason": reason,
+                            "cached_aliases": aliases,
+                        });
+                        println!("{}", serde_json::to_string_pretty(&cached)?);
+                        return Ok(());
+                    }
+                    println!(
+                        "Remote '{}' ({}) is unreachable ({}) — showing last known projects:",
+                        peer_name.bright_cyan(),
+                        peer.url,
+                        reason
+                    );
+                    let mounted: std::collections::HashSet<&String> =
+                        config.remote_mounts.iter().collect();
+                    for alias in aliases {
+                        let canonical =
+                            crate::db_discovery::repos::remote_project_name(peer_name, alias);
+                        print_remote_project_row(
+                            &canonical,
+                            mounted.contains(&canonical),
+                            "cached",
+                        );
+                    }
+                    return Ok(());
+                }
+                _ => anyhow::bail!("Cannot reach peer '{}': {}", peer_name, reason),
+            }
+        }
+        outcome @ ManagementOutcome::HttpError { .. } => unwrap_management(peer_name, outcome)?,
+    };
 
     if json {
         println!("{}", serde_json::to_string_pretty(&status)?);
@@ -871,6 +973,18 @@ async fn run_remote_reindex(peer_name: &str, alias: &str, force: bool, json: boo
     Ok(())
 }
 
+fn warn_if_heavier_model(model_type: ModelType) {
+    if model_type.is_heavier_than_default() {
+        crate::warn_print!(
+            "Warning: model '{}' produces {}-dimensional vectors (default: {}). \
+             Expect higher vector-index RAM and disk usage.",
+            model_type.short_name(),
+            model_type.dimensions(),
+            ModelType::default().dimensions()
+        );
+    }
+}
+
 pub async fn run(cancel_token: CancellationToken) -> Result<()> {
     let cli = Cli::parse();
 
@@ -881,9 +995,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             "Unknown model: '{}'. Available models:",
             cli.model.as_deref().unwrap_or_default()
         );
-        eprintln!("  minilm-l6, minilm-l6-q, minilm-l12, minilm-l12-q, paraphrase-minilm");
-        eprintln!("  bge-small, bge-small-q, bge-base, nomic-v1, nomic-v1.5, nomic-v1.5-q");
-        eprintln!("  jina-code, e5-multilingual, mxbai-large, modernbert-large");
+        eprintln!("  {}", ModelType::valid_short_names());
         std::process::exit(1);
     }
 
@@ -918,6 +1030,9 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             if json {
                 crate::output::set_quiet(true);
             }
+            if let Some(mt) = model_type {
+                warn_if_heavier_model(mt);
+            }
             let options = SearchOptions {
                 max_results,
                 per_file: if per_file == 0 { None } else { Some(per_file) },
@@ -927,7 +1042,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                 sync,
                 json,
                 filter_path,
-                model_override: model_type.map(|mt| format!("{:?}", mt)),
+                model_override: model_type.map(|mt| mt.short_name().to_string()),
                 vector_only,
                 rrf_k: if rrf_k == 60.0 {
                     None
@@ -956,6 +1071,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             remove,
             keep_config,
             list,
+            log_file,
         } => {
             // Subcommand path (preferred)
             if let Some(cmd) = command {
@@ -964,6 +1080,8 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                         path: add_path,
                         global,
                         model,
+                        local,
+                        log_file: add_log_file,
                         remote,
                     } => {
                         if let Some(peer_name) = &remote {
@@ -981,8 +1099,18 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                                     parsed
                                 })
                                 .or(model_type);
-                            crate::index::add_to_index(add_path, global, mt, cancel_token.clone())
-                                .await
+                            if let Some(mt) = mt {
+                                warn_if_heavier_model(mt);
+                            }
+                            crate::index::add_to_index(
+                                add_path,
+                                global,
+                                local,
+                                add_log_file,
+                                mt,
+                                cancel_token.clone(),
+                            )
+                            .await
                         }
                     }
                     IndexCommands::Remove {
@@ -1040,9 +1168,14 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
 
                 if add || is_add_cmd {
                     let effective_path = if is_add_cmd { None } else { path };
+                    if let Some(mt) = model_type {
+                        warn_if_heavier_model(mt);
+                    }
                     crate::index::add_to_index(
                         effective_path,
                         global,
+                        false,
+                        log_file,
                         model_type,
                         cancel_token.clone(),
                     )
@@ -1072,12 +1205,17 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                         ),
                     }
                 } else {
+                    if let Some(mt) = model_type {
+                        warn_if_heavier_model(mt);
+                    }
                     crate::index::index(
                         path,
                         dry_run,
                         force,
                         false,
                         model_type,
+                        false,
+                        log_file,
                         cancel_token.clone(),
                     )
                     .await
@@ -1097,9 +1235,12 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             keep_warm_url,
             idle_suspend_secs,
             url,
+            api_key,
         } => {
             match action {
-                crate::cli::ServeAction::Tui => crate::serve::run_tui_standalone(url).await,
+                crate::cli::ServeAction::Tui => {
+                    crate::serve::run_tui_standalone(url, api_key).await
+                }
                 crate::cli::ServeAction::Start => {
                     // Initialize serve logger — always logs to ~/.codesearch/logs/serve.log.YYYY-MM-DD
                     // regardless of whether a database exists in the current directory.
@@ -1109,10 +1250,19 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                     if let Err(e) = crate::logger::init_serve_logger(log_level, effective_quiet) {
                         eprintln!("Warning: failed to initialize serve logger: {}", e);
                     }
+                    // `--model` is a global flag inherited by every subcommand. On
+                    // `serve` it sets the serve-wide default for newly created
+                    // indexes — each repo's queries still use the model recorded
+                    // in its own index metadata (a hub may mix models), so this
+                    // never overrides an existing index.
+                    if let Some(mt) = model_type {
+                        warn_if_heavier_model(mt);
+                    }
                     crate::serve::run_serve(
                         host,
                         port,
                         register,
+                        model_type,
                         no_tui,
                         keep_warm_url,
                         idle_suspend_secs,
@@ -1133,6 +1283,8 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
         Commands::Mcp {
             path,
             create_index,
+            readonly,
+            require_ready,
             mode,
         } => {
             // Logger is initialized inside run_mcp_server() once db_path is known.
@@ -1140,8 +1292,24 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             //
             // MCP stdio transport uses stdout for JSON-RPC — always force file-only
             // logging to keep the channel clean, regardless of the global --quiet flag.
-            crate::mcp::run_mcp_server(path, create_index, log_level, true, mode, cancel_token)
+            if readonly || require_ready {
+                crate::mcp::run_mcp_server_with_options(
+                    path,
+                    crate::mcp::McpStartupOptions {
+                        create_index,
+                        readonly,
+                        require_ready,
+                    },
+                    log_level,
+                    true,
+                    mode,
+                    cancel_token,
+                )
                 .await
+            } else {
+                crate::mcp::run_mcp_server(path, create_index, log_level, true, mode, cancel_token)
+                    .await
+            }
         }
         Commands::Cache { command } => match command {
             CacheCommands::Stats { model } => run_cache_stats(model).await,
@@ -1467,8 +1635,8 @@ async fn run_remote_command(command: RemoteCommands) -> Result<()> {
             use crate::federation::{FederationClient, ManagementOutcome};
 
             let peer_name = peer.trim();
-            let config = crate::db_discovery::load_repos_config()?;
-            let Some(peer_cfg) = config.remotes.get(peer_name) else {
+            let mut config = crate::db_discovery::load_repos_config()?;
+            let Some(peer_cfg) = config.remotes.get(peer_name).cloned() else {
                 anyhow::bail!(
                     "Unknown remote peer '{}'. Add it first with `codesearch remote add`.",
                     peer_name
@@ -1476,8 +1644,17 @@ async fn run_remote_command(command: RemoteCommands) -> Result<()> {
             };
             let client = FederationClient::new()
                 .map_err(|e| anyhow::anyhow!("failed to init HTTP client: {e}"))?;
-            match client.list_repos(peer_cfg).await {
+            match client.list_repos(&peer_cfg).await {
                 ManagementOutcome::Ok(status) => {
+                    // Write-through: remember this peer's alias list so a later
+                    // call can fall back to it if the peer is temporarily down.
+                    let aliases: Vec<String> =
+                        status.repos.iter().map(|r| r.alias.clone()).collect();
+                    config.cache_remote_projects(peer_name, aliases);
+                    if let Err(e) = config.save() {
+                        tracing::warn!("failed to persist remote_project_cache: {e}");
+                    }
+
                     if status.repos.is_empty() {
                         println!("Peer '{}' exposes no projects.", peer_name);
                         return Ok(());
@@ -1489,12 +1666,11 @@ async fn run_remote_command(command: RemoteCommands) -> Result<()> {
                     println!("Projects on '{}':", peer_name);
                     for r in &repos {
                         let canonical = remote_project_name(peer_name, &r.alias);
-                        let mark = if mounted.contains(&canonical) {
-                            "✓ mounted"
-                        } else {
-                            "  -      "
-                        };
-                        println!("  {mark}  {canonical}  [{}]", r.status);
+                        print_remote_project_row(
+                            &canonical,
+                            mounted.contains(&canonical),
+                            &r.status,
+                        );
                     }
                     println!("\nMount one with: codesearch remote mount <peer>/<alias>");
                 }
@@ -1502,7 +1678,30 @@ async fn run_remote_command(command: RemoteCommands) -> Result<()> {
                     anyhow::bail!("Peer '{}' returned HTTP {}: {}", peer_name, status, reason);
                 }
                 ManagementOutcome::Unreachable(reason) => {
-                    anyhow::bail!("Peer '{}' unreachable: {}", peer_name, reason);
+                    // Offline fallback: serve the last-known alias list (if any)
+                    // instead of hard-failing on a transient peer blip.
+                    match config.cached_remote_project_aliases(peer_name) {
+                        Some(aliases) if !aliases.is_empty() => {
+                            let mounted: std::collections::HashSet<&String> =
+                                config.remote_mounts.iter().collect();
+                            println!(
+                                "Peer '{}' unreachable ({}) — showing last known projects:",
+                                peer_name, reason
+                            );
+                            for alias in aliases {
+                                let canonical = remote_project_name(peer_name, alias);
+                                print_remote_project_row(
+                                    &canonical,
+                                    mounted.contains(&canonical),
+                                    "cached",
+                                );
+                            }
+                            println!("\nMount one with: codesearch remote mount <peer>/<alias>");
+                        }
+                        _ => {
+                            anyhow::bail!("Peer '{}' unreachable: {}", peer_name, reason);
+                        }
+                    }
                 }
             }
         }
@@ -1920,6 +2119,61 @@ mod tests {
             .expect("cli parse should succeed");
         match cli.command {
             Commands::Mcp { create_index, .. } => assert!(create_index),
+            _ => panic!("expected Mcp command"),
+        }
+    }
+
+    #[test]
+    fn test_mcp_readonly_and_require_ready_default_to_false() {
+        let cli = Cli::try_parse_from(["codesearch", "mcp"]).expect("cli parse should succeed");
+        match cli.command {
+            Commands::Mcp {
+                readonly,
+                require_ready,
+                ..
+            } => {
+                assert!(!readonly);
+                assert!(!require_ready);
+            }
+            _ => panic!("expected Mcp command"),
+        }
+    }
+
+    #[test]
+    fn test_mcp_readonly_does_not_imply_other_flags() {
+        let cli = Cli::try_parse_from(["codesearch", "mcp", "--readonly"])
+            .expect("cli parse should succeed");
+        match cli.command {
+            Commands::Mcp {
+                readonly,
+                require_ready,
+                create_index,
+                ..
+            } => {
+                assert!(readonly);
+                assert!(!require_ready, "--readonly must not imply --require-ready");
+                assert!(
+                    create_index,
+                    "--readonly must not imply --create-index=false"
+                );
+            }
+            _ => panic!("expected Mcp command"),
+        }
+    }
+
+    #[test]
+    fn test_mcp_require_ready_does_not_imply_readonly() {
+        let cli = Cli::try_parse_from(["codesearch", "mcp", "--require-ready"])
+            .expect("cli parse should succeed");
+        match cli.command {
+            Commands::Mcp {
+                require_ready,
+                readonly,
+                ..
+            } => {
+                assert!(require_ready);
+                assert!(!readonly, "--require-ready must not imply --readonly");
+            }
             _ => panic!("expected Mcp command"),
         }
     }

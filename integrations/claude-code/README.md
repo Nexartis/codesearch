@@ -26,16 +26,38 @@ parent's `AGENTS.md` or the MCP `initialize` instructions at all.
 
 ## The fix
 
-Two [Claude Code hooks](https://docs.claude.com/en/docs/claude-code/hooks)
+Four [Claude Code hooks](https://docs.claude.com/en/docs/claude-code/hooks)
 that make the preference *structural* instead of advisory:
 
-- **`grep-guard`** — a `PreToolUse` hook on `Grep`. Blocks the first `Grep`
-  call against an internal repo path when codesearch looks available, with a
-  message telling the model exactly how to load and call codesearch instead.
-  If the *same* query is retried within 5 minutes, it's let through
-  unblocked — that's the legitimate "codesearch found nothing, falling back"
-  path. Grep against paths outside the current repo is never blocked;
-  codesearch doesn't cover arbitrary external paths well, grep is right there.
+- **`grep-guard`** — a `PreToolUse` hook on `Grep`. Blocks every `Grep`
+  call against an indexed repo *for as long as the codesearch serve hub
+  is reachable*, with a message telling the model exactly how to load and
+  call codesearch instead. The guarded repo is resolved from the **grep
+  target itself** — the git root of the path being searched, not the
+  hook's working directory — so an absolute-path Grep into a different
+  indexed repo is guarded too (a cwd-based check used to let those
+  through, and until #199 the absolute-path test itself only recognized
+  Windows-style roots, so POSIX absolute paths were still resolved
+  against the cwd). Coverage is decided by **registration**: the target's
+  git root must be one of the repos in the hub's `~/.codesearch/repos.json`
+  (honoring `CODESEARCH_REPOS_CONFIG`), which also carves out nested
+  repos for free — an unregistered clone inside a registered repo
+  resolves to its own git root and is treated as uncovered. Grep is
+  auto-allowed **only** when codesearch is genuinely
+  down: the hook probes the unauthenticated `/healthz` liveness endpoint
+  and lets Grep through only when that probe fails. A low-confidence or
+  empty codesearch *result* is a successful call ("reformulate"), not a
+  dead server, so it does **not** unblock Grep. One exception: when the
+  target repo is live but **mid-reindex** (the serve watcher's full
+  refresh, e.g. right after a branch switch), the hook denies Grep with a
+  **wait-and-retry** instruction (sleep 15-30s, then re-run the
+  codesearch call) — searching a mid-rebuild index returns stale/empty
+  results and must not degrade into a manual grep approval on every
+  routine checkout. The freshness probe (`GET /indexing?path=<repo
+  root>`) is skipped silently on serves that predate the endpoint, so
+  hook and server versions can be mixed freely. Grep against paths
+  outside any git repo, or against repos codesearch does not cover, is
+  never blocked; grep is right there in those cases.
 
 - **`subagent-preamble`** — a `PreToolUse` hook on `Agent` (the subagent-spawn
   tool). Prepends a short preamble to every subagent prompt explaining that
@@ -43,9 +65,32 @@ that make the preference *structural* instead of advisory:
   and when to prefer it over Grep/Glob. This is the only way to reach
   subagents at all, since they don't inherit `AGENTS.md` or MCP instructions.
 
-Both hooks fail open: if they can't parse their input, or codesearch isn't
-running/indexed, they get out of the way and let Grep proceed untouched. They
-never block anything outside the current repo.
+- **`edit-guard`** — a `PreToolUse` hook on `Edit`/`Write`/`MultiEdit`.
+  Blocks an edit to a file in a codesearch-registered repo until codesearch
+  was consulted for that exact path within the last 5 minutes:
+  `mcp__codesearch__find_impact` for SCIP-backed languages
+  (`.cs .ts .tsx .mts .cts`), `mcp__codesearch__find(kind="usages")` for
+  everything else — making the caller-aware-editing protocol structural.
+  Coverage uses the same registration model as grep-guard (shared
+  `codesearch-common` helpers): the file's git root must be listed in
+  `~/.codesearch/repos.json` (or `CODESEARCH_SERVER` is set); unregistered
+  repos and non-git paths are never blocked.
+
+- **`edit-guard-post`** — a `PostToolUse` hook on
+  `mcp__codesearch__find_impact` and `mcp__codesearch__find`, recording the
+  "consulted" markers `edit-guard` reads into a state file
+  (`$TMPDIR/.codesearch-edit-guard-state.json` on bash,
+  `%TEMP%\.codesearch-edit-guard-state.json` on PowerShell). It fires on
+  every `find_impact` call and every `find(kind="usages")` (the kind check
+  is done script-side — matchers only see tool names). Any outcome counts:
+  "no results" and "no SCIP backend" still mark the path as consulted, so
+  the guard can never wedge permanently. PostToolUse hooks cannot block
+  anything; this one never emits a decision and always exits 0.
+
+All hooks fail open: if they can't parse their input, or codesearch isn't
+running/indexed, they get out of the way and let the tool call proceed
+untouched. They never block targets outside any git repo, or repos
+codesearch does not cover.
 
 ## Install
 
@@ -64,9 +109,11 @@ bash integrations/claude-code/install.sh --project
 ```
 
 The installer:
-1. copies the hook scripts into `<claude-dir>/hooks/codesearch/`
-2. merges two `PreToolUse` registrations into `<claude-dir>/settings.json`
-   (backing up the existing file first)
+1. copies the guard scripts, the PostToolUse companion and the shared
+   `codesearch-common` helpers into `<claude-dir>/hooks/codesearch/`
+2. merges the `PreToolUse` registrations (one per guard) and the
+   `PostToolUse` registration (the companion) into
+   `<claude-dir>/settings.json` (backing up the existing file first)
 3. is idempotent — re-running it skips hooks already registered and never
    duplicates or clobbers unrelated settings
 
@@ -74,9 +121,9 @@ Restart Claude Code (or start a new session) after installing.
 
 ## Manual install
 
-If you'd rather wire it up by hand, or already have a `PreToolUse.Grep` /
-`PreToolUse.Agent` hook and want to merge manually, add to
-`~/.claude/settings.json` (or `.claude/settings.json` for project scope):
+If you'd rather wire it up by hand, or already have hooks on these events and
+want to merge manually, add to `~/.claude/settings.json` (or
+`.claude/settings.json` for project scope):
 
 ```json
 {
@@ -93,6 +140,20 @@ If you'd rather wire it up by hand, or already have a `PreToolUse.Grep` /
         "hooks": [
           { "type": "command", "command": "pwsh -NoProfile -NonInteractive -File \"<path>/subagent-preamble.ps1\"" }
         ]
+      },
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          { "type": "command", "command": "pwsh -NoProfile -NonInteractive -File \"<path>/edit-guard.ps1\"" }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "mcp__codesearch__find_impact|mcp__codesearch__find",
+        "hooks": [
+          { "type": "command", "command": "pwsh -NoProfile -NonInteractive -File \"<path>/edit-guard-post.ps1\"" }
+        ]
       }
     ]
   }
@@ -101,33 +162,77 @@ If you'd rather wire it up by hand, or already have a `PreToolUse.Grep` /
 
 Use the `.sh` scripts with a `bash "<path>/..."` command instead on
 macOS/Linux. Point `<path>` at wherever you copy `hooks/*.ps1` / `hooks/*.sh`.
+The guard scripts source `codesearch-common.ps1` / `codesearch-common.sh`
+from their own directory, so that file must be copied alongside them.
 
 ## Uninstall
 
-Remove the two `PreToolUse` entries (matcher `Grep` and `Agent` whose command
-points at `hooks/codesearch/`) from `settings.json`, and delete
+Remove the guard entries (matchers `Grep`, `Agent`, `WebSearch|WebFetch` and
+`Edit|Write|MultiEdit` under `PreToolUse`, and
+`mcp__codesearch__find_impact|mcp__codesearch__find` under `PostToolUse`,
+whose commands point at `hooks/codesearch/`) from `settings.json`, and delete
 `<claude-dir>/hooks/codesearch/`.
 
 ## Caveats
 
-- `grep-guard` detects "codesearch is available **for the current repo**" via
-  a local `.codesearch.db` at the git root, or an explicit `CODESEARCH_SERVER`
-  env var for pure remote-serve setups with no local index. It deliberately
-  does **not** treat "a `codesearch` process is running" as sufficient —
-  `codesearch serve` commonly runs as a persistent background hub covering
-  many registered repos (`codesearch index list`), so that process is alive
-  on a dev machine almost all the time regardless of whether the current
-  directory is one of the repos it actually indexes. Checking process
-  presence alone made the hook fire in every directory on the machine,
-  including unindexed ones — this was found and fixed after exactly that
-  false-positive showed up in real use.
+- `grep-guard` resolves the guarded repo from the **grep target**, never
+  from its own cwd: empty/relative paths resolve against the cwd repo
+  (they are relative to it by definition), absolute paths resolve against
+  the git root of the path being searched. Coverage is then decided by
+  **registration with the serve hub**: the target's git root must be one
+  of the repos listed in `~/.codesearch/repos.json` (the same
+  registration list the hub itself resolves queries by, honoring the
+  `CODESEARCH_REPOS_CONFIG` override), or an explicit `CODESEARCH_SERVER`
+  env var for pure remote-serve setups with no local registration. A
+  local `.codesearch.db` directory is deliberately **not** a coverage
+  signal anymore (#199): a stale db from a since-unregistered repo used
+  to deny Grep even though the hub could not answer for that repo
+  (unknown alias), and a registered repo whose db directory was gone
+  slipped through uncovered. Because the git *root* must equal a
+  registration, nested repos are carved out correctly: an unregistered
+  clone inside a registered repo resolves to its own root and is treated
+  as uncovered. Missing, unreadable or malformed `repos.json` (or a
+  missing `jq`) fails **open** — a guard that cannot resolve coverage
+  must allow, never deny. It deliberately does **not** treat "a
+  `codesearch` process is running" as sufficient — `codesearch serve`
+  commonly runs as a persistent background hub covering many registered
+  repos (`codesearch index list`), so that process is alive on a dev
+  machine almost all the time regardless of whether the searched repo is
+  one of the repos it actually indexes. Checking process presence alone
+  made the hook fire in every directory on the machine, including
+  unindexed ones — this was found and fixed after exactly that
+  false-positive showed up in real use. (The older cwd-based resolution
+  had the mirror-image defect: an absolute-path Grep into a *different*
+  indexed repo looked "external" and slipped the guard — also fixed,
+  same release. Until #199 the absolute-path test itself only matched
+  Windows-style roots — `C:\`, `C:/`, MSYS `/c/`, UNC `//server` — so
+  POSIX absolute paths like `/home/...` were still resolved against the
+  cwd; with a session cwd that is a plain parent directory the guard
+  silently allowed everything.)
   If your setup connects to a remote `codesearch serve` instance with no
-  local `.codesearch.db`, set `CODESEARCH_SERVER` to opt back into
-  enforcement for that repo.
+  local `repos.json` registration, set `CODESEARCH_SERVER` to opt back
+  into enforcement for that repo. Both the bash and the PowerShell twin
+  now resolve coverage through the shared `codesearch-common` helpers,
+  so the two shells behave identically (the PowerShell twin used to lag
+  behind on the `.codesearch.db`/Windows-only-path signals — closed with
+  the edit-guard work, #199).
+- `edit-guard` is per-file, not per-repo: a marker for one file never
+  unblocks an edit to another file. The marker state lives in a temp-dir
+  JSON file (`$TMPDIR/.codesearch-edit-guard-state.json` /
+  `%TEMP%\.codesearch-edit-guard-state.json`), entries expire after
+  5 minutes and are pruned on write; missing or corrupt state counts as
+  "not consulted" (deny on covered repos, allow everywhere else). Like
+  the other guards it is per-machine, not per-repo: it only ever fires
+  on files whose git root is registered with the serve hub.
 - Both hooks are per-machine, not per-repo: install once at user scope and
-  every project benefits, including ones without a local `.codesearch.db`
-  (the guard simply won't block Grep there, since step 2 fails open).
-- The 5-minute retry-unblock window is a heuristic, not a guarantee the model
-  actually called codesearch in between. It's deliberately permissive —
-  the goal is nudging the *first* attempt, not adversarially trapping the
-  model into an unusable state.
+  every project benefits, including ones not registered with the serve
+  hub (the guard simply won't block Grep there, since coverage fails
+  open).
+- `grep-guard` decides "is codesearch down?" by probing the serve hub's
+  unauthenticated `/healthz` endpoint (base URL from `CODESEARCH_SERVER`, else
+  `http://127.0.0.1:$CODESEARCH_SERVE_PORT`, else the compiled default
+  `http://127.0.0.1:39725`). Any HTTP response counts as up and keeps Grep
+  blocked; only a connection-level failure (refused / timeout) counts as down
+  and lets Grep through. The probe has a 2-second timeout, so a wedged server
+  eventually fails open rather than stalling every Grep. The PowerShell hook
+  needs no extra tools; the bash hook additionally requires `curl`.

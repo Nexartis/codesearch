@@ -8,12 +8,32 @@
 //! `SymbolIndexer` impls here.
 
 pub mod csharp;
+pub mod resident;
 pub mod scip_parse;
+pub mod scip_proto;
+pub mod typescript;
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+
+// ── Helper rendering ──────────────────────────────────────────────
+
+/// Platform-stable rendering of a helper process's exit status.
+///
+/// `ExitStatus`'s `Display` prints `exit code: N` on Windows but
+/// `exit status: N` on Unix — text that is persisted into index meta
+/// tables and asserted by tests must not depend on the host OS (the
+/// Linux CI red after #238 was exactly this drift). Signal-terminated
+/// processes (Unix `code() == None`) have no portable code and fall
+/// back to the platform's own rendering.
+pub(crate) fn exit_status_text(status: &std::process::ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("exit code: {code}"),
+        None => status.to_string(),
+    }
+}
 
 // ── Common types ──────────────────────────────────────────────────
 
@@ -33,16 +53,121 @@ pub struct SymbolReference {
 /// Result of a `find_impact` query.
 #[derive(Debug, Clone, Serialize)]
 pub struct FindImpactResult {
-    /// Canonical SCIP symbol string, e.g. `csharp . . . FieldDefinition#Validate().`
+    /// The query as asked — a symbol name, `file:line`, or explicit key.
     pub symbol: String,
+    /// The canonical SCIP key actually selected, e.g.
+    /// `csharp . . . FieldDefinition#Validate().` Present only when the
+    /// query resolved to exactly one stored symbol; absent on an ambiguous
+    /// answer (a separate envelope) or when nothing matched. The selector
+    /// the issue-specified contract turns on: echo is `symbol`, identity
+    /// is this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_symbol: Option<String>,
     /// Resolved references.
     pub references: Vec<SymbolReference>,
+    /// Completeness warnings for this answer. Non-empty means the
+    /// reference list may be INCOMPLETE — a helper failure was survived
+    /// rather than fatal (a project that would not compile, an exception
+    /// during reference resolution, a non-zero scip-typescript exit) and
+    /// the partial result was kept. Entries name what failed. Omitted when
+    /// empty: absent means the answer is as complete as the index knows.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     /// Seconds since the symbol index was last rebuilt.
     pub index_age_seconds: u64,
     /// Language that produced this result.
     pub language: String,
     /// Scope that was searched, e.g. `"project:example-org"`.
     pub scope: String,
+    /// Git HEAD sha the symbol index was built for, when recorded. Compare
+    /// with `current_head_sha` to spot index drift after a branch switch.
+    /// Drift is surfaced, never auto-reindexed (deliberate — see
+    /// `SymbolIndexer::index_head_sha`). Omitted when unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_head_sha: Option<String>,
+    /// Repository HEAD at response time, when readable. Omitted when the
+    /// read fails (git unavailable, transient Windows handle race — must
+    /// never fail the response).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_head_sha: Option<String>,
+}
+
+/// A `find_impact` query in the form the adapters resolve it.
+///
+/// The three input variants of `FindImpactRequest` map onto this one-to-one;
+/// `ExactKey` is the explicit selection a caller makes after an ambiguous
+/// answer (or with any full key it already has).
+#[derive(Debug, Clone)]
+pub enum ImpactQuery {
+    /// Look up this exact canonical SCIP key. No fuzzy fallback: a key
+    /// that is not in the index is a `KeyMatch::NotFound`, never a guess.
+    ExactKey(String),
+    /// Resolve a possibly-fuzzy symbol name (e.g. `Validate`,
+    /// `FieldDefinition.Validate`) to one canonical key.
+    Name(String),
+    /// Resolve the symbol defined at a file position (1-based line).
+    Position { file: PathBuf, line: u32 },
+}
+
+/// Outcome of resolving an [`ImpactQuery`] against the index.
+///
+/// Resolution is a plain LMDB read — fast, never invoking the SCIP
+/// helper. Ambiguity is surfaced instead of silently picking the
+/// shortest candidate (the pre-fix behaviour hid overloads this way).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyMatch {
+    /// Exactly one stored symbol matches; this is the selection.
+    Resolved(String),
+    /// Several stored symbols match and the query alone cannot choose.
+    /// Candidates are sorted and deduplicated — re-query with
+    /// `ImpactQuery::ExactKey` for one of them.
+    Ambiguous(Vec<String>),
+    /// Nothing in the index matches.
+    NotFound,
+}
+
+/// Typed answer for an ambiguous `find_impact` query, serialized as JSON
+/// in the tool-result text (same convention as [`SymbolLookupBusy`]).
+///
+/// The MCP client re-calls with `symbol_key` set to one of `candidates`;
+/// the server never silently picks on the client's behalf.
+#[derive(Debug, Clone, Serialize)]
+pub struct SymbolAmbiguity {
+    /// Always `true` — machine-branchable, like `busy`.
+    pub ambiguous: bool,
+    /// The query as asked.
+    pub query: String,
+    /// Every canonical key that matches, sorted. These are exact
+    /// `symbol_key` values, not prose.
+    pub candidates: Vec<String>,
+    /// Actionable hint for the agent.
+    pub hint_for_agent: String,
+}
+
+/// Resolve the repository HEAD sha for `repo_root` (40-hex), or `None`
+/// when git is unavailable, the path is not a work tree, or the read
+/// fails. Non-fatal BY DESIGN: a transient Windows git failure (see the
+/// `GitHeadWatcher` note in `src/watch/mod.rs`) must never take down a
+/// response that only wanted the fingerprint.
+pub(crate) fn current_git_head(repo_root: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo_root)
+        // Repo discovery must key off repo_root alone: a caller running under
+        // git (e.g. a push hook) exports GIT_DIR/GIT_WORK_TREE, which would
+        // otherwise override discovery and report the WRONG repo's HEAD.
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let is_40_hex = sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit());
+    is_40_hex.then_some(sha)
 }
 
 /// Error returned when the symbol index is unavailable.
@@ -54,6 +179,101 @@ pub struct SymbolIndexError {
     pub available_languages: Vec<String>,
     /// Suggestion for the agent.
     pub hint_for_agent: String,
+}
+
+/// Structured busy answer returned when a `find_impact` lookup exceeds its
+/// internal wall-clock budget.
+///
+/// The MCP client must never be the timeout mechanism: when the budget
+/// overruns, the server answers with this envelope (serialized as JSON in
+/// the tool-result text) while the lookup keeps running in the background.
+/// A caller can branch on `busy == true` instead of parsing an opaque
+/// client-side timeout, and the retry hinted in `advice` is served from the
+/// reference cache the running lookup will have populated.
+#[derive(Debug, Clone, Serialize)]
+pub struct SymbolLookupBusy {
+    /// Always `true`; makes the envelope self-describing.
+    pub busy: bool,
+    /// What is still running, e.g. `"resolving 'Ns.I.M' via the csharp SCIP helper"`.
+    pub state: String,
+    /// Wall-clock time the request waited before the budget overran. On the
+    /// retry answer for a tracked lookup this is the background lookup's
+    /// cumulative elapsed time instead.
+    pub waited_ms: u64,
+    /// Actionable retry hint, e.g. `"retry the same call in ~60s"`.
+    pub advice: String,
+    /// Machine-branchable retry interval in seconds, mirroring the prose in
+    /// `advice`: how long a harness with auto-retry semantics should sleep
+    /// before repeating the SAME call. Busy is progress, not failure.
+    pub retry_after_seconds: u64,
+}
+
+/// Machine-branchable class of a failed `find_impact` lookup.
+///
+/// `busy` needs no class here: an overran lookup answers with the typed
+/// `SymbolLookupFailure`-free `SymbolLookupBusy` envelope instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SymbolLookupFailureClass {
+    /// The helper ran and failed (non-zero exit, crash, unusable output)
+    /// against a readable index. Retrying cannot succeed until the cause
+    /// changes; fall back to text search.
+    Failed,
+    /// No readable symbol index (`index_age` reports unknown): retrying
+    /// the lookup cannot succeed until the index is built or rebuilt.
+    Stale,
+}
+
+/// Typed failure envelope for `find_impact` lookups, serialized as JSON in
+/// the tool-result text (same convention as `SymbolIndexError`). Replaces
+/// the former soft-string render (`Symbol lookup failed: ...`) so an agent
+/// can branch on `class` instead of parsing prose.
+#[derive(Debug, Clone, Serialize)]
+pub struct SymbolLookupFailure {
+    /// Rendered `{:#}` error chain.
+    pub error: String,
+    /// Machine-branchable failure class.
+    pub class: SymbolLookupFailureClass,
+    /// Actionable hint for the agent.
+    pub hint_for_agent: String,
+}
+
+impl SymbolLookupFailure {
+    /// A failed lookup against a readable index.
+    pub fn failed(error_chain: impl Into<String>) -> Self {
+        Self {
+            error: error_chain.into(),
+            class: SymbolLookupFailureClass::Failed,
+            hint_for_agent: "The SCIP helper failed for this lookup. Do not retry the same call \
+                             immediately; fall back to `find` with kind=\"usages\" (text-based) \
+                             and/or reindex the project to rebuild the symbol index."
+                .to_string(),
+        }
+    }
+
+    /// A failed lookup with an unreadable/absent symbol index.
+    pub fn stale(error_chain: impl Into<String>) -> Self {
+        Self {
+            error: error_chain.into(),
+            class: SymbolLookupFailureClass::Stale,
+            hint_for_agent: "No readable symbol index for this project. Build or rebuild it \
+                             first (`codesearch index` / `index reindex`), then retry the \
+                             same call."
+                .to_string(),
+        }
+    }
+
+    /// Classify a lookup failure by the index age reported for the same db:
+    /// an unknown age (`u64::MAX`, what `index_age` returns whenever the
+    /// index cannot be opened or read) means stale; anything else means the
+    /// index was readable and the lookup itself failed.
+    pub fn classify(error_chain: impl Into<String>, index_age_seconds: u64) -> Self {
+        if index_age_seconds == u64::MAX {
+            Self::stale(error_chain)
+        } else {
+            Self::failed(error_chain)
+        }
+    }
 }
 
 /// Which files/projects to reindex.
@@ -75,6 +295,76 @@ pub enum RebuildScope {
         /// Deleted `.cs` files (not present in the new index output).
         deleted: Vec<PathBuf>,
     },
+}
+
+// ── Shared SCIP environment ──────────────────────────────────────
+
+/// Open (or reuse) the process-wide shared SCIP LMDB environment for `db_path`.
+///
+/// Both the C# and TypeScript adapters store symbol data in the same
+/// `db_path/scip` directory, and LMDB allows exactly ONE open environment per
+/// directory per process. Historically every operation opened its own
+/// short-lived env, so two overlapping operations — e.g. a watcher-triggered
+/// rebuild starting while a lazy `find-refs` call held its env for minutes —
+/// tripped the double-open guard and one side failed outright
+/// (`LMDB double-open prevented`, surfaced as a red `C#!` in the TUI).
+/// Routing every open through this getter hands all concurrent users the SAME
+/// environment: writers serialise on LMDB's single-writer mutex, readers never
+/// block, and the double-open error class cannot occur.
+pub(crate) fn get_shared_scip_env(
+    db_path: &Path,
+) -> Result<std::sync::Arc<crate::lmdb_registry::TrackedEnv>> {
+    let scip_dir = db_path.join("scip");
+    std::fs::create_dir_all(&scip_dir)
+        .with_context(|| format!("Failed to create SCIP directory: {}", scip_dir.display()))?;
+
+    crate::lmdb_registry::get_or_open_shared_env(
+        &scip_dir,
+        &format!("SCIP({})", db_path.display()),
+        |opts| {
+            // map_size is virtual address space (not RSS); the OS only faults
+            // in written pages. Read once per env lifetime.
+            let map_size_mb = std::env::var(crate::constants::SCIP_LMDB_MAP_SIZE_MB_ENV)
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(crate::constants::SCIP_LMDB_DEFAULT_MAP_SIZE_MB);
+            opts.map_size(map_size_mb * 1024 * 1024).max_dbs(10);
+            // SAFETY: `NO_TLS` only changes reader-slot tracking. See `BASE_ENV_FLAGS`.
+            unsafe { opts.flags(crate::lmdb_registry::BASE_ENV_FLAGS) };
+        },
+        |env| {
+            // Pre-create every named database (both languages') exactly once
+            // per env session: LMDB requires named DBs to exist before they
+            // can be opened in read txns.
+            let mut wtxn = env.write_txn()?;
+            env.create_database::<heed::types::Str, heed::types::Bytes>(
+                &mut wtxn,
+                Some(crate::constants::SCIP_SYMBOLS_DB_NAME),
+            )?;
+            env.create_database::<heed::types::Str, heed::types::Str>(
+                &mut wtxn,
+                Some(crate::constants::SCIP_META_DB_NAME),
+            )?;
+            env.create_database::<heed::types::Str, heed::types::Bytes>(
+                &mut wtxn,
+                Some(crate::constants::SCIP_POSITION_DB_NAME),
+            )?;
+            env.create_database::<heed::types::Str, heed::types::Bytes>(
+                &mut wtxn,
+                Some(crate::constants::SCIP_SIMPLE_NAMES_DB_NAME),
+            )?;
+            env.create_database::<heed::types::Str, heed::types::Bytes>(
+                &mut wtxn,
+                Some(crate::constants::SCIP_REF_CACHE_DB_NAME),
+            )?;
+            env.create_database::<heed::types::Str, heed::types::Bytes>(
+                &mut wtxn,
+                Some(crate::constants::SCIP_REF_WARNINGS_DB_NAME),
+            )?;
+            wtxn.commit()?;
+            Ok(())
+        },
+    )
 }
 
 /// Summary returned after a rebuild completes.
@@ -124,20 +414,50 @@ pub trait SymbolIndexer: Send + Sync {
         scope: RebuildScope,
     ) -> Result<RebuildSummary>;
 
-    /// Return the symbol's references from the LMDB store.
-    fn find_references(&self, db_path: &Path, symbol: &str) -> Result<Vec<SymbolReference>>;
+    /// Resolve a `find_impact` query to canonical SCIP key(s), exposing
+    /// ambiguity instead of silently choosing among candidates.
+    ///
+    /// Plain LMDB reads only — never invokes the SCIP helper, so callers
+    /// can (and the find_impact handler does) run this BEFORE the
+    /// budget-tracked reference fetch: an ambiguous answer is instant.
+    /// `KeyMatch::Resolved` is the selected canonical identity; the
+    /// historical behaviour picked the shortest fuzzy match silently,
+    /// which hid overloads from the caller.
+    fn resolve_query(&self, db_path: &Path, query: &ImpactQuery) -> Result<KeyMatch>;
 
-    /// Look up references by file-position instead of symbol name.
-    /// Resolves the position to a canonical SCIP symbol first.
-    fn find_references_by_position(
+    /// Return the symbol's references for one EXACT canonical key.
+    ///
+    /// This is the expensive half of a lookup: on the C# adapter a cold
+    /// reference cache triggers the `scip-csharp find-refs` subprocess
+    /// (minutes on a large solution), which is why the find_impact
+    /// handler budgets and tracks THIS call and not `resolve_query`.
+    fn find_references_for_key(
         &self,
         db_path: &Path,
-        file: &Path,
-        line: u32,
+        canonical_key: &str,
     ) -> Result<Vec<SymbolReference>>;
+
+    /// Completeness warnings for one canonical key's stored answer — a
+    /// plain LMDB read, NEVER invoking a helper. Non-empty means the
+    /// references `find_references_for_key` returns for this key may be
+    /// INCOMPLETE: a partial helper run was survived and cached, and the
+    /// warnings were persisted with it so the partial answer can never
+    /// pass for complete. Entries name what failed.
+    fn lookup_warnings(&self, db_path: &Path, canonical: &str) -> Vec<String>;
 
     /// How old is the current symbol index (seconds since last rebuild)?
     fn index_age(&self, db_path: &Path) -> u64;
+
+    /// The git HEAD sha the current symbol index was built for, when
+    /// recorded. `None` means unknown (pre-fingerprint index, or git was
+    /// unreadable at build time). Compare with the repository's current
+    /// HEAD to make index drift after a branch switch visible — drift is
+    /// surfaced, never auto-reindexed (deliberate: reindexing a large
+    /// solution on every branch switch would thrash; refresh stays an
+    /// explicit operator action).
+    fn index_head_sha(&self, _db_path: &Path) -> Option<String> {
+        None
+    }
 
     /// Whether the helper binary for this language is available.
     fn is_available(&self) -> bool;
@@ -178,7 +498,10 @@ impl SymbolIndexerRegistry {
     /// Create a registry with default (MVP) indexers.
     pub fn new() -> Self {
         Self {
-            indexers: vec![Box::new(csharp::CSharpSymbolIndexer::new())],
+            indexers: vec![
+                Box::new(csharp::CSharpSymbolIndexer::new()),
+                Box::new(typescript::TypeScriptSymbolIndexer::new()),
+            ],
         }
     }
 
@@ -230,3 +553,41 @@ impl Default for SymbolIndexerRegistry {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The scip getter must hand out ONE shared env per `db_path` — the exact
+    /// property that stops a rebuild and an in-flight lazy find-refs (or the
+    /// TypeScript adapter) from failing each other with the double-open error.
+    #[test]
+    fn shared_scip_env_is_shared_across_calls() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("codesearch.db");
+
+        let env1 = get_shared_scip_env(&db_path).unwrap();
+        let env2 = get_shared_scip_env(&db_path).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&env1, &env2));
+    }
+}
+
+/// Lock-visibility verification (todo #96 step 5): readers never block on
+/// an open write transaction — the property that lets `find_impact` serve
+/// during an indexer rebuild without needing a `lock_status` in the busy
+/// envelope. Sibling `_tests.rs` file per repo convention.
+#[cfg(test)]
+#[path = "lock_visibility_tests.rs"]
+mod lock_visibility_tests;
+
+/// Resident-helper WorkspacePool tests (todo #115). Sibling `_tests.rs`
+/// file per repo convention.
+#[cfg(test)]
+#[path = "resident_tests.rs"]
+mod resident_tests;
+
+/// Helper stderr routing tests (`csharp.rs`). Sibling `_tests.rs` file
+/// per repo convention.
+#[cfg(test)]
+#[path = "csharp_tests.rs"]
+mod csharp_tests;

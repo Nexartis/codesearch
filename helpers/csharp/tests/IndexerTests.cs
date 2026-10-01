@@ -25,7 +25,7 @@ public class ScipModelTests
     {
         var index = new ScipIndex
         {
-            Metadata = new ScipMetadata { Version = "1.0", ToolInfo = "scip-csharp" },
+            Metadata = new ScipMetadata { Version = "2.0", ToolInfo = "scip-csharp" },
             Documents =
             [
                 new ScipDocument

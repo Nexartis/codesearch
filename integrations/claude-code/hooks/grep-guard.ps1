@@ -4,27 +4,52 @@
 # `initialize` instructions (see docs) are advisory only — nothing stops the
 # model from reaching for the always-on Grep/Glob tools instead, especially
 # under time pressure. This hook makes the preference structural instead of
-# advisory: the FIRST Grep call against an internal path is blocked with
-# actionable guidance; if the same query is retried within 5 minutes (i.e.
-# codesearch was tried and came up empty), it is let through.
+# advisory: a Grep call against an indexed internal path is blocked with
+# actionable guidance for as long as the codesearch serve hub is reachable.
 #
-# Blocks the first Grep call for a given (pattern, path) pair when:
-#   - codesearch appears to be active (running process, CODESEARCH_SERVER env,
-#     or an indexed .codesearch.db at the git root), AND
-#   - the search path is internal (empty/relative, or absolute-but-inside the
-#     current git repo)
+# Grep is auto-allowed ONLY when codesearch is genuinely unreachable ("plat").
+# Crucially, a low-confidence / empty codesearch *result* is a SUCCESSFUL call
+# ("reformulate your query"), NOT "codesearch is down" — so it must never open
+# the grep escape hatch. The previous version used a blind "same query retried
+# within 5 min" proxy that could not tell those two apart and leaked grep on
+# every low-confidence result. We now probe the unauthenticated /healthz
+# liveness endpoint directly, which is the only signal that actually means
+# "codesearch is down".
+#
+# Blocks the Grep call when ALL of:
+#   - the search target resolves to a git repo (its OWN root, not the cwd's —
+#     absolute paths into a different repo resolve against THAT repo, todo
+#     #54), AND
+#   - codesearch covers THAT repo (its git root registered in the serve
+#     hub's repos.json, or the CODESEARCH_SERVER opt-in for remote/hub-only
+#     setups), AND
+#   - the codesearch serve hub answers its /healthz liveness probe (it's UP)
 #
 # Passes through (exit 0, no block) when:
-#   - codesearch is not running and no local index is found — grep is all
-#     you have, so don't get in the way
-#   - the path is outside the current git repo (codesearch doesn't cover
-#     arbitrary external paths well; grep is the right tool there)
-#   - the same (pattern, path) pair was already blocked in the last 5 minutes
-#     (covers the legitimate "codesearch found nothing, now try grep" case)
+#   - the target is not inside any git repo (external path — grep is the
+#     right tool there)
+#   - codesearch does not cover the target's repo (git root not registered
+#     in repos.json, no CODESEARCH_SERVER)
+#   - the codesearch serve hub does not answer /healthz — it's down, so grep
+#     is genuinely all you have
+#
+# When the target repo is covered and LIVE but MID-REINDEX (branch switch
+# full refresh, todo #55), the deny message is a WAIT-AND-RETRY instruction
+# instead of the standard "use codesearch" one — searching a mid-rebuild
+# index returns stale/empty results and must not degrade into a manual grep
+# approval on every routine checkout.
 #
 # Install: see ../README.md (or run ../install.ps1 to wire this up automatically).
 
 $ErrorActionPreference = 'Stop'
+
+# Shared target-resolution helpers live in codesearch-common.ps1 (shared
+# with edit-guard). Missing/broken helper file -> fail open, never block.
+try {
+    . (Join-Path $PSScriptRoot 'codesearch-common.ps1')
+} catch {
+    exit 0
+}
 
 try {
     $raw = [Console]::In.ReadToEnd()
@@ -40,124 +65,160 @@ $inp  = $data.tool_input
 if ($tool -ne 'Grep') { exit 0 }
 if ($null -eq $inp)   { exit 0 }
 
-$names   = @($inp.PSObject.Properties.Name)
-$path    = if ($names -contains 'path')    { [string]$inp.path }    else { '' }
-$pattern = if ($names -contains 'pattern') { [string]$inp.pattern } else { '' }
+$names = @($inp.PSObject.Properties.Name)
+$path  = if ($names -contains 'path') { [string]$inp.path } else { '' }
 
 # ------------------------------------------------------------------
-# 1. Is the path internal to the current repo?
-# ------------------------------------------------------------------
-$isInternal = $true
-if ($path -and $path -ne '.' -and $path -ne './') {
-    $normPath = $path.TrimEnd('/\')
-    # Absolute paths (Windows drive letter, or Git-Bash /c/... style)
-    if ($normPath -match '^([A-Za-z]:[\\/]|/[a-zA-Z]/|//)') {
-        try {
-            $gr = (& git rev-parse --show-toplevel 2>$null)
-            if ($LASTEXITCODE -eq 0 -and $gr) {
-                $gr  = $gr.Trim() -replace '[/\\]', [System.IO.Path]::DirectorySeparatorChar
-                $abs = $normPath   -replace '[/\\]', [System.IO.Path]::DirectorySeparatorChar
-                if (-not $abs.StartsWith($gr, [System.StringComparison]::OrdinalIgnoreCase)) {
-                    $isInternal = $false
-                }
-            }
-        } catch {
-            $isInternal = $false  # can't determine git root -> assume external, allow grep
-        }
-    }
-    # Relative paths ("src/", "../sibling/") stay internal = $true
-}
-
-if (-not $isInternal) { exit 0 }
-
-# ------------------------------------------------------------------
-# 2. Is codesearch actually available FOR THIS REPO? Don't block if it isn't.
+# 1+2. Resolve the TARGET repo (the repo this Grep is aimed at) and check
+#      codesearch coverage THERE — never in the hook's cwd.
 #
-# NOTE: we deliberately do NOT treat "a codesearch process is running" as
-# sufficient. codesearch commonly runs as a persistent background `serve`
-# hub covering many registered repos (`codesearch index list`) — that
-# process is alive nearly all the time on a dev machine, regardless of
-# whether the CURRENT directory is one of the repos it actually indexes.
-# Using process-presence alone made this hook fire in every directory on
-# the machine, including ones with no index at all. A local `.codesearch.db`
-# at the git root is the precise, fast signal that THIS repo is indexed.
+# The resolution (absolute path -> the target's own git root, empty/
+# relative -> the cwd repo) lives in codesearch-common.ps1 and is shared
+# with edit-guard. History (#54, #199): see codesearch-common.sh.
 # ------------------------------------------------------------------
-function Test-CodesearchAvailable {
-    try {
-        $gr = (& git rev-parse --show-toplevel 2>$null)
-        if ($LASTEXITCODE -eq 0 -and $gr) {
-            $gr = $gr.Trim()
-            if (Test-Path (Join-Path $gr '.codesearch.db')) { return $true }
-        }
-    } catch {}
+$targetRoot = Resolve-TargetGitRoot $path
 
-    # Explicit opt-in escape hatch for pure remote-serve setups with no local
-    # .codesearch.db (this repo's index lives only on a remote `codesearch
-    # serve` host). Requires the user to consciously set this env var, so it
-    # can't spuriously fire the way "any process running" did.
-    if ($env:CODESEARCH_SERVER) { return $true }
+# Not inside any git repo (or git unusable) -> external target: grep is right.
+if (-not $targetRoot) { exit 0 }
 
-    return $false
+# Coverage: the TARGET repo's git root is REGISTERED with the serve hub
+# (~/.codesearch/repos.json — the same list the hub itself resolves by),
+# matching the bash twin and edit-guard; a running serve hub alone is NOT a
+# signal (it covers many repos and being alive says nothing about this one).
+# CODESEARCH_SERVER stays the explicit opt-in for pure remote-serve setups.
+# Fails open: missing/malformed repos.json counts as unregistered -> allow.
+if (-not (Test-CodesearchTargetRegistered $targetRoot)) { exit 0 }
+
+# ------------------------------------------------------------------
+# 3. Is the codesearch serve hub actually UP right now? (Liveness probe.)
+#
+# This is the ONLY condition under which grep is auto-allowed: codesearch is
+# genuinely unreachable ("plat"). We probe the unauthenticated /healthz
+# liveness endpoint (fixed {"status":"ok"} body, no API key required). A
+# reachable server -> DENY grep and force a codesearch reformulation, even
+# when a previous codesearch call returned a low-confidence / empty result —
+# an empty *result* is a SUCCESSFUL call, not a dead server, so it must NOT
+# open the escape hatch. Only a connection-level failure (refused / DNS /
+# timeout) means the server is down -> ALLOW grep.
+#
+# Base URL resolution (mirrors codesearch src/constants.rs):
+#   CODESEARCH_SERVER (full base URL, e.g. http://host:port)
+#   > http://127.0.0.1:$CODESEARCH_SERVE_PORT
+#   > http://127.0.0.1:39725  (DEFAULT_SERVE_URL / DEFAULT_SERVE_PORT)
+# ------------------------------------------------------------------
+function Get-CodesearchBaseUrl {
+    if ($env:CODESEARCH_SERVER)     { return ($env:CODESEARCH_SERVER.TrimEnd('/')) }
+    if ($env:CODESEARCH_SERVE_PORT) { return "http://127.0.0.1:$($env:CODESEARCH_SERVE_PORT)" }
+    return 'http://127.0.0.1:39725'
 }
 
-if (-not (Test-CodesearchAvailable)) { exit 0 }
-
-# ------------------------------------------------------------------
-# 3. Retry cache: same (pattern, path) blocked recently -> let it through.
-#    Covers "tried codesearch, it returned nothing, falling back to grep".
-# ------------------------------------------------------------------
-$cacheFile = Join-Path $env:TEMP '.codesearch-grep-guard.json'
-$cacheTTL  = 300  # seconds
-
-$cache = @{}
-if (Test-Path $cacheFile) {
+function Test-CodesearchLive {
+    param([string]$Base)
     try {
-        $stored = Get-Content $cacheFile -Raw | ConvertFrom-Json
-        $now    = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-        foreach ($prop in $stored.PSObject.Properties) {
-            if (($now - [long]$prop.Value) -lt $cacheTTL) {
-                $cache[$prop.Name] = [long]$prop.Value
+        # Short timeout keeps grep latency low; /healthz answers instantly.
+        $null = Invoke-WebRequest -Uri "$Base/healthz" -TimeoutSec 2 -UseBasicParsing
+        return $true
+    } catch {
+        # An HTTP error RESPONSE (4xx/5xx) still proves the server is reachable
+        # and up; only a connection-level failure means it's genuinely down.
+        try {
+            if ($null -ne $_.Exception -and $null -ne $_.Exception.Response) { return $true }
+        } catch {}
+        return $false
+    }
+}
+
+# codesearch is DOWN -> grep is genuinely all you have, let it through.
+$base = Get-CodesearchBaseUrl
+if (-not (Test-CodesearchLive -Base $base)) { exit 0 }
+
+# ------------------------------------------------------------------
+# 3.5 Is the TARGET repo mid-reindex right now? (Freshness probe, #55.)
+#
+# Liveness (/healthz) says the server is UP; it says nothing about index
+# FRESHNESS. Right after a branch switch the serve watcher fires a full
+# refresh, and searches against the mid-rebuild index return stale/empty
+# results — which used to push the agent into a manual grep approval on
+# every routine checkout (the exact "stale after branch switch" report).
+# GET /indexing?path=<repo root> resolves the target to its registered repo
+# and reports an active reindex. When one is in flight, deny with a
+# WAIT-AND-RETRY instruction: the tree did not change, the index is just
+# catching up — waiting beats grepping.
+#
+# Backward compat: an older serve without this endpoint answers 404, the
+# probe is skipped (catch below), and behaviour is exactly the pre-#55 deny.
+# ------------------------------------------------------------------
+try {
+    $enc  = [uri]::EscapeDataString(($targetRoot -replace '\\', '/'))
+    $resp = Invoke-WebRequest -Uri "$base/indexing?path=$enc" -TimeoutSec 2 -UseBasicParsing
+    $fresh = $resp.Content | ConvertFrom-Json
+    if ($fresh.covered -eq $true -and $fresh.indexing -eq $true) {
+        $waitMsg = @"
+codesearch is LIVE, but THIS repo's index is being rebuilt right now (a
+branch switch or file change fired the serve watcher's full refresh).
+Searching immediately would return stale or empty results — that is the
+rebuild in progress, not a miss, and NOT a reason to grep.
+
+WAIT 15-30 seconds (Bash: sleep 20), then RETRY your codesearch call — it
+will answer normally once the rebuild lands. The working tree did not
+change; only the index is catching up, so grep adds nothing here.
+
+If the rebuild still has not landed after ~2 minutes, run your codesearch
+call anyway (a partially fresh index still beats grep) or ask the user how
+to proceed.
+"@
+        $waitOut = @{
+            hookSpecificOutput = @{
+                hookEventName            = 'PreToolUse'
+                permissionDecision       = 'deny'
+                permissionDecisionReason = $waitMsg
             }
         }
-    } catch {}
+        $waitOut | ConvertTo-Json -Depth 10 -Compress
+        exit 0
+    }
+} catch {
+    # 404 (older serve) or probe failure: no freshness signal — fall through
+    # to the standard deny below.
 }
-
-$cacheKey = "$pattern|$path"
-if ($cache.ContainsKey($cacheKey)) {
-    exit 0  # already blocked once this window -> allow the retry
-}
-
-$cache[$cacheKey] = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-try {
-    $cache | ConvertTo-Json -Compress | Set-Content $cacheFile -NoNewline
-} catch {}
 
 # ------------------------------------------------------------------
 # 4. Block with actionable guidance
 # ------------------------------------------------------------------
 $msg = @"
-codesearch is active for this repo — try it before Grep for code discovery.
+codesearch is LIVE for this repo (its /healthz probe just answered) — use it,
+do NOT fall back to Grep. Grep on an indexed internal path is only auto-allowed
+when the codesearch serve hub is actually DOWN, which it is not right now.
+
+IMPORTANT: a low-confidence or EMPTY codesearch result is a SUCCESSFUL call that
+means "reformulate your query" — it does NOT mean codesearch is down and it will
+NOT unblock Grep. Reformulate instead of grepping.
 
 Step 1 — load the deferred MCP tool schemas (Claude Code defers all MCP tools;
 this is a one-time step per conversation):
   ToolSearch("select:mcp__codesearch__search,mcp__codesearch__find,mcp__codesearch__explore,mcp__codesearch__get_chunk")
 
-Step 2 — search:
-  mcp__codesearch__search(query="$pattern", mode="semantic")             -- concepts, identifiers, cross-file
-  mcp__codesearch__search(query="$pattern", mode="literal", regex=true)  -- exact pattern / regex
-  mcp__codesearch__find(symbol="...", kind="definition")                 -- symbol definition
-  mcp__codesearch__find(symbol="...", kind="usages")                     -- all call sites
+Step 2 — pick the RIGHT tool (this is usually why a query came back empty):
+  find(symbol="Name", kind="definition")   -- known symbol / type / function definition
+  find(symbol="Name", kind="usages")       -- all call sites of a known symbol
+  explore(kind="outline", target="path")   -- every symbol in one file
+  search(query="concept", mode="semantic") -- concepts / cross-file, the DEFAULT
+  search(query="exact", mode="literal", regex=true) -- exact syntax / pattern
 
-Multi-repo serve mode: if the search returns a "scope_required" or
-"Unknown alias" error, you MUST pass project="<repo-alias>" (single repo) or
-group="<group>" (cross-repo). The error response LISTS the valid
-available_projects / available_groups — pick from that list (the alias may
-differ from the folder name). Example:
-  mcp__codesearch__search(query="$pattern", mode="semantic", project="<alias-from-error>")
+Query hygiene (this is what produces "low_confidence: []"):
+  * Do NOT paste grep-style multi-term alternations ("a|b|c", "::", "fn foo(")
+    into search — BM25 tokenises on punctuation and the match scores below the
+    relevance floor, so you get an empty result even though the string exists.
+  * Use ONE clean term, or switch to find()/explore() for exact symbols.
 
-This exact Grep call is auto-unblocked if you retry it within 5 minutes
-(i.e. codesearch returned nothing useful — go ahead and grep).
-Grep is always allowed for paths outside the current repo.
+Multi-repo serve mode: if the call returns a "scope_required" or "Unknown alias"
+error, you MUST pass project="<repo-alias>" (single repo) or group="<group>"
+(cross-repo). The error response LISTS the valid available_projects /
+available_groups — pick from that list (the alias may differ from the folder
+name).
+
+Grep is always allowed for targets outside any git repo, and for repos
+codesearch does not cover (no local index, no CODESEARCH_SERVER).
 "@
 
 $out = @{

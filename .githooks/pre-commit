@@ -1,7 +1,10 @@
 #!/bin/bash
-# Pre-commit hook: format Rust code only.
+# pre-commit hook: format Rust code + root-md allowlist guard.
 #
-# Runs `cargo fmt` and stages any reformatting so CI's fmt-check can't fail.
+# 1. Runs `cargo fmt` and stages any reformatting so CI's fmt-check can't fail.
+# 2. Rejects commits that introduce a root-level *.md outside the allowlist.
+#
+# Installed via `git config core.hooksPath .githooks` — see .githooks/README.md.
 #
 # This hook deliberately does NOT bump the version or build a binary. It used
 # to auto-bump the Cargo.toml patch version and run `cargo build` on every
@@ -24,5 +27,12 @@ if [ -n "$FMT_CHANGED" ]; then
     git add -- '*.rs'
     echo "pre-commit: staged rustfmt changes ($FMT_CHANGED)"
 fi
+
+# --- root-md allowlist guard -------------------------------------------------
+# Branch-aware (AGENTS.md/CLAUDE.md are feature-branch-only, dropped at
+# finalization). Shared with pre-merge-commit via lib/root-md-guard.sh —
+# rationale and allowlist live there; see .githooks/README.md.
+. "$(dirname "$0")/lib/root-md-guard.sh"
+root_md_guard || exit 1
 
 exit 0

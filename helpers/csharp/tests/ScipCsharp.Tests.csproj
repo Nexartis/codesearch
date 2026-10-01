@@ -12,12 +12,22 @@
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.*" />
     <PackageReference Include="xunit" Version="2.*" />
     <PackageReference Include="xunit.runner.visualstudio" Version="2.*" />
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.13.0" />
+    <!-- SymbolIndexer.cs declares `using Microsoft.CodeAnalysis.MSBuild;`
+         (MSBuildWorkspace), which only resolves with the Workspaces.MSBuild
+         assembly on the reference set. -->
+    <PackageReference Include="Microsoft.CodeAnalysis.Workspaces.MSBuild" Version="4.13.0" />
   </ItemGroup>
 
-  <!-- Reference only the model types (no Roslyn needed for model tests) -->
+  <!--
+    Model tests need no Roslyn; KeyFormatTests drives the real SymbolIndexer
+    over in-memory compilations, so Roslyn is referenced and SymbolIndexer.cs
+    is compiled in (its internals are visible via InternalsVisibleTo).
+  -->
   <ItemGroup>
     <Compile Include="..\ScipModels.cs" Link="ScipModels.cs" />
     <Compile Include="..\OutputWriter.cs" Link="OutputWriter.cs" />
+    <Compile Include="..\SymbolIndexer.cs" Link="SymbolIndexer.cs" />
   </ItemGroup>
 
   <!-- Exclude fixture source files from compilation -->

@@ -8,8 +8,12 @@ namespace ScipCsharp;
 /// CLI entrypoint for scip-csharp.
 ///
 /// Subcommands:
-///   index     — compile solution, collect definitions, write SCIP JSON (fast, no FindReferencesAsync)
-///   find-refs — resolve references for a single symbol on demand (for lazy find_impact caching)
+///   index           — compile solution, collect definitions, write SCIP JSON (fast, no FindReferencesAsync)
+///   find-refs       — resolve references for a single symbol on demand (for lazy find_impact caching)
+///   batch-find-refs — resolve multiple symbols in one workspace session
+///   serve           — resident mode: load the workspace once, answer find-refs/reload
+///                     requests as JSON lines on stdin/stdout (todo #115; the Rust host
+///                     kills the process for teardown)
 /// </summary>
 public static class Program
 {
@@ -44,8 +48,81 @@ public static class Program
             "index" => await RunIndexAsync(args[1..]).ConfigureAwait(false),
             "find-refs" => await RunFindRefsAsync(args[1..]).ConfigureAwait(false),
             "batch-find-refs" => await RunBatchFindRefsAsync(args[1..]).ConfigureAwait(false),
+            "serve" => await RunServeAsync(args[1..]).ConfigureAwait(false),
             _ => await UnknownCommand(args[0]).ConfigureAwait(false),
         };
+    }
+
+    /// <summary>
+    /// Solution path the serve loop was started with. Remembered so a
+    /// "reload" request without an explicit path re-opens the same solution.
+    /// Only meaningful in serve mode (resident); other subcommands are
+    /// single-shot processes.
+    /// </summary>
+    internal static string? CurrentServeSolution { get; private set; }
+
+    // ── serve subcommand (resident mode) ─────────────────────────────
+
+    private static async Task<int> RunServeAsync(string[] args)
+    {
+        var parsed = ParseServeArgs(args);
+        if (parsed is null) return 1;
+
+        if (!TryRegisterMsBuild(out var regErr)) { await Console.Error.WriteLineAsync(regErr).ConfigureAwait(false); return 1; }
+
+        using var workspace = CreateTolerantWorkspace();
+
+        try
+        {
+            Console.Error.WriteLine($"serve: loading solution: {parsed}");
+            await OpenSolutionFilteredAsync(workspace, parsed).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            await Console.Error.WriteLineAsync(
+                $"serve: [WARN] Solution load partially failed ({ex.GetType().Name}: {ex.Message}); " +
+                $"continuing with {workspace.CurrentSolution.Projects.Count()} loaded project(s).")
+                .ConfigureAwait(false);
+
+            if (!workspace.CurrentSolution.Projects.Any())
+            {
+                await Console.Error.WriteLineAsync(
+                    $"serve: no projects loaded — cannot serve. Full error:{Environment.NewLine}{ex.StackTrace}")
+                    .ConfigureAwait(false);
+                return 1;
+            }
+        }
+
+        CurrentServeSolution = parsed;
+
+        // The loop owns the process lifetime from here: stdin EOF or a
+        // "shutdown" request exits 0. The Rust host kills the process for
+        // teardown — disposing the Roslyn workspace reliably is not possible,
+        // process death is (todo #115).
+        return await ServeHost.LoopAsync(
+            workspace,
+            solution => OpenSolutionFilteredAsync(workspace, solution)).ConfigureAwait(false);
+    }
+
+    private static string? ParseServeArgs(string[] args)
+    {
+        string? solutionPath = null;
+        for (int i = 0; i < args.Length; i++)
+        {
+            switch (args[i])
+            {
+                case "--solution":
+                    solutionPath = RequireValidPath(args, ref i, "--solution", mustExist: true);
+                    if (solutionPath is null) return null;
+                    break;
+                default:
+                    Console.Error.WriteLine($"Unknown argument: {args[i]}");
+                    return null;
+            }
+        }
+
+        if (string.IsNullOrEmpty(solutionPath)) { Console.Error.WriteLine("serve: --solution is required"); return null; }
+        return solutionPath;
     }
 
     // ── index subcommand ─────────────────────────────────────────────
@@ -564,6 +641,53 @@ public static class Program
         return args[++i];
     }
 
+    /// <summary>
+    /// Reads the next arg value and validates it as a filesystem path.
+    ///
+    /// SECURITY: All CLI path arguments must go through this helper instead of
+    /// <see cref="RequireValue"/>. <see cref="Path.GetFullPath"/> canonicalizes
+    /// the path (collapsing "..", resolving relative segments, rejecting
+    /// malformed inputs), which prevents path-traversal attacks where a
+    /// crafted argument could read or write outside expected directories
+    /// (Aikido group 30640677). The .NET helper is invoked by the Rust parent
+    /// process; this is defense-in-depth, not the primary boundary.
+    /// </summary>
+    /// <param name="mustExist">If true, the path must point to an existing file.</param>
+    /// <returns>The canonicalized absolute path, or null + stderr message on failure.</returns>
+    private static string? RequireValidPath(string[] args, ref int i, string flag, bool mustExist)
+    {
+        var raw = RequireValue(args, ref i, flag);
+        if (raw is null) return null;
+
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            Console.Error.WriteLine($"{flag} must not be empty or whitespace");
+            return null;
+        }
+
+        string full;
+        try
+        {
+            // GetFullPath normalizes separators, resolves relative segments
+            // (../..), and rejects malformed inputs. This is the central
+            // path-traversal defense for CLI args.
+            full = Path.GetFullPath(raw);
+        }
+        catch (Exception ex) when (ex is ArgumentException or PathTooLongException or NotSupportedException)
+        {
+            Console.Error.WriteLine($"{flag}: invalid path '{raw}': {ex.Message}");
+            return null;
+        }
+
+        if (mustExist && !File.Exists(full))
+        {
+            Console.Error.WriteLine($"{flag}: file not found: {full}");
+            return null;
+        }
+
+        return full;
+    }
+
     private static (string? SolutionPath, string? ProjectPath, string OutputPath, string? ProjectFilter)?
         ParseIndexArgs(string[] args)
     {
@@ -577,15 +701,15 @@ public static class Program
             switch (args[i])
             {
                 case "--solution":
-                    solutionPath = RequireValue(args, ref i, "--solution");
+                    solutionPath = RequireValidPath(args, ref i, "--solution", mustExist: true);
                     if (solutionPath is null) return null;
                     break;
                 case "--project":
-                    projectPath = RequireValue(args, ref i, "--project");
+                    projectPath = RequireValidPath(args, ref i, "--project", mustExist: true);
                     if (projectPath is null) return null;
                     break;
                 case "--output":
-                    outputPath = RequireValue(args, ref i, "--output");
+                    outputPath = RequireValidPath(args, ref i, "--output", mustExist: false);
                     if (outputPath is null) return null;
                     break;
                 case "--filter-project":
@@ -626,7 +750,7 @@ public static class Program
             switch (args[i])
             {
                 case "--solution":
-                    solutionPath = RequireValue(args, ref i, "--solution");
+                    solutionPath = RequireValidPath(args, ref i, "--solution", mustExist: true);
                     if (solutionPath is null) return null;
                     break;
                 case "--symbol":
@@ -634,7 +758,7 @@ public static class Program
                     if (symbol is null) return null;
                     break;
                 case "--output":
-                    outputPath = RequireValue(args, ref i, "--output");
+                    outputPath = RequireValidPath(args, ref i, "--output", mustExist: false);
                     if (outputPath is null) return null;
                     break;
                 case "--filter-project":
@@ -667,11 +791,11 @@ public static class Program
             switch (args[i])
             {
                 case "--solution":
-                    solutionPath = RequireValue(args, ref i, "--solution");
+                    solutionPath = RequireValidPath(args, ref i, "--solution", mustExist: true);
                     if (solutionPath is null) return null;
                     break;
                 case "--symbols-file":
-                    symbolsFile = RequireValue(args, ref i, "--symbols-file");
+                    symbolsFile = RequireValidPath(args, ref i, "--symbols-file", mustExist: true);
                     if (symbolsFile is null) return null;
                     break;
                 case "--symbols":
@@ -679,7 +803,7 @@ public static class Program
                     if (symbolsInline is null) return null;
                     break;
                 case "--output":
-                    outputPath = RequireValue(args, ref i, "--output");
+                    outputPath = RequireValidPath(args, ref i, "--output", mustExist: false);
                     if (outputPath is null) return null;
                     break;
                 default:
@@ -694,11 +818,8 @@ public static class Program
         IReadOnlyList<string> symbols;
         if (!string.IsNullOrEmpty(symbolsFile))
         {
-            if (!File.Exists(symbolsFile))
-            {
-                Console.Error.WriteLine($"batch-find-refs: symbols file not found: {symbolsFile}");
-                return null;
-            }
+            // Existence + canonicalization already enforced by RequireValidPath
+            // above (mustExist: true). No redundant File.Exists here.
             symbols = File.ReadAllLines(symbolsFile)
                 .Select(l => l.Trim())
                 .Where(l => !string.IsNullOrEmpty(l) && !l.StartsWith('#'))
@@ -736,6 +857,7 @@ public static class Program
         Console.WriteLine("  scip-csharp find-refs --solution <path> --symbol <scip-key> --output <path>");
         Console.WriteLine("  scip-csharp batch-find-refs --solution <path> --symbols-file <path> --output <path>");
         Console.WriteLine("  scip-csharp batch-find-refs --solution <path> --symbols <key1;key2;...> --output <path>");
+        Console.WriteLine("  scip-csharp serve --solution <path>");
         Console.WriteLine();
         Console.WriteLine("Options (index):");
         Console.WriteLine("  --solution <path>         Path to .sln file");
@@ -754,12 +876,17 @@ public static class Program
         Console.WriteLine("  --symbols-file <path>     File with one SCIP key per line");
         Console.WriteLine("  --symbols <key1;key2>     Semicolon-separated SCIP keys");
         Console.WriteLine("  --output <path>           Output JSON file path");
+        Console.WriteLine();
+        Console.WriteLine("Options (serve):");
+        Console.WriteLine("  --solution <path>         Path to .sln file (loaded once; the process then");
+        Console.WriteLine("                            serves find-refs/reload requests as JSON lines on");
+        Console.WriteLine("                            stdin/stdout until EOF or a shutdown request)");
     }
 
     [ExcludeFromCodeCoverage]
     private static async Task<int> UnknownCommand(string cmd)
     {
-        await Console.Error.WriteLineAsync($"Unknown command: '{cmd}'. Use 'index', 'find-refs', or 'batch-find-refs'.").ConfigureAwait(false);
+        await Console.Error.WriteLineAsync($"Unknown command: '{cmd}'. Use 'index', 'find-refs', 'batch-find-refs', or 'serve'.").ConfigureAwait(false);
         return 1;
     }
 }

@@ -306,7 +306,7 @@ fn check_file_integrity(db_path: &Path, project_path: &Path) -> CheckResult {
     };
 
     // Stale files: in index but deleted from disk
-    let stale_files = store.find_deleted_files();
+    let stale_files = store.find_deleted_files(project_path);
     let stale_count = stale_files.len();
 
     // Walk disk to find all indexable files (uses the real FileWalker)
@@ -327,14 +327,15 @@ fn check_file_integrity(db_path: &Path, project_path: &Path) -> CheckResult {
     let mut unindexed = 0;
 
     for file in &files {
-        match store.check_file(&file.path) {
+        let key = crate::cache::storage_key(&file.path, project_path);
+        match store.check_file(&file.path, &key) {
             Ok((needs_reindex, old_ids)) => {
                 if needs_reindex && old_ids.is_empty() {
                     // check_file returns (true, []) for two cases:
                     //   1. File has NO entry in the store → genuinely unindexed
                     //   2. File IS tracked but produced 0 chunks (minified JS, empty file, etc.)
                     // Distinguish them with is_tracked() — case 2 is not an error.
-                    if store.is_tracked(&file.path) {
+                    if store.is_tracked(&key) {
                         // Unchunkable file — tracked with 0 chunks, not a problem
                         up_to_date += 1;
                     } else {
@@ -893,6 +894,7 @@ fn print_results(results: &[CheckResult], json: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::fs::{self, File};
     use std::io::Write;
     use tempfile::tempdir;
@@ -946,7 +948,11 @@ mod tests {
         create_fts_dir(dir);
     }
 
+    /// Mutates CODESEARCH_REPOS_CONFIG — `#[serial]` + the EnvRestore guard
+    /// keep it from racing (and leaking into) the remove_order_tests, which
+    /// redirect the same var to their own fixtures.
     #[test]
+    #[serial]
     fn test_doctor_no_database() {
         let temp_dir = tempdir().unwrap();
         let project_path = temp_dir.path();
@@ -954,12 +960,13 @@ mod tests {
         // Isolate from global repos.json — point to non-existent config so
         // find_best_database doesn't discover the developer's real database.
         let fake_config = temp_dir.path().join("nonexistent_repos.json");
-        std::env::set_var(crate::constants::REPOS_CONFIG_ENV, &fake_config);
+        let _env = crate::testing::EnvRestore::set(&[(
+            crate::constants::REPOS_CONFIG_ENV,
+            &fake_config.to_string_lossy(),
+        )]);
 
         // No .codesearch.db exists
         let result = check_find_database(project_path);
-
-        std::env::remove_var(crate::constants::REPOS_CONFIG_ENV);
 
         assert_eq!(result.status, CheckStatus::Fail);
         assert_eq!(result.name, "No database found");
@@ -967,6 +974,7 @@ mod tests {
     }
 
     #[test]
+    #[serial] // reads global repos.json via find_best_database
     fn test_doctor_incomplete_database() {
         let temp_dir = tempdir().unwrap();
         let db_dir = temp_dir.path().join(".codesearch.db");
@@ -983,6 +991,7 @@ mod tests {
     }
 
     #[test]
+    #[serial] // reads global repos.json via find_best_database
     fn test_doctor_model_name_mismatch() {
         let temp_dir = tempdir().unwrap();
         let db_dir = temp_dir.path().join(".codesearch.db");
@@ -1001,6 +1010,7 @@ mod tests {
     }
 
     #[test]
+    #[serial] // reads global repos.json via find_best_database
     fn test_doctor_model_name_consistent() {
         let temp_dir = tempdir().unwrap();
         let db_dir = temp_dir.path().join(".codesearch.db");
@@ -1018,6 +1028,7 @@ mod tests {
     }
 
     #[test]
+    #[serial] // reads global repos.json via find_best_database
     fn test_doctor_misplaced_index() {
         let temp_dir = tempdir().unwrap();
 
@@ -1038,6 +1049,7 @@ mod tests {
     }
 
     #[test]
+    #[serial] // reads global repos.json via find_best_database
     fn test_doctor_index_at_git_root() {
         let temp_dir = tempdir().unwrap();
 
@@ -1057,6 +1069,7 @@ mod tests {
     }
 
     #[test]
+    #[serial] // reads global repos.json via find_best_database
     fn test_doctor_stale_files() {
         let temp_dir = tempdir().unwrap();
         let project_path = temp_dir.path();
@@ -1073,7 +1086,9 @@ mod tests {
         fs::write(&test_file, "fn stale() {}").unwrap();
 
         let mut store = FileMetaStore::new("minilm-l6-q".to_string(), 384);
-        store.update_file(&test_file, vec![1, 2, 3]).unwrap();
+        store
+            .update_file(&test_file, "will_be_deleted.rs", vec![1, 2, 3])
+            .unwrap();
         store.save(&db_dir).unwrap();
 
         // Now delete the file — it becomes stale
@@ -1098,6 +1113,7 @@ mod tests {
     }
 
     #[test]
+    #[serial] // reads global repos.json via find_best_database
     fn test_doctor_valid_database_all_green() {
         let temp_dir = tempdir().unwrap();
         let db_dir = temp_dir.path().join(".codesearch.db");

@@ -38,7 +38,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       # pin@v4
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          # Pin ref so workflow_dispatch builds the tagged commit (inputs.version),
+          # not the default branch (master-tip) — otherwise binaries get labeled
+          # with a version they weren't built from (#161-class mismatch).
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.version) || github.ref }}
+          persist-credentials: false
 
       - name: Install Rust
         # pin@stable
@@ -58,7 +64,7 @@ jobs:
 
       - name: Cache cargo
         # pin@v4
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
             ~/.cargo/registry
@@ -75,7 +81,7 @@ jobs:
 
       - name: Setup .NET
         # pin@v4
-        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68
         with:
           dotnet-version: '10.0.x'
 
@@ -98,24 +104,36 @@ jobs:
           Copy-Item -Recurse helpers-publish\* staging\helpers\csharp\
           Compress-Archive -Path staging\* -DestinationPath ${{ matrix.artifact_csharp }}
 
+      # D1 — same cp-retry pattern as the macOS "Package with-csharp" step (which
+      # broke v1.1.31 under APFS disk pressure, see build-macos job below). The
+      # Linux runner has ~84GB disk and ext4 (no fcopyfile EIO failure mode), so
+      # this isn't fixing an observed failure — it's preventive consistency so
+      # both platforms fail the same transient-copy-error way instead of one
+      # silently hard-failing on the first attempt.
       - name: Package with-csharp (Linux)
         if: runner.os == 'Linux'
         run: |
           mkdir -p staging/helpers/csharp
-          cp target/${{ matrix.target }}/release/codesearch staging/
+          for i in 1 2 3; do
+            if cp target/${{ matrix.target }}/release/codesearch staging/codesearch; then break; fi
+            echo "cp attempt $i/3 failed, retrying in 5s…"
+            df -h /
+            sleep 5
+          done
+          test -f staging/codesearch
           cp -r helpers-publish/* staging/helpers/csharp/
           tar czf ${{ matrix.artifact_csharp }} -C staging .
 
       - name: Upload kale artifact
         # pin@v4
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
 
       - name: Upload with-csharp artifact
         # pin@v4
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: ${{ matrix.artifact_csharp }}
           path: ${{ matrix.artifact_csharp }}
@@ -125,7 +143,13 @@ jobs:
     runs-on: macos-latest
     steps:
       # pin@v4
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          # Pin ref so workflow_dispatch builds the tagged commit (inputs.version),
+          # not the default branch (master-tip) — otherwise binaries get labeled
+          # with a version they weren't built from (#161-class mismatch).
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.version) || github.ref }}
+          persist-credentials: false
 
       - name: Install Rust
         # pin@stable
@@ -141,7 +165,7 @@ jobs:
 
       - name: Cache cargo
         # pin@v4
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
             ~/.cargo/registry
@@ -156,35 +180,66 @@ jobs:
         env:
           CARGO_TARGET_DIR: target
 
+      # C1 + C4 — Stage binary out of target/, then cargo clean to free ~5-10GB on
+      # the 14GB macOS runner. APFS fcopyfile() can return EIO under disk pressure
+      # (instead of the clean ENOSPC), which is what broke v1.1.31's macOS packaging.
+      # df -h logging for post-mortem diagnosis. Binary is moved (atomic rename within
+      # the same filesystem — no copyfile syscall) before clean, so it survives.
+      - name: Stage binary & free disk space
+        run: |
+          echo "=== Disk usage before staging ==="
+          df -h /
+          mkdir -p staging-release
+          mv target/aarch64-apple-darwin/release/codesearch staging-release/codesearch
+          cargo clean
+          echo "=== Disk usage after cargo clean ==="
+          df -h /
+
       - name: Setup .NET
         # pin@v4
-        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68
         with:
           dotnet-version: '10.0.x'
 
       - name: Publish C# helper (self-contained single-file)
         run: dotnet publish helpers/csharp -c Release -r osx-arm64 --self-contained -p:PublishSingleFile=true -o helpers-publish
 
+      # C3 — Retry loop on tar/cp. set -e safe via if/then (failed condition doesn't
+      # trigger exit-on-error). df -h on each failure for diagnosis. Final test -f
+      # forces a hard failure if all 3 attempts failed.
       - name: Package kale
-        run: tar czf codesearch-macos-arm64.tar.gz -C target/aarch64-apple-darwin/release codesearch
+        run: |
+          for i in 1 2 3; do
+            if tar czf codesearch-macos-arm64.tar.gz -C staging-release codesearch; then break; fi
+            echo "tar attempt $i/3 failed, retrying in 5s…"
+            df -h /
+            sleep 5
+          done
+          test -f codesearch-macos-arm64.tar.gz
 
       - name: Package with-csharp
         run: |
           mkdir -p staging/helpers/csharp
-          cp target/aarch64-apple-darwin/release/codesearch staging/
+          for i in 1 2 3; do
+            if cp staging-release/codesearch staging/codesearch; then break; fi
+            echo "cp attempt $i/3 failed, retrying in 5s…"
+            df -h /
+            sleep 5
+          done
+          test -f staging/codesearch
           cp -r helpers-publish/* staging/helpers/csharp/
           tar czf codesearch-macos-arm64-with-csharp.tar.gz -C staging .
 
       - name: Upload kale artifact
         # pin@v4
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: codesearch-macos-arm64.tar.gz
           path: codesearch-macos-arm64.tar.gz
 
       - name: Upload with-csharp artifact
         # pin@v4
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: codesearch-macos-arm64-with-csharp.tar.gz
           path: codesearch-macos-arm64-with-csharp.tar.gz
@@ -198,14 +253,14 @@ jobs:
     steps:
       - name: Download all artifacts
         # pin@v4
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           path: artifacts
           merge-multiple: true
 
       - name: Create or update Release
         # pin@v2
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64
         with:
           files: artifacts/*
           generate_release_notes: true

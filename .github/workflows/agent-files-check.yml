@@ -1,0 +1,55 @@
+name: Agent files check
+
+# AGENTS.md and CLAUDE.md are branch-local agent working files: tracked on
+# feature branches while building, dropped at finalization (git rm before the
+# PR — see AGENTS.develop.md, "For agents starting a new feature branch").
+# They must never reach develop or master.
+#
+# Locally the branch-aware pre-commit / pre-merge-commit hooks enforce this;
+# this check is the server-side net for PRs merged via the GitHub UI or from
+# clones without hooks installed (core.hooksPath unset = no hooks run at all).
+#
+# Visible PR check (red X), consistent with changelog-check: this repo's
+# merges routinely go through `gh pr merge --admin`, which would bypass a
+# required check just the same. No label bypass exists on purpose: the only
+# correct fix is dropping the files from the PR head.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [develop, master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-files-check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  no-agent-files:
+    runs-on: ubuntu-latest
+    steps:
+      # pin@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: PR head must not carry root AGENTS.md / CLAUDE.md
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          BAD=""
+          for f in AGENTS.md CLAUDE.md; do
+            if git cat-file -e "$HEAD_SHA:$f" 2>/dev/null; then
+              BAD="$BAD $f"
+              echo "::error::$f exists at the PR head — branch-local agent file, must not reach develop/master."
+            fi
+          done
+          if [ -n "$BAD" ]; then
+            echo "::error::Run the branch finalization step: git rm$BAD, commit, push."
+            exit 1
+          fi
+          echo "No root AGENTS.md/CLAUDE.md at the PR head — good."

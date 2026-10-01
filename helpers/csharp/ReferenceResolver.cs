@@ -22,7 +22,8 @@ public sealed class ReferenceResolver
     {
         var output = new FindRefsOutput { Symbol = scipKey };
 
-        var (symbolMap, projectRoot) = await BuildSymbolMapAsync(solution).ConfigureAwait(false);
+        var (symbolMap, projectRoot, mapWarnings) = await BuildSymbolMapAsync(solution).ConfigureAwait(false);
+        output.Warnings.AddRange(mapWarnings);
 
         var targetSymbol = FindSymbolByKey(symbolMap, scipKey);
         if (targetSymbol is null)
@@ -33,8 +34,9 @@ public sealed class ReferenceResolver
 
         Console.Error.WriteLine($"find-refs: resolving references for {scipKey}...");
 
-        var refs = await ResolveReferencesAsync(targetSymbol, solution, projectRoot).ConfigureAwait(false);
+        var (refs, warnings) = await ResolveReferencesAsync(targetSymbol, solution, projectRoot).ConfigureAwait(false);
         output.References.AddRange(refs);
+        output.Warnings.AddRange(warnings);
 
         Console.Error.WriteLine($"find-refs: found {output.References.Count} reference(s)");
         return output;
@@ -48,7 +50,7 @@ public sealed class ReferenceResolver
     {
         var results = new BatchFindRefsOutput();
 
-        var (symbolMap, projectRoot) = await BuildSymbolMapAsync(solution).ConfigureAwait(false);
+        var (symbolMap, projectRoot, mapWarnings) = await BuildSymbolMapAsync(solution).ConfigureAwait(false);
 
         // Build reverse map: scip_key → ISymbol for O(1) lookup
         var keyToSymbol = new Dictionary<string, ISymbol>();
@@ -63,6 +65,9 @@ public sealed class ReferenceResolver
         {
             var scipKey = scipKeys[i];
             var output = new FindRefsOutput { Symbol = scipKey };
+            // Map-level warnings apply to every symbol: a project that failed
+            // to compile hides its symbols from every resolution.
+            output.Warnings.AddRange(mapWarnings);
 
             if (!keyToSymbol.TryGetValue(scipKey, out var targetSymbol))
             {
@@ -71,8 +76,9 @@ public sealed class ReferenceResolver
                 continue;
             }
 
-            var refs = await ResolveReferencesAsync(targetSymbol, solution, projectRoot).ConfigureAwait(false);
+            var (refs, warnings) = await ResolveReferencesAsync(targetSymbol, solution, projectRoot).ConfigureAwait(false);
             output.References.AddRange(refs);
+            output.Warnings.AddRange(warnings);
 
             Console.Error.WriteLine($"batch-find-refs: [{i + 1}/{scipKeys.Count}] {scipKey} → {refs.Count} ref(s)");
             results.Results.Add(output);
@@ -85,11 +91,14 @@ public sealed class ReferenceResolver
 
     /// <summary>
     /// Builds the symbol map by compiling all projects in the solution.
-    /// Returns the map and the common project root for relative path computation.
+    /// Returns the map, the common project root for relative path computation,
+    /// and one warning per project that failed to compile — those projects'
+    /// symbols are silently missing from the map, so the caller must be told.
     /// </summary>
-    private async Task<(Dictionary<ISymbol, string> SymbolMap, string? ProjectRoot)> BuildSymbolMapAsync(Solution solution)
+    private async Task<(Dictionary<ISymbol, string> SymbolMap, string? ProjectRoot, List<string> Warnings)> BuildSymbolMapAsync(Solution solution)
     {
         var symbolMap = new Dictionary<ISymbol, string>(SymbolEqualityComparer.Default);
+        var warnings = new List<string>();
 
         Console.Error.WriteLine("find-refs: building symbol map from solution...");
         foreach (var project in solution.Projects)
@@ -98,6 +107,7 @@ public sealed class ReferenceResolver
             if (compilation is null)
             {
                 Console.Error.WriteLine($"[WARN] find-refs: could not compile {project.Name}");
+                warnings.Add($"could not compile project '{project.Name}' — its symbols are missing from the map");
                 continue;
             }
             SymbolIndexer.CollectSymbols(compilation.GlobalNamespace, symbolMap);
@@ -110,7 +120,7 @@ public sealed class ReferenceResolver
                 .Where(p => p is not null)
                 .Cast<string>());
 
-        return (symbolMap, projectRoot);
+        return (symbolMap, projectRoot, warnings);
     }
 
     private static ISymbol? FindSymbolByKey(Dictionary<ISymbol, string> symbolMap, string scipKey)
@@ -123,10 +133,16 @@ public sealed class ReferenceResolver
         return null;
     }
 
-    private static async Task<List<FindRefsOccurrence>> ResolveReferencesAsync(
+    /// <summary>
+    /// Resolves references for one symbol. Returns the occurrences plus a
+    /// warning per survived failure — a caught FindReferencesAsync exception
+    /// must degrade the answer's honesty, not just its size.
+    /// </summary>
+    private static async Task<(List<FindRefsOccurrence> Refs, List<string> Warnings)> ResolveReferencesAsync(
         ISymbol targetSymbol, Solution solution, string? projectRoot)
     {
         var results = new List<FindRefsOccurrence>();
+        var warnings = new List<string>();
 
         try
         {
@@ -157,8 +173,11 @@ public sealed class ReferenceResolver
             Console.Error.WriteLine(
                 $"[WARN] FindReferencesAsync failed for {targetSymbol.Name}: " +
                 $"{ex.GetType().Name}: {ex.Message}");
+            warnings.Add(
+                $"FindReferencesAsync failed for {targetSymbol.Name}: " +
+                $"{ex.GetType().Name}: {ex.Message}");
         }
 
-        return results;
+        return (results, warnings);
     }
 }

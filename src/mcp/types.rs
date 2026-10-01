@@ -139,10 +139,13 @@ pub struct StatusRequest {
 /// Input variants:
 /// - By name: `{ "symbol_name": "FieldDefinition.Validate", "project": "myrepo" }`
 /// - By position: `{ "file": "src/Validation/FieldDefinition.cs", "line": 42, "project": "myrepo" }`
+/// - By exact key (explicit selection after an ambiguous answer):
+///   `{ "symbol_key": "csharp . . . FieldDefinition#Validate().", "project": "myrepo" }`
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct FindImpactRequest {
     /// Symbol name to look up (e.g. `"FieldDefinition.Validate"`).
-    /// Used when you know the name. Mutually exclusive with `file`+`line`.
+    /// Mutually exclusive with `symbol_key`; if both a name and
+    /// file+line arrive, the name wins (documented precedence).
     pub symbol_name: Option<String>,
 
     /// File path for position-based lookup (relative to project root or absolute).
@@ -153,8 +156,19 @@ pub struct FindImpactRequest {
     /// Must be combined with `file`.
     pub line: Option<u32>,
 
-    /// Language filter (e.g. `"csharp"`). If omitted, auto-detects from file extension
-    /// or searches all installed language adapters.
+    /// Exact canonical SCIP symbol key — the explicit selection after an
+    /// ambiguous answer listed candidates (or any full key the caller
+    /// already has). Looked up verbatim: no fuzzy fallback, no silent
+    /// overload picking. Mutually exclusive with `symbol_name` and
+    /// `file`+`line`.
+    #[serde(default)]
+    pub symbol_key: Option<String>,
+
+    /// Language filter (e.g. `"csharp"`). If omitted: position lookups
+    /// auto-detect it from the file extension; with no or exactly one
+    /// installed helper the pick is deterministic, and with several
+    /// installed the answer asks you to name one instead of picking
+    /// silently.
     pub language: Option<String>,
 
     /// Route to a specific project (requires `codesearch serve`).
@@ -268,7 +282,17 @@ pub struct SimilarChunksRequest {
 /// Search result item — returned by semantic search
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SearchResultItem {
-    pub chunk_id: u32,
+    /// Store-assigned chunk id. `Some` for semantic hits (where the store
+    /// returned a real id); **`None` for literal-mode hits** — literal results
+    /// carry no chunk id and the field is omitted from the JSON entirely.
+    ///
+    /// Never fabricate an id (e.g. `unwrap_or(0)`) for absent values: a
+    /// caller can combine a rendered `0` with the item's `source` into a
+    /// bogus `chunk_ref` (`"<peer>/<alias>:0"`) that `get_chunk` will
+    /// silently resolve to an *unrelated* chunk. An absent id must render
+    /// as an absent field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_id: Option<u32>,
     pub path: String,
     pub start_line: usize,
     pub end_line: usize,
@@ -379,6 +403,13 @@ pub struct LiteralSearchResponse {
     /// Suggested next tool when low_confidence is true.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suggested_tool: Option<String>,
+
+    /// Repos that failed during this search. Without this a broken store is
+    /// indistinguishable from a repo that simply holds no match — a false
+    /// negative for the calling agent, which never sees the server log.
+    /// Omitted entirely when empty, so healthy responses are unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warnings: Option<Vec<String>>,
 }
 
 /// Semantic search response wrapper with low-confidence signaling
@@ -510,6 +541,12 @@ pub struct RepoInfo {
     /// import-data repo that shares a group with the main project. Empty when
     /// the repo is in no named group.
     pub groups: Vec<String>,
+    /// Set when this repo's store failed to report stats (e.g. the LMDB env
+    /// returned an error). `total_chunks`/`total_files` are 0 in that case,
+    /// which is otherwise indistinguishable from "not yet indexed" — this is
+    /// the signal that tells the two apart. Absent when stats were read fine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Health response served by `codesearch serve` at GET /health.
@@ -615,6 +652,45 @@ mod tests {
             err.contains("must not be empty"),
             "Expected empty error, got: {}",
             err
+        );
+    }
+
+    fn sample_repo_info(error: Option<String>) -> RepoInfo {
+        RepoInfo {
+            alias: "inriver".to_string(),
+            project_path: "/repos/inriver".to_string(),
+            database_path: "/repos/inriver/.codesearch.db".to_string(),
+            total_chunks: 0,
+            total_files: 0,
+            model: "minilm-l6-q".to_string(),
+            lock_status: "available".to_string(),
+            groups: vec![],
+            error,
+        }
+    }
+
+    // These pin the wire shape only — whether `error` is omitted or present —
+    // not the fan-out decision that populates it (that belongs to
+    // `index_status_summary` and the `list_projects`/`index_status_impl`
+    // handlers, which own the Ok/Err match and are exercised there).
+    #[test]
+    fn repo_info_omits_error_when_healthy() {
+        let json = serde_json::to_string(&sample_repo_info(None)).unwrap();
+        assert!(
+            !json.contains("\"error\""),
+            "a healthy repo must not carry an `error` key at all, got: {json}"
+        );
+    }
+
+    #[test]
+    fn repo_info_carries_error_when_stats_failed() {
+        let json = serde_json::to_string(&sample_repo_info(Some(
+            "stats unavailable: os error 22".into(),
+        )))
+        .unwrap();
+        assert!(
+            json.contains("\"error\":\"stats unavailable: os error 22\""),
+            "got: {json}"
         );
     }
 }

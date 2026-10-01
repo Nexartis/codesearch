@@ -1,4 +1,4 @@
-use crate::constants::MAX_LMDB_MAP_SIZE_MB;
+use crate::constants::max_lmdb_map_size_mb;
 use crate::embed::EmbeddedChunk;
 use crate::info_print;
 use anyhow::{anyhow, Result};
@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::num::NonZeroUsize;
 use std::path::Path;
-use tracing::warn;
+use tracing::{error, warn};
 
 /// Read the persisted LMDB map size from metadata.json in the database directory.
 /// Returns DEFAULT_LMDB_MAP_SIZE_MB if no persisted value is found.
@@ -70,7 +70,7 @@ fn map_size_pin_key(db_path: &Path) -> std::path::PathBuf {
 /// Pin (or raise) the process map size for `db_path` and return the effective
 /// value. Monotonically non-decreasing and capped at `MAX_LMDB_MAP_SIZE_MB`.
 fn pin_map_size(db_path: &Path, candidate: usize) -> usize {
-    let candidate = candidate.min(MAX_LMDB_MAP_SIZE_MB);
+    let candidate = candidate.min(max_lmdb_map_size_mb());
     let pins = map_size_pins();
     let mut entry = pins.entry(map_size_pin_key(db_path)).or_insert(candidate);
     if candidate > *entry {
@@ -112,6 +112,30 @@ fn read_metadata_u32(db_path: &Path, key: &str) -> Option<u32> {
 /// combined with `rename` being atomic on the same filesystem, a reader always
 /// observes either the complete old or the complete new content.
 /// On failure the temp file is best-effort removed.
+/// Windows-only classification for a transient handle-holder racing our
+/// rename: ERROR_ACCESS_DENIED (5), ERROR_SHARING_VIOLATION (32),
+/// ERROR_LOCK_VIOLATION (33) — the same raw codes `ServeState::is_db_locked_error`
+/// (`src/serve/mod.rs`) retries on. On Windows, AV/Search-indexer momentarily
+/// opening a just-written small JSON file makes `MOVEFILE_REPLACE_EXISTING`
+/// fail with "Access is denied" purely from timing, not a real conflict —
+/// most visible under `cargo test --lib --bins` parallel load. Unix renames
+/// are atomic replace and never hit this path, so the retry is a no-op there.
+fn is_transient_rename_error(e: &std::io::Error) -> bool {
+    if let Some(raw) = e.raw_os_error() {
+        if matches!(raw, 5 | 32 | 33) {
+            return true;
+        }
+    }
+    let msg = e.to_string();
+    msg.contains("being used") || msg.contains("is in use") || msg.contains("Access is denied")
+}
+
+/// Bounded retry budget for the rename step below: short, since a genuine
+/// conflict (not a transient handle) should surface quickly rather than
+/// stall the caller.
+const RENAME_RETRY_ATTEMPTS: u32 = 5;
+const RENAME_RETRY_DELAY_MS: u64 = 20;
+
 fn atomic_write_json(path: &Path, json: &serde_json::Value) -> Result<()> {
     use std::io::Write;
 
@@ -136,11 +160,37 @@ fn atomic_write_json(path: &Path, json: &serde_json::Value) -> Result<()> {
         return Err(e.into());
     }
 
-    if let Err(e) = fs::rename(&tmp_path, path) {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(e.into());
+    // Retry the rename itself on a transient handle-holder (see
+    // `is_transient_rename_error`) before giving up. Bounded and short: this
+    // is not a lock-contention backoff, just riding out a momentary AV/indexer
+    // handle on the destination file.
+    let mut last_err = None;
+    for attempt in 0..RENAME_RETRY_ATTEMPTS {
+        match fs::rename(&tmp_path, path) {
+            Ok(()) => return Ok(()),
+            Err(e) if is_transient_rename_error(&e) && attempt + 1 < RENAME_RETRY_ATTEMPTS => {
+                warn!(
+                    "atomic_write_json: rename to {} hit a transient error (attempt {}/{}): {}",
+                    path.display(),
+                    attempt + 1,
+                    RENAME_RETRY_ATTEMPTS,
+                    e
+                );
+                std::thread::sleep(std::time::Duration::from_millis(RENAME_RETRY_DELAY_MS));
+                last_err = Some(e);
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(e.into());
+            }
+        }
     }
-    Ok(())
+    // Unreachable in practice (the loop always returns above), but keep the
+    // compiler happy and preserve the last error if it somehow falls through.
+    let _ = fs::remove_file(&tmp_path);
+    Err(last_err
+        .map(Into::into)
+        .unwrap_or_else(|| anyhow!("atomic_write_json: rename failed with no captured error")))
 }
 
 /// Read-modify-write metadata.json, crash-atomically.
@@ -334,10 +384,49 @@ pub struct VectorStore {
     env: TrackedEnv,
     vectors: ArroyDatabase<Cosine>,
     chunks: Database<U32<BigEndian>, SerdeBincode<ChunkMetadata>>,
+    /// Persisted high-water mark of chunk ids ever handed out ("meta" DB,
+    /// key [`META_KEY_ID_HWM`]). `None` only in read-only mode on a legacy
+    /// store created before the mark existed.
+    ///
+    /// Without this, `next_id` is derived from `chunks.last()` on every open,
+    /// so deleting the chunks holding the highest ids lowers `max_key` and the
+    /// next reopen hands those ids to unrelated content — `get_chunk(old_id)`
+    /// then silently returns the wrong file. The mark never decreases on
+    /// delete; deleted ids stay dead forever (safe `Ok(None)` misses).
+    id_hwm_db: Option<Database<Str, SerdeBincode<u32>>>,
     next_id: u32,
     dimensions: usize,
     indexed: bool,
     pub map_size_mb: usize,
+}
+
+/// Key in the "meta" database holding the highest chunk id ever assigned.
+const META_KEY_ID_HWM: &str = "id_hwm";
+
+/// Chunks per write transaction in [`VectorStore::rewrite_chunk_paths`].
+pub const PATH_REWRITE_BATCH: usize = 1000;
+
+/// Derive `next_id` so ids are NEVER reused across reopens.
+///
+/// Takes the max of (highest live key + 1) and (persisted high-water mark + 1):
+/// - live keys alone regress when top-of-range chunks are deleted;
+/// - the mark alone is absent on legacy stores (falls back to live keys —
+///   pre-mark behaviour, unchanged until the first write persists the mark).
+///
+/// A full rebuild wipes the DB and the mark with it, which is correct: a new
+/// generation may restart at 0, and stale references then fail as `Ok(None)`
+/// (safe miss) instead of resolving to unrelated content.
+fn next_id_from(
+    chunks: &Database<U32<BigEndian>, SerdeBincode<ChunkMetadata>>,
+    hwm: Option<u32>,
+    txn: &heed::RoTxn,
+) -> Result<u32> {
+    let from_live = match chunks.last(txn)? {
+        Some((max_key, _)) => max_key + 1,
+        None => 0,
+    };
+    let from_mark = hwm.map(|h| h.saturating_add(1)).unwrap_or(0);
+    Ok(from_live.max(from_mark))
 }
 
 /// Lightweight chunk metadata used for file-outline style navigation.
@@ -384,6 +473,9 @@ impl VectorStore {
         // TrackedEnv additionally prevents double-open within the same process.
         let mut opts = EnvOpenOptions::new();
         opts.map_size(map_size_mb * 1024 * 1024).max_dbs(10);
+        // SAFETY: see `BASE_ENV_FLAGS` — `NO_TLS` only changes how LMDB tracks
+        // reader slots, never the on-disk format.
+        unsafe { opts.flags(crate::lmdb_registry::BASE_ENV_FLAGS) };
         let env = unsafe {
             TrackedEnv::open(
                 &opts,
@@ -398,14 +490,17 @@ impl VectorStore {
         let vectors: ArroyDatabase<Cosine> = env.create_database(&mut wtxn, Some("vectors"))?;
         let chunks: Database<U32<BigEndian>, SerdeBincode<ChunkMetadata>> =
             env.create_database(&mut wtxn, Some("chunks"))?;
+        let id_hwm_db: Database<Str, SerdeBincode<u32>> =
+            env.create_database(&mut wtxn, Some("meta"))?;
 
-        // Get the next ID from the maximum existing key + 1
-        // Using len() is wrong after delete+insert cycles: deleted IDs create gaps
-        // so len() < max_key + 1, causing ID collisions on re-open
-        let next_id = match chunks.last(&wtxn)? {
-            Some((max_key, _)) => max_key + 1,
-            None => 0,
-        };
+        // Get the next ID from the maximum existing key + 1 and the persisted
+        // high-water mark, whichever is higher — see `next_id_from`. Using
+        // len() is wrong after delete+insert cycles: deleted IDs create gaps
+        // so len() < max_key + 1, causing ID collisions on re-open; using
+        // max_key alone is wrong after TOP-OF-RANGE deletes, which lower
+        // max_key and would hand those ids to unrelated new content.
+        let hwm: Option<u32> = id_hwm_db.get(&wtxn, META_KEY_ID_HWM)?;
+        let next_id = next_id_from(&chunks, hwm, &wtxn)?;
 
         wtxn.commit()?;
 
@@ -432,6 +527,7 @@ impl VectorStore {
             env,
             vectors,
             chunks,
+            id_hwm_db: Some(id_hwm_db),
             next_id,
             dimensions,
             indexed,
@@ -473,8 +569,10 @@ impl VectorStore {
         // TrackedEnv additionally prevents double-open within the same process.
         let mut opts = EnvOpenOptions::new();
         opts.map_size(map_size_mb * 1024 * 1024).max_dbs(10);
-        // SAFETY: READ_ONLY flag is safe for concurrent read access.
-        unsafe { opts.flags(EnvFlags::READ_ONLY) };
+        // SAFETY: READ_ONLY is safe for concurrent read access; `NO_TLS` is
+        // required for it to be *usable* — without it a second live read txn on
+        // the same thread fails with MDB_BAD_RSLOT. See `BASE_ENV_FLAGS`.
+        unsafe { opts.flags(crate::lmdb_registry::BASE_ENV_FLAGS | EnvFlags::READ_ONLY) };
         let env = unsafe {
             TrackedEnv::open(
                 &opts,
@@ -492,13 +590,20 @@ impl VectorStore {
         let chunks: Database<U32<BigEndian>, SerdeBincode<ChunkMetadata>> = env
             .open_database(&rtxn, Some("chunks"))?
             .ok_or_else(|| anyhow::anyhow!("chunks database not found"))?;
+        // The mark DB may be absent on legacy stores (created before ids were
+        // made monotonic) — `None` then, and `next_id_from` falls back to the
+        // live-keys derivation. Read-only never inserts, so the mark is only
+        // informational here anyway.
+        let id_hwm_db: Option<Database<Str, SerdeBincode<u32>>> =
+            env.open_database(&rtxn, Some("meta"))?;
 
-        // Get the next ID from the maximum existing key + 1
-        // Using len() is wrong after delete+insert cycles: deleted IDs create gaps
-        let next_id = match chunks.last(&rtxn)? {
-            Some((max_key, _)) => max_key + 1,
-            None => 0,
+        // Get the next ID from the maximum existing key + 1 and the persisted
+        // high-water mark, whichever is higher — see `next_id_from`.
+        let hwm: Option<u32> = match &id_hwm_db {
+            Some(db) => db.get(&rtxn, META_KEY_ID_HWM)?,
+            None => None,
         };
+        let next_id = next_id_from(&chunks, hwm, &rtxn)?;
 
         // Check if database is already indexed
         let indexed = if next_id > 0 {
@@ -507,7 +612,20 @@ impl VectorStore {
             false
         };
 
-        drop(rtxn);
+        // MUST commit, not drop. LMDB keeps a database handle opened inside a
+        // transaction private to that transaction "until the transaction is
+        // successfully committed"; if the transaction is *aborted* instead, the
+        // handle is closed automatically. Dropping an `RoTxn` aborts it, which
+        // silently invalidated `vectors` / `chunks` above — every later use then
+        // failed with a bare EINVAL (os error 22).
+        //
+        // That is why this only ever broke in read-only mode: `new()` opens its
+        // databases in a WRITE txn that is committed, so its handles stay valid.
+        // In production it surfaced as read-only vendors reporting
+        // `indexed: null` / `max_chunk_id: 0` while every search against them
+        // failed, even though the HNSW graph was present (`indexed` is cached
+        // here, before the invalidation, so it still read `true`).
+        rtxn.commit()?;
 
         tracing::debug!(
             "✅ Database opened read-only (next_id: {}, indexed: {})",
@@ -519,6 +637,7 @@ impl VectorStore {
             env,
             vectors,
             chunks,
+            id_hwm_db,
             next_id,
             dimensions,
             indexed,
@@ -540,11 +659,12 @@ impl VectorStore {
     /// environment, which avoids the "an environment is already opened with
     /// different options" error when a live serve process needs to grow the map.
     fn resize_environment(&mut self, new_size_mb: usize) -> Result<()> {
-        if new_size_mb > MAX_LMDB_MAP_SIZE_MB {
+        if new_size_mb > max_lmdb_map_size_mb() {
             return Err(anyhow::anyhow!(
-                "Requested map size {}MB exceeds MAX_LMDB_MAP_SIZE_MB {}MB",
+                "Requested map size {}MB exceeds MAX_LMDB_MAP_SIZE_MB {}MB \
+                 (set CODESEARCH_MAX_LMDB_MAP_SIZE_MB to raise this cap)",
                 new_size_mb,
-                MAX_LMDB_MAP_SIZE_MB
+                max_lmdb_map_size_mb()
             ));
         }
 
@@ -556,6 +676,10 @@ impl VectorStore {
         // active.  Our caller holds &mut self and just got MDB_MAP_FULL on an
         // insert — any write transaction that triggered the error has already
         // been dropped by the caller before invoking the retry logic.
+        // The `&mut self` covers this store only: LMDB requires no *process*
+        // transaction to be live, which holds because every reader of this
+        // path goes through the same `RwLock<VectorStore>` (shared env via
+        // `lmdb_registry`) and is therefore excluded by our write lock.
         unsafe {
             self.env.resize(new_size_bytes)?;
         }
@@ -618,6 +742,11 @@ impl VectorStore {
             self.next_id += 1;
         }
 
+        // Same-transaction mark persist as in insert_chunks_with_ids_impl.
+        if let Some(db) = &self.id_hwm_db {
+            db.put(&mut wtxn, META_KEY_ID_HWM, &(self.next_id - 1))?;
+        }
+
         wtxn.commit()?;
 
         // Mark as not indexed (need to rebuild index after inserts)
@@ -650,20 +779,35 @@ impl VectorStore {
             match &result {
                 Ok(_) => return result,
                 Err(e) => {
-                    if attempts >= max_attempts || !self.is_map_full_error(e.as_ref()) {
+                    if !self.is_map_full_error(e.as_ref()) {
+                        return result;
+                    }
+                    if attempts >= max_attempts {
+                        error!(
+                            "❌ MDB_MAP_FULL persists in build_index() after {} attempt(s) at \
+                             {}MB — giving up: {}",
+                            attempts, self.map_size_mb, e
+                        );
                         return result;
                     }
 
                     let new_size = self.map_size_mb * 2;
-                    if new_size <= MAX_LMDB_MAP_SIZE_MB {
+                    if new_size <= max_lmdb_map_size_mb() {
                         warn!(
                             "MDB_MAP_FULL error in build_index(), resizing to {}MB (attempt {}/{})",
                             new_size, attempts, max_attempts
                         );
                         self.resize_environment(new_size)?;
+                        warn!(
+                            "↻ Retrying build_index() at {}MB (attempt {}/{})",
+                            self.map_size_mb,
+                            attempts + 1,
+                            max_attempts
+                        );
                     } else {
                         warn!(
-                            "MDB_MAP_FULL error in build_index(), already at max size {}MB",
+                            "MDB_MAP_FULL error in build_index(), already at max size {}MB \
+                             (set CODESEARCH_MAX_LMDB_MAP_SIZE_MB to raise this cap)",
                             self.map_size_mb
                         );
                         return result;
@@ -753,6 +897,21 @@ impl VectorStore {
         })
     }
 
+    /// Cheap health probe: `(total_chunks, indexed)` without the full-table scan
+    /// [`Self::stats`] performs.
+    ///
+    /// `stats()` deserializes every `ChunkMetadata` in the store to count unique
+    /// file paths — tens of thousands of records on a large corpus. Callers that
+    /// only need to know "are there chunks, and is the HNSW graph present?" must
+    /// use this instead: `chunks.len()` is an O(1) LMDB stat and `indexed` is a
+    /// plain field. This matters on the memory/CPU-constrained serve replica,
+    /// where the read-only warmup path exists precisely to do almost no work.
+    pub fn index_health(&self) -> Result<(usize, bool)> {
+        let rtxn = self.env.read_txn()?;
+        let total_chunks = self.chunks.len(&rtxn)? as usize;
+        Ok((total_chunks, self.indexed))
+    }
+
     pub fn stats(&self) -> Result<StoreStats> {
         let rtxn = self.env.read_txn()?;
 
@@ -809,6 +968,57 @@ impl VectorStore {
         Ok(file_chunks)
     }
 
+    /// Rewrite the stored `path` of chunks in place — metadata only, vectors
+    /// untouched. Returns every found record, already-rewritten ones included,
+    /// so a caller retrying after a failed FTS mirror still mirrors them all.
+    /// Missing ids are skipped.
+    ///
+    /// Batched: one transaction over every chunk of a large index would need
+    /// copy-on-write space for the whole chunks table at once.
+    pub fn rewrite_chunk_paths(
+        &mut self,
+        updates: &[(u32, String)],
+    ) -> Result<Vec<(u32, ChunkMetadata)>> {
+        let mut rewritten = Vec::with_capacity(updates.len());
+        for batch in updates.chunks(PATH_REWRITE_BATCH) {
+            let done = match self.rewrite_chunk_paths_batch(batch) {
+                Err(e) if self.is_map_full_error(e.as_ref()) => {
+                    let new_size = self.map_size_mb * 2;
+                    warn!(
+                        "MDB_MAP_FULL rewriting {} chunk path(s), resizing to {}MB",
+                        batch.len(),
+                        new_size
+                    );
+                    self.resize_environment(new_size)?;
+                    self.rewrite_chunk_paths_batch(batch)?
+                }
+                other => other?,
+            };
+            rewritten.extend(done);
+        }
+        Ok(rewritten)
+    }
+
+    fn rewrite_chunk_paths_batch(
+        &mut self,
+        batch: &[(u32, String)],
+    ) -> Result<Vec<(u32, ChunkMetadata)>> {
+        let mut wtxn = self.env.write_txn()?;
+        let mut rewritten = Vec::with_capacity(batch.len());
+        for (id, path) in batch {
+            let Some(mut meta) = self.chunks.get(&wtxn, id)? else {
+                continue;
+            };
+            if meta.path != *path {
+                meta.path = path.clone();
+                self.chunks.put(&mut wtxn, id, &meta)?;
+            }
+            rewritten.push((*id, meta));
+        }
+        wtxn.commit()?;
+        Ok(rewritten)
+    }
+
     /// Delete chunks by their IDs
     ///
     /// Returns the number of chunks deleted
@@ -825,19 +1035,39 @@ impl VectorStore {
             match &result {
                 Ok(_) => return result,
                 Err(e) => {
-                    if attempts >= max_attempts || !self.is_map_full_error(e.as_ref()) {
+                    if !self.is_map_full_error(e.as_ref()) {
+                        return result;
+                    }
+                    if attempts >= max_attempts {
+                        error!(
+                            "❌ MDB_MAP_FULL persists in delete_chunks() after {} attempt(s) at \
+                             {}MB while deleting {} chunk(s) — giving up: {}",
+                            attempts,
+                            self.map_size_mb,
+                            chunk_ids.len(),
+                            e
+                        );
                         return result;
                     }
 
                     // Double map size and retry
                     let new_size = self.map_size_mb * 2;
-                    if new_size <= MAX_LMDB_MAP_SIZE_MB {
-                        warn!("MDB_MAP_FULL error in delete_chunks(), resizing to {}MB (attempt {}/{})",
-                              new_size, attempts, max_attempts);
+                    if new_size <= max_lmdb_map_size_mb() {
+                        warn!("MDB_MAP_FULL error in delete_chunks() deleting {} chunk(s), resizing to {}MB (attempt {}/{})",
+                              chunk_ids.len(), new_size, attempts, max_attempts);
                         self.resize_environment(new_size)?;
-                    } else {
                         warn!(
-                            "MDB_MAP_FULL error, already at max size {}MB",
+                            "↻ Retrying delete of {} chunk(s) at {}MB (attempt {}/{})",
+                            chunk_ids.len(),
+                            self.map_size_mb,
+                            attempts + 1,
+                            max_attempts
+                        );
+                    } else {
+                        error!(
+                            "❌ MDB_MAP_FULL deleting {} chunk(s), already at the max map size \
+                             {}MB (set CODESEARCH_MAX_LMDB_MAP_SIZE_MB to raise this cap)",
+                            chunk_ids.len(),
                             self.map_size_mb
                         );
                         return result;
@@ -890,24 +1120,62 @@ impl VectorStore {
         loop {
             attempts += 1;
 
+            // The aborted attempt committed nothing, so the ids it consumed
+            // were never assigned: hand them back instead of letting every
+            // retry push the id space (and arroy's item range) further out.
+            let id_before = self.next_id;
             let result = self.insert_chunks_with_ids_impl(&chunks);
 
             match &result {
-                Ok(_) => return result,
+                Ok(_) => {
+                    if attempts > 1 {
+                        tracing::info!(
+                            "✅ Insert of {} chunk(s) succeeded on attempt {}/{} at {}MB",
+                            chunks.len(),
+                            attempts,
+                            max_attempts,
+                            self.map_size_mb
+                        );
+                    }
+                    return result;
+                }
                 Err(e) => {
-                    if attempts >= max_attempts || !self.is_map_full_error(e.as_ref()) {
+                    self.next_id = id_before;
+                    if !self.is_map_full_error(e.as_ref()) {
+                        return result;
+                    }
+                    if attempts >= max_attempts {
+                        // Previously this returned in silence, which is how a
+                        // wedged final attempt looked identical to a crash.
+                        tracing::error!(
+                            "❌ MDB_MAP_FULL persists after {} attempt(s) at {}MB while inserting \
+                             {} chunk(s) — giving up: {}",
+                            attempts,
+                            self.map_size_mb,
+                            chunks.len(),
+                            e
+                        );
                         return result;
                     }
 
                     // Double map size and retry
                     let new_size = self.map_size_mb * 2;
-                    if new_size <= MAX_LMDB_MAP_SIZE_MB {
-                        warn!("MDB_MAP_FULL error in insert_chunks_with_ids(), resizing to {}MB (attempt {}/{})",
-                              new_size, attempts, max_attempts);
+                    if new_size <= max_lmdb_map_size_mb() {
+                        warn!("MDB_MAP_FULL error in insert_chunks_with_ids() inserting {} chunk(s), resizing to {}MB (attempt {}/{})",
+                              chunks.len(), new_size, attempts, max_attempts);
                         self.resize_environment(new_size)?;
-                    } else {
                         warn!(
-                            "MDB_MAP_FULL error, already at max size {}MB",
+                            "↻ Retrying insert of {} chunk(s) at {}MB (attempt {}/{})",
+                            chunks.len(),
+                            self.map_size_mb,
+                            attempts + 1,
+                            max_attempts
+                        );
+                    } else {
+                        error!(
+                            "❌ MDB_MAP_FULL inserting {} chunk(s), already at the max map size \
+                             {}MB (set CODESEARCH_MAX_LMDB_MAP_SIZE_MB to raise this cap)",
+                            chunks.len(),
                             self.map_size_mb
                         );
                         return result;
@@ -945,6 +1213,15 @@ impl VectorStore {
             self.next_id += 1;
         }
 
+        // Persist the high-water mark in the SAME transaction as the data:
+        // if this txn aborts, neither the chunks nor the mark land, so the
+        // mark can never claim ids that were not actually assigned. On
+        // abort the in-memory next_id may have advanced past the persisted
+        // mark — that only wastes ids (gaps), it can never reuse one.
+        if let Some(db) = &self.id_hwm_db {
+            db.put(&mut wtxn, META_KEY_ID_HWM, &(self.next_id - 1))?;
+        }
+
         wtxn.commit()?;
         self.indexed = false;
 
@@ -962,6 +1239,14 @@ impl VectorStore {
         // Clear both databases
         self.chunks.clear(&mut wtxn)?;
         self.vectors.clear(&mut wtxn)?;
+
+        // A deliberate wipe starts a new id generation: drop the high-water
+        // mark with the data so the counter may restart at 0. Stale references
+        // into the wiped generation then fail as `Ok(None)` (safe miss) —
+        // they can never resolve to the new generation's unrelated content.
+        if let Some(db) = &self.id_hwm_db {
+            db.delete(&mut wtxn, META_KEY_ID_HWM)?;
+        }
 
         wtxn.commit()?;
 
@@ -1174,6 +1459,46 @@ mod tests {
     use crate::embed::EmbeddedChunk;
     use tempfile::tempdir;
 
+    /// A failed insert must leave the id counter where it was: the transaction
+    /// aborted, so those ids were never handed out. Under the MDB_MAP_FULL
+    /// retry this compounded — every attempt burned another `chunks.len()` ids
+    /// and pushed arroy's item range further out on a database that already
+    /// could not take the data. Provoked here with a dimension mismatch,
+    /// which fails the same `_impl` mid-loop without a 512MB fixture.
+    #[test]
+    fn a_failed_insert_hands_back_the_ids_it_consumed() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("ids.db");
+        let mut store = VectorStore::new(&db_path, 4).unwrap();
+
+        store
+            .insert_chunks_with_ids(vec![drift_chunk("src/a.rs", "fn a() {}", 0)])
+            .expect("baseline insert");
+        let before = store.next_id;
+
+        let bad = vec![
+            drift_chunk("src/b.rs", "fn b() {}", 1),
+            EmbeddedChunk::new(
+                Chunk::new(
+                    "fn c() {}".to_string(),
+                    2,
+                    2,
+                    ChunkKind::Other,
+                    "src/c.rs".to_string(),
+                ),
+                vec![1.0, 0.0], // wrong dimension: fails after the first chunk
+            ),
+        ];
+        store
+            .insert_chunks_with_ids(bad)
+            .expect_err("dimension mismatch must fail the insert");
+
+        assert_eq!(
+            store.next_id, before,
+            "ids consumed by the aborted attempt must be handed back"
+        );
+    }
+
     #[test]
     fn test_vector_store_creation() {
         let temp_dir = tempdir().unwrap();
@@ -1222,8 +1547,9 @@ mod tests {
         let db_path = temp_dir.path().join("capped.db");
         std::fs::create_dir_all(&db_path).unwrap();
 
-        let pinned = pin_map_size(&db_path, MAX_LMDB_MAP_SIZE_MB + 4096);
-        assert_eq!(pinned, MAX_LMDB_MAP_SIZE_MB);
+        let cap = max_lmdb_map_size_mb();
+        let pinned = pin_map_size(&db_path, cap + 4096);
+        assert_eq!(pinned, cap);
     }
 
     #[test]
@@ -1479,5 +1805,200 @@ mod tests {
         let emb = store.get_embedding(0).unwrap();
         assert!(emb.is_some());
         assert_eq!(emb.unwrap().len(), 4);
+    }
+
+    /// Helper: a 1-chunk insert carrying a distinguishing path, returning the
+    /// id assigned to it.
+    fn insert_one(store: &mut VectorStore, path: &str) -> u32 {
+        let ids = store
+            .insert_chunks_with_ids(vec![EmbeddedChunk::new(
+                Chunk::new(
+                    format!("fn {path}() {{}}"),
+                    0,
+                    1,
+                    ChunkKind::Function,
+                    path.to_string(),
+                ),
+                vec![1.0, 0.0, 0.0, 0.0],
+            )])
+            .unwrap();
+        assert_eq!(ids.len(), 1);
+        ids[0]
+    }
+
+    /// Deleting the chunks that hold the HIGHEST ids must not let a reopen
+    /// hand those ids to new content. Pre-mark behaviour recomputed
+    /// `next_id = max_key + 1` on every open, so the delete lowered max_key
+    /// and the next insert silently reused a dead id — `get_chunk(old_id)`
+    /// then returned the WRONG file with no error (the custom-kb
+    /// wrong-file-resolution defect class, todo #51).
+    #[test]
+    fn reopen_after_top_of_range_delete_does_not_reuse_ids() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("hwm-top.db");
+
+        let mut store = VectorStore::new(&db_path, 4).unwrap();
+        assert_eq!(insert_one(&mut store, "gen1/a.rs"), 0);
+        assert_eq!(insert_one(&mut store, "gen1/b.rs"), 1);
+
+        // Delete the top-of-range chunk (id 1) — lowers max_key to 0.
+        assert_eq!(store.delete_chunks(&[1]).unwrap(), 1);
+        drop(store);
+
+        // Reopen: next_id must come from the persisted high-water mark (1),
+        // NOT from the lowered max_key (0). The new chunk gets id 2.
+        let mut store = VectorStore::new(&db_path, 4).unwrap();
+        assert_eq!(insert_one(&mut store, "gen2/c.rs"), 2);
+
+        // The deleted id stays dead: a safe miss, never unrelated content.
+        let stale = store.get_chunk(1).unwrap();
+        assert!(stale.is_none(), "deleted id 1 must stay dead");
+        // And it did not alias the new content either.
+        assert_eq!(store.get_chunk(2).unwrap().unwrap().path, "gen2/c.rs");
+    }
+
+    /// The sharpest variant: delete EVERYTHING. Live keys are then empty, so
+    /// the legacy derivation would restart at id 0 and hand it to unrelated
+    /// new content. The mark must keep the counter past every dead id.
+    /// (Custom-kb routinely hits delete+add via renames and repo rewrites.)
+    #[test]
+    fn reopen_after_full_delete_never_restarts_from_zero() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("hwm-full.db");
+
+        let mut store = VectorStore::new(&db_path, 4).unwrap();
+        assert_eq!(insert_one(&mut store, "gen1/a.rs"), 0);
+        assert_eq!(insert_one(&mut store, "gen1/b.rs"), 1);
+        assert_eq!(insert_one(&mut store, "gen1/c.rs"), 2);
+
+        assert_eq!(store.delete_chunks(&[0, 1, 2]).unwrap(), 3);
+        drop(store);
+
+        let mut store = VectorStore::new(&db_path, 4).unwrap();
+        assert_eq!(insert_one(&mut store, "gen2/d.rs"), 3);
+        for dead in 0..3 {
+            assert!(
+                store.get_chunk(dead).unwrap().is_none(),
+                "deleted id {dead} must stay dead"
+            );
+        }
+    }
+
+    /// A deliberate `clear()` wipes the mark with the data: the next
+    /// generation may restart at 0, and old references miss safely.
+    #[test]
+    fn clear_resets_the_id_generation() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("hwm-clear.db");
+
+        let mut store = VectorStore::new(&db_path, 4).unwrap();
+        assert_eq!(insert_one(&mut store, "gen1/a.rs"), 0);
+        store.clear().unwrap();
+        drop(store);
+
+        let mut store = VectorStore::new(&db_path, 4).unwrap();
+        assert_eq!(insert_one(&mut store, "gen2/b.rs"), 0);
+    }
+
+    /// Legacy-store compat: a store whose "meta" DB carries no mark (written
+    /// by pre-mark code) opens fine and derives next_id from live keys only —
+    /// behaviour is unchanged until the first write persists the mark.
+    #[test]
+    fn reopen_without_mark_falls_back_to_live_keys() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("hwm-legacy.db");
+
+        let mut store = VectorStore::new(&db_path, 4).unwrap();
+        assert_eq!(insert_one(&mut store, "gen1/a.rs"), 0);
+        assert_eq!(insert_one(&mut store, "gen1/b.rs"), 1);
+
+        // Simulate a legacy store: strip the mark, keep the data.
+        {
+            let mut wtxn = store.env.write_txn().unwrap();
+            store
+                .id_hwm_db
+                .as_ref()
+                .unwrap()
+                .delete(&mut wtxn, META_KEY_ID_HWM)
+                .unwrap();
+            wtxn.commit().unwrap();
+        }
+        drop(store);
+
+        let mut store = VectorStore::new(&db_path, 4).unwrap();
+        // No mark, max_key = 1 → legacy derivation: next id is 2. (With the
+        // top chunk deleted this WOULD reuse id 1 — that is the documented,
+        // unchanged legacy risk for stores written before the mark existed.)
+        assert_eq!(insert_one(&mut store, "gen2/c.rs"), 2);
+    }
+
+    // === cross-generation chunk-id drift (mechanism repro → FIXED) ===
+    //
+    // History: ids were autoincrement (`next_id = max_key + 1` recomputed on
+    // every open), so deleting the chunks holding the HIGHEST ids lowered
+    // `max_key` and the next reopen handed those ids to unrelated content —
+    // `get_chunk(old_id)` returned the wrong file with no error. On the cloud
+    // peer every scale-to-zero wake replays custom-kb's incremental git
+    // history on a restored snapshot (delete + re-insert at the top of the
+    // range is routine there), which is why this mattered for chunk-id
+    // stability across cold starts. See develterf_dlwr/todo#51.
+    //
+    // The original repro on `fix/custom-kb-chunk-id-drift`
+    // (`reopen_after_top_of_range_delete_reassigns_ids_to_new_content`)
+    // asserted the OLD reassignment behaviour; it is superseded by the
+    // high-water-mark tests above (`reopen_after_top_of_range_delete_does_
+    // not_reuse_ids`, `reopen_after_full_delete_never_restarts_from_zero`)
+    // which pin the FIXED behaviour. The boundary control below is kept
+    // verbatim: low-range deletes were always safe and must stay safe.
+
+    fn drift_chunk(path: &str, content: &str, id: usize) -> EmbeddedChunk {
+        EmbeddedChunk::new(
+            Chunk::new(
+                content.to_string(),
+                id,
+                id,
+                ChunkKind::Other,
+                path.to_string(),
+            ),
+            vec![1.0, 0.0, 0.0, 0.0],
+        )
+    }
+
+    #[test]
+    fn reopen_after_low_range_delete_keeps_remaining_ids_stable() {
+        // Boundary control: deleting BELOW the top of the range leaves
+        // max_key untouched, so surviving ids stay stable across reopens and
+        // new inserts never collide with them. Under the high-water mark this
+        // holds trivially (the mark only ever raises next_id) — the test
+        // pins that the mark did not CHANGE this always-safe case.
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("drift-low.db");
+
+        {
+            let mut store = VectorStore::new(&db_path, 4).unwrap();
+            store
+                .insert_chunks_with_ids(vec![
+                    drift_chunk("a.md", "content A0", 0),
+                    drift_chunk("a.md", "content A1", 1),
+                    drift_chunk("b.md", "content B0", 2),
+                    drift_chunk("b.md", "content B1", 3),
+                ])
+                .unwrap();
+            // A (ids 0,1) deleted; B keeps the top of the range.
+            store.delete_chunks(&[0, 1]).unwrap();
+        }
+
+        let mut store2 = VectorStore::new(&db_path, 4).unwrap();
+        assert_eq!(store2.next_id, 4, "max_key (B's id 3) keeps next_id at 4");
+
+        // B's ids still resolve to B after the reopen.
+        let chunk = store2.get_chunk(2).unwrap().expect("id 2 must resolve");
+        assert_eq!(chunk.path, "b.md");
+
+        // New inserts start above the surviving range — no reuse.
+        let c_ids = store2
+            .insert_chunks_with_ids(vec![drift_chunk("c.md", "content C0", 0)])
+            .unwrap();
+        assert_eq!(c_ids, vec![4]);
     }
 }

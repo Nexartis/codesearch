@@ -29,6 +29,12 @@ pub struct FtsResult {
     pub score: f32,
 }
 
+enum CommitAttempt {
+    Committed,
+    PrepareFailed(String),
+    PublishFailed(String),
+}
+
 /// Full-text search store using Tantivy
 ///
 /// Single connection type that supports both read and write operations.
@@ -177,16 +183,17 @@ impl FtsStore {
 
     /// Open or create index with retry logic for Windows file locking issues
     fn open_or_create_index_with_retry(fts_path: &Path, schema: &Schema) -> Result<Index> {
-        let max_retries = 3;
+        const MAX_RETRIES: usize = 3;
         let mut last_error: Option<String> = None;
 
-        for attempt in 0..max_retries {
+        for attempt in 0..MAX_RETRIES {
             if attempt > 0 {
                 // Wait before retry (exponential backoff)
                 std::thread::sleep(std::time::Duration::from_millis(100 * (1 << attempt)));
             }
 
-            let result: Result<Index, _> = if fts_path.join("meta.json").exists() {
+            let opened_existing = fts_path.join("meta.json").exists();
+            let result: Result<Index, _> = if opened_existing {
                 Index::open_in_dir(fts_path).map_err(|e| e.to_string())
             } else {
                 MmapDirectory::open(fts_path)
@@ -202,18 +209,53 @@ impl FtsStore {
                 Err(e) => {
                     last_error = Some(e);
                     // On Windows, try to clear lock files if permission denied
-                    if attempt < max_retries - 1 {
+                    if attempt < MAX_RETRIES - 1 {
                         Self::try_clear_lock_files(fts_path);
                     }
                 }
             }
         }
 
-        Err(anyhow!(
-            "Failed to open FTS index after {} retries: {}",
-            max_retries,
-            last_error.unwrap_or_default()
-        ))
+        // Last resort: a pre-upgrade FTS index written by an older tantivy
+        // major cannot be opened by this one (format break), which would
+        // brick the whole DB for existing users. The FTS index is derived
+        // data — fully rebuildable via reindex — so wipe it and create a
+        // fresh empty index instead of failing. BM25 results stay empty
+        // until the next (re)index; vector search is unaffected.
+        if let Err(wipe_err) = Self::wipe_fts_dir(fts_path) {
+            return Err(anyhow!(
+                "Failed to open FTS index after {MAX_RETRIES} retries: {} (wipe also failed: {wipe_err})",
+                last_error.unwrap_or_default()
+            ));
+        }
+        tracing::warn!(
+            "FTS index at {} was unreadable by this codesearch version and has been reset; \
+             run 'codesearch index' to rebuild it",
+            fts_path.display()
+        );
+        MmapDirectory::open(fts_path)
+            .map_err(|e| e.to_string())
+            .and_then(|dir| {
+                Index::create(dir, schema.clone(), IndexSettings::default())
+                    .map_err(|e| e.to_string())
+            })
+            .map_err(|e| {
+                anyhow!(
+                    "Failed to open FTS index after {} retries: {} (fresh create also failed: {})",
+                    MAX_RETRIES,
+                    last_error.unwrap_or_default(),
+                    e
+                )
+            })
+    }
+
+    /// Remove the FTS index directory contents so a fresh index can be created.
+    fn wipe_fts_dir(fts_path: &Path) -> std::io::Result<()> {
+        if !fts_path.exists() {
+            return Ok(());
+        }
+        std::fs::remove_dir_all(fts_path)?;
+        std::fs::create_dir_all(fts_path)
     }
 
     /// Create writer with retry logic for Windows file locking issues
@@ -315,9 +357,7 @@ impl FtsStore {
             Ok(_) => Ok(()),
             Err(e) => {
                 let error_str = e.to_string();
-                if error_str.contains("writer was killed")
-                    || error_str.contains("index writer was killed")
-                {
+                if Self::is_writer_killed(&error_str) {
                     tracing::debug!(
                         "FTS writer was killed, recreating and retrying add_chunk for chunk {}",
                         chunk_id
@@ -370,88 +410,114 @@ impl FtsStore {
         Ok(())
     }
 
+    fn is_writer_killed(error: &str) -> bool {
+        error.contains("writer was killed") || error.contains("index writer was killed")
+    }
+
+    fn is_transient_commit_error(error: &str) -> bool {
+        error.contains("Access is denied")
+            || error.contains("PermissionDenied")
+            || error.contains("IoError")
+    }
+
+    /// One commit attempt, split so a failure in `prepare_commit` is told
+    /// apart from a failure while publishing an already-prepared commit.
+    ///
+    /// `prepare_commit` joins every indexing worker and respawns it one by
+    /// one; a worker error aborts that loop half-way and leaves the writer
+    /// with fewer (often zero) workers behind a live 10k-doc pipeline.
+    /// Committing that writer again "succeeds" while every later document is
+    /// queued and silently dropped, and once the pipeline fills,
+    /// `add_document` blocks forever — so it must never be reused.
+    fn commit_once(&mut self) -> CommitAttempt {
+        let Some(writer) = self.writer.as_mut() else {
+            return CommitAttempt::Committed;
+        };
+        match writer.prepare_commit() {
+            Ok(prepared) => match prepared.commit() {
+                Ok(_) => CommitAttempt::Committed,
+                Err(e) => CommitAttempt::PublishFailed(e.to_string()),
+            },
+            Err(e) => CommitAttempt::PrepareFailed(e.to_string()),
+        }
+    }
+
     /// Commit pending changes with retry logic for Windows file locking.
     ///
-    /// If the writer was killed (background merge panic), it is recreated.
-    /// Data since the last successful commit will be lost in that case, but
-    /// indexing can continue rather than aborting entirely.
+    /// A killed writer (background merge panic) is recreated so the store stays
+    /// usable; any other flush failure discards it. Both return an error: the
+    /// pending documents are gone, and the caller must learn that instead of
+    /// seeing a commit that silently indexed nothing.
     pub fn commit(&mut self) -> Result<()> {
         if self.writer.is_none() {
             return Ok(());
         }
 
         let max_retries = 5;
-        let mut last_error: Option<String> = None;
+        let mut last_error = String::new();
 
         for attempt in 0..max_retries {
             if attempt > 0 {
-                // Wait before retry (exponential backoff: 100ms, 200ms, 400ms, 800ms)
+                // Wait before retry (exponential backoff: 200ms, 400ms, 800ms, 1600ms)
                 std::thread::sleep(std::time::Duration::from_millis(100 * (1 << attempt)));
             }
 
-            let writer = self.writer.as_mut().unwrap();
-            match writer.commit() {
-                Ok(_) => {
-                    // Reload reader to see changes
+            let error_str = match self.commit_once() {
+                CommitAttempt::Committed => {
                     if let Err(e) = self.reader.reload() {
                         // Non-fatal: reader will eventually catch up
                         tracing::debug!("Reader reload warning: {}", e);
                     }
                     return Ok(());
                 }
-                Err(e) => {
-                    let error_str = e.to_string();
-                    last_error = Some(error_str.clone());
-
-                    // Writer was killed by background thread panic — recreate it
-                    if error_str.contains("writer was killed")
-                        || error_str.contains("index writer was killed")
-                    {
-                        tracing::debug!(
-                            "FTS writer was killed during commit (attempt {}/{}). \
-                             Recreating writer. Data since last commit may be lost.",
-                            attempt + 1,
-                            max_retries
-                        );
-                        self.writer = None;
-                        self.ensure_writer()?;
-                        // After recreating, the pending data is gone, so commit
-                        // the new (empty) writer to ensure a clean state
-                        if let Some(ref mut w) = self.writer {
-                            w.commit()
-                                .map_err(|e| anyhow!("FTS commit after recovery failed: {}", e))?;
-                        }
-                        if let Err(e) = self.reader.reload() {
-                            tracing::debug!("Reader reload warning: {}", e);
-                        }
-                        return Ok(());
-                    }
-
-                    // File locking error — retry with backoff
-                    if error_str.contains("Access is denied")
-                        || error_str.contains("PermissionDenied")
-                        || error_str.contains("IoError")
-                    {
-                        tracing::debug!(
-                            "FTS commit retry {}/{}: {}",
-                            attempt + 1,
-                            max_retries,
-                            error_str
-                        );
-                        // Continue to retry
-                    } else {
-                        // Non-recoverable error, fail immediately
-                        return Err(anyhow!("FTS commit failed: {}", error_str));
-                    }
+                CommitAttempt::PrepareFailed(e) if !Self::is_writer_killed(&e) => {
+                    self.writer = None;
+                    return Err(anyhow!(
+                        "FTS commit failed while flushing indexing workers: {}. The writer was \
+                         discarded; uncommitted FTS changes are lost and must be re-indexed",
+                        e
+                    ));
                 }
+                CommitAttempt::PrepareFailed(e) | CommitAttempt::PublishFailed(e) => e,
+            };
+            last_error = error_str.clone();
+
+            if Self::is_writer_killed(&error_str) {
+                self.writer = None;
+                self.ensure_writer()?;
+                // After recreating, the pending data is gone, so commit
+                // the new (empty) writer to ensure a clean state
+                if let Some(ref mut w) = self.writer {
+                    w.commit()
+                        .map_err(|e| anyhow!("FTS commit after recovery failed: {}", e))?;
+                }
+                if let Err(e) = self.reader.reload() {
+                    tracing::debug!("Reader reload warning: {}", e);
+                }
+                // The store stays usable, but the caller must not record the
+                // dropped documents as indexed.
+                return Err(anyhow!(
+                    "FTS writer was killed during commit: {}. A fresh writer was created; \
+                     uncommitted FTS changes are lost and must be re-indexed",
+                    error_str
+                ));
             }
+
+            if !Self::is_transient_commit_error(&error_str) {
+                return Err(anyhow!("FTS commit failed: {}", error_str));
+            }
+            tracing::debug!(
+                "FTS commit retry {}/{}: {}",
+                attempt + 1,
+                max_retries,
+                error_str
+            );
         }
 
-        // All retries exhausted
         Err(anyhow!(
             "FTS commit failed after {} retries: {}",
             max_retries,
-            last_error.unwrap_or_default()
+            last_error
         ))
     }
 
@@ -502,7 +568,8 @@ impl FtsStore {
         };
 
         // Execute search
-        let top_docs = searcher.search(&parsed_query, &TopDocs::with_limit(limit))?;
+        let top_docs =
+            searcher.search(&parsed_query, &TopDocs::with_limit(limit).order_by_score())?;
 
         self.collect_fts_results(top_docs)
     }
@@ -560,7 +627,7 @@ impl FtsStore {
             BooleanQuery::union(vec![Box::new(boosted_sig), Box::new(content_query)])
         };
 
-        let top_docs = searcher.search(&combined, &TopDocs::with_limit(limit))?;
+        let top_docs = searcher.search(&combined, &TopDocs::with_limit(limit).order_by_score())?;
 
         self.collect_fts_results(top_docs)
     }
@@ -578,7 +645,7 @@ impl FtsStore {
         let query = RegexQuery::from_pattern(pattern, self.content_field)
             .map_err(|e| anyhow!("Invalid regex pattern '{}': {}", pattern, e))?;
 
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(limit))?;
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(limit).order_by_score())?;
 
         self.collect_fts_results(top_docs)
     }
@@ -628,7 +695,7 @@ impl FtsStore {
             Box::new(PhraseQuery::new(terms))
         };
 
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(limit))?;
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(limit).order_by_score())?;
 
         self.collect_fts_results(top_docs)
     }
@@ -842,6 +909,34 @@ mod tests {
         // Phrase with no match
         let results = store.search_phrase("nonexistent phrase xyz", 10)?;
         assert!(results.is_empty());
+
+        Ok(())
+    }
+
+    /// An index written by an incompatible tantivy major must not brick the
+    /// store: the unreadable index is wiped and a fresh empty one created
+    /// (BM25 rebuilds on the next index run).
+    #[test]
+    fn unreadable_index_is_wiped_and_store_recovers() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let fts_dir = tmp.path().join("fts");
+        std::fs::create_dir_all(&fts_dir)?;
+        // A meta.json no tantivy version can parse simulates an index from
+        // an incompatible tantivy major.
+        std::fs::write(fts_dir.join("meta.json"), "{ not valid tantivy metadata")?;
+
+        let mut store = FtsStore::new(tmp.path())?;
+
+        // Fresh store: opens and searches empty.
+        let results = store.search("anything", 10, None)?;
+        assert!(results.is_empty());
+
+        // And accepts writes after the wipe.
+        store.add_chunk(1, "recovery probe content", "probe.rs", None, "block")?;
+        store.commit()?;
+        let results = store.search("recovery probe", 10, None)?;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].chunk_id, 1);
 
         Ok(())
     }

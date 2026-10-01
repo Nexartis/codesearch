@@ -24,6 +24,49 @@ use crate::index::build_serve_client_with_key;
 // Shared with the `remote` CLI command via constants (single source of truth).
 use crate::constants::DEFAULT_REMOTE_TIMEOUT_SECS as DEFAULT_TIMEOUT_SECS;
 
+/// Whether an HTTP status from a remote peer is transient — likely a
+/// scale-to-zero cold start (503) or a short gateway hiccup (502/504) — and
+/// therefore worth a bounded in-call retry. Everything else (4xx auth/config
+/// problems, the peer's own 5xx tool errors) is a real answer, not noise:
+/// retrying it would only burn the caller's time before failing the same way.
+fn is_transient_peer_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 502..=504)
+}
+
+/// Backoff before federation retry attempt `retry_idx` (0-based). Honours the
+/// `CODESEARCH_REMOTE_RETRY_BACKOFF_MS` test override (a single ms value used
+/// for every retry); without it, [`REMOTE_PEER_RETRY_BACKOFF_MS`] supplies one
+/// delay per retry, reusing its last entry for any excess retries.
+async fn peer_retry_backoff(retry_idx: usize) {
+    let override_ms = std::env::var(crate::constants::REMOTE_PEER_RETRY_BACKOFF_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
+    let default_ms = || {
+        crate::constants::REMOTE_PEER_RETRY_BACKOFF_MS
+            .last()
+            .copied()
+            .unwrap_or(8000)
+    };
+    let ms = override_ms.unwrap_or_else(|| {
+        crate::constants::REMOTE_PEER_RETRY_BACKOFF_MS
+            .get(retry_idx)
+            .copied()
+            .unwrap_or_else(default_ms)
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+}
+
+/// Final-failure message for a peer that still answered transiently after all
+/// retries: names the likely cause (cold start) and the remedy (retry soon),
+/// so a caller can tell "temporarily unavailable" apart from "misconfigured /
+/// auth failed" — which need entirely different responses.
+fn transient_exhausted_message(what: &str, status: u16, retries: u32) -> String {
+    format!(
+        "remote {what} did not respond in time (http={status} after {retries} retries) — \
+         likely a cold start on a scale-to-zero host; retry the same call in ~30s"
+    )
+}
+
 /// A single hit returned by a remote `/search` endpoint.
 ///
 /// Fields mirror the local search-item shapes (semantic *and* literal) but are
@@ -127,7 +170,7 @@ pub struct RemoteRepoStatus {
     #[serde(default)]
     pub alias: String,
     /// Repo lifecycle state reported by the server
-    /// (`open`/`warm`/`readonly`/`closed`/`indexing`/`error`/`no_index`).
+    /// (`open`/`warm`/`readonly`/`idle`/`indexing`/`error`/`no_index`; older peers may send `closed`).
     #[serde(default)]
     pub status: String,
     /// `write`/`read`/`-`.
@@ -141,11 +184,15 @@ pub struct RemoteRepoStatus {
     pub tool_call_count: Option<u64>,
 }
 
-/// `GET /repos/:alias/info` payload — on-disk index stats for one repo on the
+/// `GET /repos/{alias}/info` payload — on-disk index stats for one repo on the
 /// peer. Only the fields the TUI mount-info overlay renders are typed; every
 /// field is optional/defaulted so an older/newer remote still parses.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct RemoteRepoInfo {
+    /// The peer's on-disk index path (its `.codesearch.db` directory) — NOT
+    /// the same shape as `RemoteRepoAdded.path` below, which is a repo root.
+    #[serde(default)]
+    pub path: String,
     #[serde(default)]
     pub chunks: usize,
     #[serde(default)]
@@ -169,7 +216,7 @@ pub struct RemoteRepoAdded {
     pub message: Option<String>,
 }
 
-/// `DELETE /repos/:alias` success payload (HTTP 200).
+/// `DELETE /repos/{alias}` success payload (HTTP 200).
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct RemoteRepoRemoved {
     #[serde(default)]
@@ -182,7 +229,7 @@ pub struct RemoteRepoRemoved {
     pub message: Option<String>,
 }
 
-/// `POST /repos/:alias/reindex` success payload (HTTP 202).
+/// `POST /repos/{alias}/reindex` success payload (HTTP 202).
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct RemoteReindexResult {
     #[serde(default)]
@@ -264,43 +311,78 @@ impl FederationClient {
 
     /// Shared POST + parse for `/search` (group- and project-scoped variants
     /// prepare the body differently, then funnel through here).
+    ///
+    /// Transient statuses (502/503/504 — most often a scale-to-zero cold
+    /// start) are retried a bounded number of times inside this call before
+    /// the failure is surfaced; see [`REMOTE_PEER_RETRY_ATTEMPTS`]. Transport
+    /// errors (refused/timeout) are NOT retried: the per-request timeout
+    /// already consumed the call's latency budget, and a hard-unreachable peer
+    /// fails the same way on the next attempt.
     async fn post_search(
         &self,
         peer: &RemotePeer,
         body: serde_json::Value,
     ) -> Outcome<Vec<RemoteSearchItem>> {
         let url = Self::peer_url(peer, crate::constants::SEARCH_PATH);
-        let req = self
-            .client
-            .post(&url)
-            .timeout(Self::peer_timeout(peer))
-            .json(&body);
-        let req = attach_bearer(req, &peer.api_key);
-
-        match req.send().await {
-            Ok(resp) => {
-                let status = resp.status();
-                match resp.json::<RemoteSearchResponse>().await {
-                    Ok(parsed) if status.is_success() && !parsed._mcp_is_error.unwrap_or(false) => {
-                        Outcome::Ok(parsed.results)
-                    }
-                    Ok(parsed) => {
-                        // Tool-level error on the remote (e.g. scope_required).
-                        let n = parsed.results.len();
-                        Outcome::Unreachable(format!(
-                            "remote /search returned a tool error (http={status}, items={n})"
-                        ))
-                    }
-                    Err(e) => Outcome::Unreachable(format!(
-                        "remote /search returned non-JSON body (http={status}): {e}"
-                    )),
-                }
+        let attempts = crate::constants::REMOTE_PEER_RETRY_ATTEMPTS.max(1);
+        for attempt in 0..attempts {
+            if attempt > 0 {
+                peer_retry_backoff((attempt - 1) as usize).await;
             }
-            Err(e) => Outcome::Unreachable(format!("remote /search unreachable: {e}")),
+            let req = self
+                .client
+                .post(&url)
+                .timeout(Self::peer_timeout(peer))
+                .json(&body);
+            let req = attach_bearer(req, &peer.api_key);
+
+            match req.send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if is_transient_peer_status(status) {
+                        let retries_left = attempts - attempt - 1;
+                        if retries_left > 0 {
+                            tracing::debug!(
+                                "remote /search transient {} (attempt {}/{}) — retrying",
+                                status,
+                                attempt + 1,
+                                attempts
+                            );
+                            continue;
+                        }
+                        return Outcome::Unreachable(transient_exhausted_message(
+                            "/search",
+                            status.as_u16(),
+                            attempts - 1,
+                        ));
+                    }
+                    match resp.json::<RemoteSearchResponse>().await {
+                        Ok(parsed)
+                            if status.is_success() && !parsed._mcp_is_error.unwrap_or(false) =>
+                        {
+                            return Outcome::Ok(parsed.results)
+                        }
+                        Ok(parsed) => {
+                            // Tool-level error on the remote (e.g. scope_required).
+                            let n = parsed.results.len();
+                            return Outcome::Unreachable(format!(
+                                "remote /search returned a tool error (http={status}, items={n})"
+                            ));
+                        }
+                        Err(e) => {
+                            return Outcome::Unreachable(format!(
+                                "remote /search returned non-JSON body (http={status}): {e}"
+                            ))
+                        }
+                    }
+                }
+                Err(e) => return Outcome::Unreachable(format!("remote /search unreachable: {e}")),
+            }
         }
+        unreachable!("retry loop always returns on its final iteration")
     }
 
-    /// Fetch a single chunk from a remote peer's `/chunk/:id` endpoint.
+    /// Fetch a single chunk from a remote peer's `/chunk/{id}` endpoint.
     ///
     /// Scoping mirrors [`Self::search_project`]:
     /// - When `remote_alias` is `Some`, the lookup is scoped to that single
@@ -320,7 +402,7 @@ impl FederationClient {
     ) -> Outcome<serde_json::Value> {
         let mut url = Self::peer_url(
             peer,
-            &crate::constants::CHUNK_PATH.replace(":id", &chunk_id.to_string()),
+            &crate::constants::CHUNK_PATH.replace("{id}", &chunk_id.to_string()),
         );
         // Scope the lookup: prefer a single-project scope (`project=<alias>`)
         // so the multi-repo peer can disambiguate the chunk_id; fall back to
@@ -345,28 +427,56 @@ impl FederationClient {
             .join("&");
         url.push('?');
         url.push_str(&query);
-        let req = self.client.get(&url).timeout(Self::peer_timeout(peer));
-        let req = attach_bearer(req, &peer.api_key);
-        match req.send().await {
-            Ok(resp) => {
-                let status = resp.status();
-                match resp.json::<serde_json::Value>().await {
-                    Ok(v) if status.is_success() && !is_mcp_error(&v) => Outcome::Ok(v),
-                    Ok(v) => Outcome::Unreachable(format!(
-                        "remote /chunk returned a tool error (http={status}): {}",
-                        short_reason(&v)
-                    )),
-                    Err(e) => Outcome::Unreachable(format!(
-                        "remote /chunk returned non-JSON body (http={status}): {e}"
-                    )),
-                }
+        let attempts = crate::constants::REMOTE_PEER_RETRY_ATTEMPTS.max(1);
+        for attempt in 0..attempts {
+            if attempt > 0 {
+                peer_retry_backoff((attempt - 1) as usize).await;
             }
-            Err(e) => Outcome::Unreachable(format!("remote /chunk unreachable: {e}")),
+            let req = self.client.get(&url).timeout(Self::peer_timeout(peer));
+            let req = attach_bearer(req, &peer.api_key);
+            match req.send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if is_transient_peer_status(status) {
+                        let retries_left = attempts - attempt - 1;
+                        if retries_left > 0 {
+                            tracing::debug!(
+                                "remote /chunk transient {} (attempt {}/{}) — retrying",
+                                status,
+                                attempt + 1,
+                                attempts
+                            );
+                            continue;
+                        }
+                        return Outcome::Unreachable(transient_exhausted_message(
+                            "/chunk",
+                            status.as_u16(),
+                            attempts - 1,
+                        ));
+                    }
+                    match resp.json::<serde_json::Value>().await {
+                        Ok(v) if status.is_success() && !is_mcp_error(&v) => return Outcome::Ok(v),
+                        Ok(v) => {
+                            return Outcome::Unreachable(format!(
+                                "remote /chunk returned a tool error (http={status}): {}",
+                                short_reason(&v)
+                            ))
+                        }
+                        Err(e) => {
+                            return Outcome::Unreachable(format!(
+                                "remote /chunk returned non-JSON body (http={status}): {e}"
+                            ))
+                        }
+                    }
+                }
+                Err(e) => return Outcome::Unreachable(format!("remote /chunk unreachable: {e}")),
+            }
         }
+        unreachable!("retry loop always returns on its final iteration")
     }
 
     /// Shared request/response handling for the management endpoints
-    /// (`/status`, `/repos`, `/repos/:alias`, `/repos/:alias/reindex`).
+    /// (`/status`, `/repos`, `/repos/{alias}`, `/repos/{alias}/reindex`).
     ///
     /// Distinguishes three failure modes (see [`ManagementOutcome`]):
     /// transport failure → `Unreachable`; non-2xx → `HttpError` with the peer's
@@ -467,7 +577,7 @@ impl FederationClient {
         .await
     }
 
-    /// `DELETE /repos/:alias` — unregister a repo on the peer and delete its DB.
+    /// `DELETE /repos/{alias}` — unregister a repo on the peer and delete its DB.
     /// `alias` is the peer's repo alias (NOT a local path).
     pub async fn remove_repo(
         &self,
@@ -481,7 +591,7 @@ impl FederationClient {
             .await
     }
 
-    /// `GET /repos/:alias/info` — fetch on-disk index stats (chunks/files/db
+    /// `GET /repos/{alias}/info` — fetch on-disk index stats (chunks/files/db
     /// size/model) for one repo on the peer. `alias` is the peer's repo alias.
     pub async fn repo_info(
         &self,
@@ -498,7 +608,7 @@ impl FederationClient {
             .await
     }
 
-    /// `POST /repos/:alias/reindex[?force=true]` — trigger a background
+    /// `POST /repos/{alias}/reindex[?force=true]` — trigger a background
     /// incremental (or forced full) reindex of a repo on the peer.
     pub async fn reindex(
         &self,
@@ -618,6 +728,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_slow_peer_returns_unreachable_within_deadline() {
+        // A peer that ACCEPTS the connection but responds slower than the
+        // configured `timeout_secs` must surface as `Outcome::Unreachable`
+        // (driven by reqwest's per-request timeout) — NOT hang for the full
+        // server delay. This is the deadline guarantee federation relies on to
+        // avoid a single slow peer stalling a fan-out.
+        let app = axum::Router::new().route(
+            crate::constants::SEARCH_PATH,
+            axum::routing::post(|| async {
+                // Sleep far longer than the peer timeout below.
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                axum::Json(serde_json::json!({"results": []}))
+            }),
+        );
+        let addr = spawn_test_server(app).await;
+
+        let slow_peer = RemotePeer {
+            url: format!("http://{addr}"),
+            api_key: String::new(),
+            group: None,
+            timeout_secs: Some(1),
+        };
+
+        let client = FederationClient::new().unwrap();
+        let start = std::time::Instant::now();
+        let outcome = client
+            .search_project(&slow_peer, serde_json::json!({"query": "x"}), "kb")
+            .await;
+        let elapsed = start.elapsed();
+
+        // Must return well before the 3s server delay — i.e. the deadline fired.
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "expected the peer timeout (~1s) to fire, not a hang for the full \
+             server delay; took {elapsed:?}"
+        );
+        match outcome {
+            Outcome::Unreachable(_) => {}
+            other => panic!("expected Unreachable (deadline), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn search_returns_results_from_a_live_peer() {
         let app = axum::Router::new().route(
             crate::constants::SEARCH_PATH,
@@ -713,7 +866,7 @@ mod tests {
         // `group`) for a namespaced lookup — the fix for `ambiguous_chunk_id`
         // on a multi-repo peer.
         let app = axum::Router::new().route(
-            "/chunk/:id",
+            "/chunk/{id}",
             axum::routing::get(
                 |axum::extract::Query(params): axum::extract::Query<
                     std::collections::HashMap<String, String>,
@@ -765,7 +918,7 @@ mod tests {
         // lookup must then fall back to the peer's group scope and NOT send a
         // `project` param — preserving pre-fix behaviour for old refs.
         let app = axum::Router::new().route(
-            "/chunk/:id",
+            "/chunk/{id}",
             axum::routing::get(
                 |axum::extract::Query(params): axum::extract::Query<
                     std::collections::HashMap<String, String>,
@@ -888,7 +1041,7 @@ mod tests {
     async fn remove_repo_targets_alias_in_url() {
         // Echo the captured alias back to prove it landed in the DELETE path.
         let app = axum::Router::new().route(
-            "/repos/:alias",
+            "/repos/{alias}",
             axum::routing::delete(
                 |axum::extract::Path(alias): axum::extract::Path<String>| async move {
                     axum::Json(serde_json::json!({
@@ -919,7 +1072,7 @@ mod tests {
     async fn reindex_posts_to_alias_reindex_path() {
         // Capture the alias from the path to prove the reindex URL was built.
         let app = axum::Router::new().route(
-            "/repos/:alias/reindex",
+            "/repos/{alias}/reindex",
             axum::routing::post(
                 |axum::extract::Path(alias): axum::extract::Path<String>| async move {
                     axum::Json(serde_json::json!({
@@ -953,7 +1106,7 @@ mod tests {
     async fn reindex_with_force_appends_force_query() {
         // Capture the query string to prove ?force=true was forwarded.
         let app = axum::Router::new().route(
-            "/repos/:alias/reindex",
+            "/repos/{alias}/reindex",
             axum::routing::post(
                 |axum::extract::Query(params): axum::extract::Query<
                     std::collections::HashMap<String, String>,
@@ -987,7 +1140,7 @@ mod tests {
         // An alias with a space must be percent-encoded on the wire and decoded
         // back by axum — proves the encoding round-trips through the HTTP layer.
         let app = axum::Router::new().route(
-            "/repos/:alias",
+            "/repos/{alias}",
             axum::routing::delete(
                 |axum::extract::Path(alias): axum::extract::Path<String>| async move {
                     axum::Json(serde_json::json!({
@@ -1060,5 +1213,247 @@ mod tests {
             ManagementOutcome::Unreachable(_) => {}
             other => panic!("expected Unreachable, got {:?}", other),
         }
+    }
+
+    // =========================================================================
+    // Transient-status retry (502/503/504 — scale-to-zero cold starts, todo #58)
+    // =========================================================================
+
+    /// Helper: an axum route answering `/chunk/{id}` that returns 503 (with a
+    /// non-JSON body, like a real cold-starting gateway) for the first
+    /// `fail_first` calls, then a valid 200 JSON chunk payload. Counts every
+    /// hit so tests can assert exactly how many attempts were made.
+    fn flaky_chunk_route(
+        fail_first: u32,
+    ) -> (axum::Router, std::sync::Arc<std::sync::atomic::AtomicU32>) {
+        use axum::response::IntoResponse;
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let hits_clone = hits.clone();
+        let router = axum::Router::new().route(
+            "/chunk/{id}",
+            axum::routing::get(move || {
+                let hits = hits_clone.clone();
+                async move {
+                    let n = hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    if n <= fail_first {
+                        (
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            "backend cold start",
+                        )
+                            .into_response()
+                    } else {
+                        axum::Json(serde_json::json!({
+                            "chunk_id": n,
+                            "content": "warm",
+                            "path": "kb/warm.md",
+                            "start_line": 1,
+                            "end_line": 2
+                        }))
+                        .into_response()
+                    }
+                }
+            }),
+        );
+        (router, hits)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn get_chunk_retries_transient_503_and_succeeds() {
+        let _env = crate::testing::EnvRestore::set(&[(
+            crate::constants::REMOTE_PEER_RETRY_BACKOFF_ENV,
+            "1",
+        )]);
+        // Fails twice with 503 (non-JSON body, exactly like the observed
+        // cold-start failure), then succeeds — must surface as Ok with the
+        // caller never seeing the transient failures.
+        let (router, hits) = flaky_chunk_route(2);
+        let addr = spawn_test_server(router).await;
+
+        let client = FederationClient::new().unwrap();
+        let outcome = client
+            .get_chunk(&peer(format!("http://{addr}")), Some("kb"), 42, None)
+            .await;
+        match outcome {
+            Outcome::Ok(v) => assert_eq!(v["content"], "warm"),
+            other => panic!("expected Ok after retry, got {other:?}"),
+        }
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "two cold-start 503s + one success = three attempts"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn get_chunk_requests_the_exact_chunk_path_without_placeholder_residue() {
+        // Regression (todo #153): the URL template is `/chunk/{id}`; a
+        // placeholder replacement that missed the closing brace produced
+        // `/chunk/2058%7D`. Axum's `{id}` param happily swallowed the stray
+        // `}` into the captured value, so mock-based route tests passed while
+        // real peers answered 400 Bad Request on the mangled id. The route
+        // below echoes back the EXACT path it was hit on, so any residue in
+        // the constructed URL fails the assertion.
+        let seen = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+        let seen_clone = seen.clone();
+        let router = axum::Router::new().route(
+            "/chunk/{id}",
+            axum::routing::get(move |uri: axum::http::Uri| {
+                let seen = seen_clone.clone();
+                async move {
+                    *seen.lock().await = uri.path().to_string();
+                    axum::Json(serde_json::json!({
+                        "chunk_id": 2058,
+                        "content": "ok",
+                        "path": "kb/x.md",
+                        "start_line": 1,
+                        "end_line": 2
+                    }))
+                }
+            }),
+        );
+        let addr = spawn_test_server(router).await;
+
+        let client = FederationClient::new().unwrap();
+        let outcome = client
+            .get_chunk(&peer(format!("http://{addr}")), Some("bynder"), 2058, None)
+            .await;
+        assert!(
+            matches!(outcome, Outcome::Ok(_)),
+            "the peer must answer the clean path"
+        );
+        assert_eq!(
+            *seen.lock().await,
+            "/chunk/2058",
+            "the constructed URL must carry the bare chunk id — no placeholder residue"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn get_chunk_persistent_503_reports_cold_start_hint() {
+        let _env = crate::testing::EnvRestore::set(&[(
+            crate::constants::REMOTE_PEER_RETRY_BACKOFF_ENV,
+            "1",
+        )]);
+        // Always 503: exhaust the retries, then fail with a message that
+        // names the likely cause and the remedy instead of a raw "non-JSON
+        // body (http=503)" the caller can do nothing with.
+        let (router, hits) = flaky_chunk_route(u32::MAX);
+        let addr = spawn_test_server(router).await;
+
+        let client = FederationClient::new().unwrap();
+        let outcome = client
+            .get_chunk(&peer(format!("http://{addr}")), Some("kb"), 7, None)
+            .await;
+        match outcome {
+            Outcome::Unreachable(msg) => {
+                assert!(msg.contains("503"), "message should name the status: {msg}");
+                assert!(
+                    msg.contains("cold start"),
+                    "message should name the likely cause: {msg}"
+                );
+                assert!(
+                    msg.contains("~30s"),
+                    "message should tell the caller when to retry: {msg}"
+                );
+                assert!(
+                    msg.contains("after 2 retries"),
+                    "message should state the retry count: {msg}"
+                );
+            }
+            other => panic!("expected Unreachable, got {other:?}"),
+        }
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            crate::constants::REMOTE_PEER_RETRY_ATTEMPTS,
+            "initial attempt + configured retries, no more"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn get_chunk_does_not_retry_non_transient_status() {
+        let _env = crate::testing::EnvRestore::set(&[(
+            crate::constants::REMOTE_PEER_RETRY_BACKOFF_ENV,
+            "1",
+        )]);
+        // A 500 with a JSON error body is the peer's OWN answer (the cloud
+        // peer rejects force-reindex this way) — retrying it would only burn
+        // time before failing identically. Exactly one request must be made.
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let hits_clone = hits.clone();
+        let router = axum::Router::new().route(
+            "/chunk/{id}",
+            axum::routing::get(move || {
+                let hits = hits_clone.clone();
+                async move {
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                }
+            }),
+        );
+        let addr = spawn_test_server(router).await;
+
+        let client = FederationClient::new().unwrap();
+        let outcome = client
+            .get_chunk(&peer(format!("http://{addr}")), Some("kb"), 1, None)
+            .await;
+        assert!(
+            matches!(outcome, Outcome::Unreachable(_)),
+            "500 must fail, not retry"
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "non-transient status must not be retried"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn search_retries_transient_503_and_succeeds() {
+        let _env = crate::testing::EnvRestore::set(&[(
+            crate::constants::REMOTE_PEER_RETRY_BACKOFF_ENV,
+            "1",
+        )]);
+        // Same exposure as get_chunk (identical pre-fix code shape) — one 503
+        // then a valid 200 search response must surface as Ok.
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let hits_clone = hits.clone();
+        let router = axum::Router::new().route(
+            crate::constants::SEARCH_PATH,
+            axum::routing::post(move || {
+                use axum::response::IntoResponse;
+                let hits = hits_clone.clone();
+                async move {
+                    let n = hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    if n == 1 {
+                        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "cold start")
+                            .into_response();
+                    }
+                    axum::Json(serde_json::json!({
+                        "results": [{ "path": "kb/doc.md", "score": 0.9 }]
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+        let addr = spawn_test_server(router).await;
+
+        let client = FederationClient::new().unwrap();
+        let outcome = client
+            .search_project(
+                &peer(format!("http://{addr}")),
+                serde_json::json!({"query": "x"}),
+                "kb",
+            )
+            .await;
+        match outcome {
+            Outcome::Ok(items) => assert_eq!(items.len(), 1),
+            other => panic!("expected Ok after retry, got {other:?}"),
+        }
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }

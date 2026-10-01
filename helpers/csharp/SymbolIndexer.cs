@@ -218,7 +218,12 @@ public sealed class SymbolIndexer
 
     /// <summary>
     /// Converts a Roslyn symbol to a SCIP-style symbol name.
-    /// Format: csharp &lt;namespace&gt; . &lt;Type&gt;#&lt;member&gt;(&lt;params&gt;).
+    /// Format: csharp &lt;namespace&gt; . &lt;ContainingTypePath&gt;#&lt;member&gt;(&lt;params&gt;).
+    /// Distinctness guarantees (see KeyFormatTests): generic arity is kept
+    /// (Foo`1 vs Foo, M`1 vs M), nested types carry their full containing-type
+    /// chain (Outer1.Inner vs Outer2.Inner) and parameter types are fully
+    /// qualified (A.P vs B.P). Any change here must bump the index version
+    /// (ScipModels "2.0") and SCIP_KEY_FORMAT so old indexes rebuild.
     /// </summary>
     internal static string SymbolToScipName(ISymbol symbol)
     {
@@ -227,9 +232,10 @@ public sealed class SymbolIndexer
             var ns = type.ContainingNamespace?.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
             if (ns?.StartsWith("global::") == true)
                 ns = ns["global::".Length..];
+            var typePath = ContainingTypePath(type);
             if (string.IsNullOrEmpty(ns))
-                return $"csharp . . {type.Name}#";
-            return $"csharp {ns} . {type.Name}#";
+                return $"csharp . . {typePath}#";
+            return $"csharp {ns} . {typePath}#";
         }
 
         var containingType = symbol.ContainingType;
@@ -240,14 +246,18 @@ public sealed class SymbolIndexer
         if (typeNs?.StartsWith("global::") == true)
             typeNs = typeNs["global::".Length..];
 
-        var typeName = containingType.Name;
+        var containingPath = ContainingTypePath(containingType);
         var prefix = string.IsNullOrEmpty(typeNs)
-            ? $"csharp . . {typeName}#"
-            : $"csharp {typeNs} . {typeName}#";
+            ? $"csharp . . {containingPath}#"
+            : $"csharp {typeNs} . {containingPath}#";
 
         return symbol switch
         {
-            IMethodSymbol method => $"{prefix}{method.Name}({FormatParameters(method.Parameters)}).",
+            // Arity on the method name (M`1) keeps void M() and void M<T>()
+            // on distinct keys.
+            IMethodSymbol method => method.Arity > 0
+                ? $"{prefix}{method.Name}`{method.Arity}({FormatParameters(method.Parameters)})."
+                : $"{prefix}{method.Name}({FormatParameters(method.Parameters)}).",
             IPropertySymbol prop => $"{prefix}{prop.Name}",
             IFieldSymbol field => $"{prefix}{field.Name}",
             IEventSymbol evt => $"{prefix}{evt.Name}",
@@ -259,7 +269,11 @@ public sealed class SymbolIndexer
     {
         return string.Join(", ", parameters.Select(p =>
         {
-            var type = p.Type.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat);
+            // Fully qualified: MinimallyQualifiedFormat displayed both A.Foo
+            // and B.Foo as `Foo`, collapsing distinct overloads onto one key.
+            var type = p.Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
+            if (type.StartsWith("global::", StringComparison.Ordinal))
+                type = type["global::".Length..];
             return p.RefKind switch
             {
                 RefKind.Ref => $"ref {type}",
@@ -268,6 +282,28 @@ public sealed class SymbolIndexer
                 _ => type,
             };
         }));
+    }
+
+    /// <summary>
+    /// Type name with generic arity (Roslyn/ECMA backtick convention):
+    /// `Foo`, `Foo`1`. Without the arity, `class Foo&lt;T&gt;` and `class Foo`
+    /// collapse onto one key.
+    /// </summary>
+    internal static string FormatTypeRef(INamedTypeSymbol t) =>
+        t.Arity > 0 ? $"{t.Name}`{t.Arity}" : t.Name;
+
+    /// <summary>
+    /// Containing-type chain outermost-first including <paramref name="t"/>
+    /// itself, e.g. `Outer`1.Inner`. Only the immediate type name would let
+    /// `Ns.Outer1.Inner` and `Ns.Outer2.Inner` collide.
+    /// </summary>
+    internal static string ContainingTypePath(INamedTypeSymbol t)
+    {
+        var segments = new List<string>();
+        for (var current = (INamedTypeSymbol?)t; current is not null; current = current.ContainingType)
+            segments.Add(FormatTypeRef(current));
+        segments.Reverse();
+        return string.Join(".", segments);
     }
 
     internal static List<int> LocationToRange(Location loc)

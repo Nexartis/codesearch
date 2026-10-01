@@ -37,7 +37,75 @@ pub fn strip_unc_prefix(path: PathBuf) -> PathBuf {
     }
 }
 
-/// Canonicalize a path and strip any Windows UNC `\\?\` prefix.
+/// Translate an MSYS / Git Bash POSIX-style drive path (`/c/Users/...`) to
+/// its Windows drive-path equivalent (`C:/Users/...`). Idempotent on every
+/// other input. On non-Windows this is a no-op (a Unix path like `/c/...`
+/// is a legitimate absolute path, not an MSYS-ism).
+///
+/// # Why this exists
+/// When an agent (or any non-MSYS caller — e.g. an MCP client) sends
+/// codesearch a path like `/c/Users/foo`, Rust on Windows interprets the
+/// leading `/` as "rooted on the *current drive*" — i.e. it resolves to
+/// `<current-drive>:\c\Users\foo`, creating junk directories like
+/// `C:\c\Users\...` and silently indexing the wrong project. This is the
+/// path-pollution defect behind the orphan `<repo>-propagate-tmp` indexes:
+/// an agent-supplied POSIX path slipped past `safe_canonicalize` and got
+/// materialised on disk as `C:\c\...`.
+///
+/// # What it matches
+/// A leading `/` followed by a **single ASCII letter** followed by either
+/// `/` or end-of-string. So `/c`, `/c/`, `/c/Users/foo` all match (drive `C`);
+/// `/ab/foo`, `/usr/bin`, `relative/c/x` do **not** match (left untouched).
+///
+/// # What it does not match
+/// Existing Windows paths (`C:\...`, `C:/...`) — the first byte is not `/`,
+/// so they pass through unchanged. Verbatim UNC (`\\?\C:\...`) likewise.
+#[cfg(windows)]
+pub fn translate_msys_path(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    let b = s.as_bytes();
+    if b.len() >= 2 && b[0] == b'/' {
+        let second = b[1];
+        if second.is_ascii_alphabetic() && (b.len() == 2 || b[2] == b'/') {
+            // `/c/Users/foo` → `C:/Users/foo`. Windows accepts `/` as a path
+            // separator, so we don't need to rewrite subsequent slashes.
+            // Drive letter is upper-cased so `/c/...` and `/C/...` collapse
+            // to the same canonical form before they reach the registry.
+            let drive = (second as char).to_ascii_uppercase();
+            let rest = if b.len() > 2 { &s[2..] } else { "/" };
+            return PathBuf::from(format!("{}:{}", drive, rest));
+        }
+    }
+    path.to_path_buf()
+}
+
+/// Non-Windows: legitimate absolute POSIX path, must not be rewritten.
+/// (See the Windows variant above for the full rationale.)
+#[cfg(not(windows))]
+pub fn translate_msys_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
+/// Normalize a raw user-supplied path: translate any MSYS POSIX drive prefix
+/// (`/c/...` → `C:/...`) AND strip any Windows UNC `\\?\` prefix.
+///
+/// Use this as the **fallback** when [`safe_canonicalize`] fails (path
+/// doesn't exist yet, permission denied, etc.) so the registry never stores
+/// a raw path that Windows would later resolve to a polluted
+/// `<drive>:\c\...` location. Both operations are idempotent and no-ops on
+/// non-Windows, so this is safe to call unconditionally.
+///
+/// This helper exists precisely to avoid the per-site discipline trap of
+/// repeating `translate_msys_path(&strip_unc_prefix(path))` at every
+/// fallback site — that pattern was the original defect: `register()` had
+/// it, but `unregister_path()` and `alias_for_path()` did not, breaking
+/// register/unregister symmetry.
+pub fn normalize_user_path(path: &Path) -> PathBuf {
+    strip_unc_prefix(translate_msys_path(path))
+}
+
+/// Canonicalize a path, translate any MSYS POSIX-style prefix first, and
+/// strip any Windows UNC `\\?\` prefix from the result.
 ///
 /// **This is the ONLY approved way to canonicalize paths in codesearch.**
 /// It returns the same error as `Path::canonicalize()` on failure (path does
@@ -48,8 +116,13 @@ pub fn strip_unc_prefix(path: PathBuf) -> PathBuf {
 /// `.join()` and `Path::exists()` to fail inconsistently on sub-paths, and
 /// produces diverging HashMap keys when the same directory is accessed with
 /// and without the prefix. `safe_canonicalize` eliminates this class of bug.
+///
+/// It also calls [`translate_msys_path`] *before* canonicalising, so that
+/// caller-supplied POSIX-style paths (`/c/Users/foo`) are routed to
+/// `C:/Users/foo` rather than being materialised as `<drive>:\c\Users\foo`.
 pub fn safe_canonicalize(path: &Path) -> std::io::Result<PathBuf> {
-    path.canonicalize().map(strip_unc_prefix)
+    let translated = translate_msys_path(path);
+    translated.canonicalize().map(strip_unc_prefix)
 }
 
 /// Normalize a file path for consistent HashMap lookups.
@@ -58,14 +131,37 @@ pub fn safe_canonicalize(path: &Path) -> std::io::Result<PathBuf> {
 /// prefix (`\\?\C:\...`). Notify (FSW) events may use standard paths (`C:\...`).
 /// This function strips the UNC prefix and converts backslashes to forward slashes
 /// so that paths from different sources all map to the same key.
+///
+/// **Platform behavior** (Aikido group 30641757, priority 46):
+/// - **Windows**: backslash IS a path separator — converting it to `/` is
+///   required for HashMap consistency across APIs.
+/// - **Unix**: backslash is a **legal filename character** (not a separator).
+///   A file literally named `foo\bar.rs` is distinct from `foo/bar.rs` (which
+///   lives in subdirectory `foo`). Unconditionally converting `\` → `/` would
+///   collapse these two unrelated files into one HashMap key, causing silent
+///   metadata corruption (one file's chunks overwrite the other's).
 pub fn normalize_path(path: &Path) -> String {
     let s = path.to_string_lossy();
-    s.trim_start_matches(r"\\?\").replace('\\', "/")
+    normalize_path_str(&s)
 }
 
 /// Normalize a path string (same logic as `normalize_path` but for `&str` input).
+///
+/// See `normalize_path` for the platform-specific separator handling and
+/// the Aikido 30641757 rationale.
 pub fn normalize_path_str(path: &str) -> String {
-    path.trim_start_matches(r"\\?\").replace('\\', "/")
+    let trimmed = path.trim_start_matches(r"\\?\");
+    #[cfg(windows)]
+    {
+        trimmed.replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        // Backslash is a legal filename char on Unix — preserve it literally.
+        // UNC prefix is already stripped above (it's a no-op on Unix in
+        // practice, but defensive in case a Windows-style path string leaks in).
+        trimmed.to_string()
+    }
 }
 
 /// Normalize a filter path for prefix matching.
@@ -103,6 +199,18 @@ pub fn normalize_path_relative(path: &str, project_root_normalized: &str) -> Str
     } else {
         relative.trim_start_matches("./").to_string()
     }
+}
+
+/// Canonical storage key for a file: its path **relative to the project root**,
+/// normalized (UNC stripped, forward slashes on Windows). Already-relative
+/// inputs and paths outside `project_root` fall back to the normalized input.
+///
+/// Chunk metadata and `FileMetaStore` entries are keyed by this relative form
+/// so a built database directory is machine-portable (snapshot tarballs move
+/// the DB between hosts where the absolute build path does not exist).
+pub fn storage_key(path: &Path, project_root: &Path) -> String {
+    let root_normalized = normalize_path(project_root);
+    normalize_path_relative(&normalize_path(path), &root_normalized)
 }
 
 /// Check whether a path matches a normalized filter prefix.
@@ -153,7 +261,7 @@ pub struct FileMeta {
 /// 3. Stores chunk count for statistics
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FileMetaStore {
-    /// Map of absolute file path -> metadata
+    /// Map of project-relative file path (storage key) -> metadata
     files: HashMap<String, FileMeta>,
     /// Model used for indexing (invalidate if model changes)
     pub model_name: String,
@@ -247,7 +355,12 @@ impl FileMetaStore {
         let content = fs::read(path)?;
         let mut hasher = Sha256::new();
         hasher.update(&content);
-        Ok(format!("{:x}", hasher.finalize()))
+        // sha2 0.11: the digest array no longer impls LowerHex — hex-encode manually
+        Ok(hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect())
     }
 
     /// Get file modification time as unix timestamp
@@ -257,17 +370,21 @@ impl FileMetaStore {
         Ok(mtime.duration_since(SystemTime::UNIX_EPOCH)?.as_secs())
     }
 
-    /// Check if a file needs re-indexing
     /// Check whether a path is already tracked (regardless of chunk count).
     /// Used by doctor to distinguish "never indexed" from "indexed but unchunkable".
-    pub fn is_tracked(&self, path: &Path) -> bool {
-        let path_str = normalize_path(path);
+    ///
+    /// `key` is the project-relative storage key (see [`storage_key`]).
+    pub fn is_tracked(&self, key: &str) -> bool {
+        let path_str = normalize_path_str(key);
         self.files.contains_key(&path_str)
     }
 
     /// Returns: (needs_reindex, existing_chunk_ids_to_delete)
-    pub fn check_file(&self, path: &Path) -> Result<(bool, Vec<u32>)> {
-        let path_str = normalize_path(path);
+    ///
+    /// `path` is the absolute path used for filesystem stats (mtime/size/hash);
+    /// `key` is the project-relative storage key the metadata is filed under.
+    pub fn check_file(&self, path: &Path, key: &str) -> Result<(bool, Vec<u32>)> {
+        let path_str = normalize_path_str(key);
 
         // Get current file stats
         let current_mtime = Self::get_mtime(path)?;
@@ -294,9 +411,12 @@ impl FileMetaStore {
         }
     }
 
-    /// Update metadata for a file after indexing
-    pub fn update_file(&mut self, path: &Path, chunk_ids: Vec<u32>) -> Result<()> {
-        let path_str = normalize_path(path);
+    /// Update metadata for a file after indexing.
+    ///
+    /// `path` is the absolute path used for filesystem stats; `key` is the
+    /// project-relative storage key the metadata is filed under.
+    pub fn update_file(&mut self, path: &Path, key: &str, chunk_ids: Vec<u32>) -> Result<()> {
+        let path_str = normalize_path_str(key);
         let hash = Self::compute_hash(path)?;
         let mtime = Self::get_mtime(path)?;
         let size = fs::metadata(path)?.len();
@@ -315,10 +435,54 @@ impl FileMetaStore {
         Ok(())
     }
 
-    /// Mark a file as deleted
-    pub fn remove_file(&mut self, path: &Path) -> Option<FileMeta> {
-        let path_str = normalize_path(path);
+    /// Mark a file as deleted. `key` is the project-relative storage key.
+    pub fn remove_file(&mut self, key: &str) -> Option<FileMeta> {
+        let path_str = normalize_path_str(key);
         self.files.remove(&path_str)
+    }
+
+    /// Re-key entries still filed under an absolute path inside `project_root`
+    /// (the pre-relative-key format) to their project-relative storage key.
+    ///
+    /// Without this every legacy entry misses its lookup: the file is seen as
+    /// new and re-embedded, while the absolute entry — which
+    /// `find_deleted_files` resolves to an existing file — survives forever
+    /// together with its now-duplicate chunks. An absolute entry whose relative
+    /// key is already tracked is dropped (its chunks are orphans).
+    pub fn relativize_legacy_keys(&mut self, project_root: &Path) -> LegacyKeyMigration {
+        let legacy: Vec<(String, String)> = self
+            .files
+            .keys()
+            .filter(|key| Path::new(key.as_str()).has_root())
+            .filter_map(|key| {
+                let rel = storage_key(Path::new(key), project_root);
+                (rel != *key).then(|| (key.clone(), rel))
+            })
+            .collect();
+
+        let mut migration = LegacyKeyMigration::default();
+        for (key, rel) in legacy {
+            let Some(meta) = self.files.remove(&key) else {
+                continue;
+            };
+            if self.files.contains_key(&rel) {
+                migration.superseded += 1;
+                continue;
+            }
+            migration
+                .rekeyed
+                .push((rel.clone(), meta.chunk_ids.clone()));
+            self.files.insert(rel, meta);
+        }
+        migration
+    }
+
+    /// Every chunk id referenced by a tracked file.
+    pub fn tracked_chunk_ids(&self) -> std::collections::HashSet<u32> {
+        self.files
+            .values()
+            .flat_map(|m| m.chunk_ids.iter().copied())
+            .collect()
     }
 
     /// Get all tracked files
@@ -332,11 +496,14 @@ impl FileMetaStore {
         self.files.is_empty()
     }
 
-    /// Find files that were deleted (exist in store but not on disk)
-    pub fn find_deleted_files(&self) -> Vec<(String, Vec<u32>)> {
+    /// Find files that were deleted (exist in store but not on disk).
+    ///
+    /// `project_root` resolves relative keys back onto disk for the
+    /// existence check — keys are project-relative so the store is portable.
+    pub fn find_deleted_files(&self, project_root: &Path) -> Vec<(String, Vec<u32>)> {
         self.files
             .iter()
-            .filter(|(path, _)| !Path::new(path).exists())
+            .filter(|(path, _)| !project_root.join(path).exists())
             .map(|(path, meta)| (path.clone(), meta.chunk_ids.clone()))
             .collect()
     }
@@ -373,6 +540,22 @@ impl FileMetaStore {
     }
 }
 
+/// Outcome of [`FileMetaStore::relativize_legacy_keys`].
+#[derive(Debug, Default)]
+pub struct LegacyKeyMigration {
+    /// `(relative key, chunk ids)` of every re-keyed entry — their chunks
+    /// still carry the absolute path.
+    pub rekeyed: Vec<(String, Vec<u32>)>,
+    /// Absolute entries dropped because the relative key was already tracked.
+    pub superseded: usize,
+}
+
+impl LegacyKeyMigration {
+    pub fn is_empty(&self) -> bool {
+        self.rekeyed.is_empty() && self.superseded == 0
+    }
+}
+
 #[derive(Debug)]
 #[allow(dead_code)] // Used with stats() method
 pub struct FileMetaStats {
@@ -389,355 +572,5 @@ impl FileMetaStats {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    // ── safe_canonicalize / strip_unc_prefix ────────────────────────────────
-
-    #[test]
-    fn strip_unc_prefix_removes_windows_unc() {
-        let unc = PathBuf::from(r"\\?\C:\WorkArea\AI\foo");
-        let stripped = strip_unc_prefix(unc);
-        assert_eq!(stripped, PathBuf::from(r"C:\WorkArea\AI\foo"));
-    }
-
-    #[test]
-    fn strip_unc_prefix_is_idempotent_on_plain_path() {
-        let plain = PathBuf::from(r"C:\WorkArea\AI\foo");
-        let result = strip_unc_prefix(plain.clone());
-        assert_eq!(result, plain);
-    }
-
-    #[test]
-    fn strip_unc_prefix_is_idempotent_on_unix_path() {
-        let unix = PathBuf::from("/home/user/project");
-        let result = strip_unc_prefix(unix.clone());
-        assert_eq!(result, unix);
-    }
-
-    /// `safe_canonicalize` on an existing directory must return a plain path
-    /// (no `\\?\` prefix) that `Path::exists()` confirms is reachable.
-    /// This is the core regression guard for the class of bugs where UNC paths
-    /// caused `.join(".codesearch.db").exists()` to return false.
-    #[test]
-    fn safe_canonicalize_on_existing_dir_returns_plain_path() {
-        let tmp = tempdir().unwrap();
-        let result = safe_canonicalize(tmp.path()).unwrap();
-        let s = result.to_string_lossy();
-        assert!(
-            !s.starts_with(r"\\?\"),
-            "safe_canonicalize must strip UNC prefix, got: {}",
-            s
-        );
-        // The returned path must still be a valid, accessible directory.
-        assert!(
-            result.exists(),
-            "safe_canonicalize result must exist: {}",
-            s
-        );
-        // A sub-path join must also be resolvable — this is what was broken.
-        let sub = result.join("dummy_check");
-        // exists() returns false (dir doesn't exist) but must NOT panic or error
-        let _ = sub.exists();
-    }
-
-    #[test]
-    fn safe_canonicalize_on_nonexistent_path_returns_error() {
-        let nonexistent = PathBuf::from(r"C:\this\path\does\not\exist\ever");
-        assert!(
-            safe_canonicalize(&nonexistent).is_err(),
-            "safe_canonicalize must propagate canonicalize() errors"
-        );
-    }
-
-    #[test]
-    fn test_normalize_path_strips_unc_prefix() {
-        let path = Path::new(r"\\?\C:\WorkArea\AI\codesearch\src\main.rs");
-        assert_eq!(
-            normalize_path(path),
-            "C:/WorkArea/AI/codesearch/src/main.rs"
-        );
-    }
-
-    #[test]
-    fn test_normalize_path_converts_backslashes() {
-        let path = Path::new(r"C:\WorkArea\AI\codesearch\src\main.rs");
-        assert_eq!(
-            normalize_path(path),
-            "C:/WorkArea/AI/codesearch/src/main.rs"
-        );
-    }
-
-    #[test]
-    fn test_normalize_path_forward_slashes_unchanged() {
-        let path = Path::new("C:/WorkArea/AI/codesearch/src/main.rs");
-        let result = normalize_path(path);
-        // On Windows, Path::new with forward slashes may or may not convert them
-        // The important thing is the result is consistent
-        assert!(!result.contains('\\'));
-        assert!(!result.starts_with(r"\\?\"));
-    }
-
-    #[test]
-    fn test_normalize_path_str_strips_unc() {
-        assert_eq!(normalize_path_str(r"\\?\C:\foo\bar.rs"), "C:/foo/bar.rs");
-    }
-
-    #[test]
-    fn test_normalize_path_unix_style() {
-        // Unix/Linux/macOS paths should remain unchanged
-        let path = Path::new("/home/user/project/src/main.rs");
-        assert_eq!(normalize_path(path), "/home/user/project/src/main.rs");
-    }
-
-    #[test]
-    fn test_normalize_path_mixed_separators() {
-        // Mixed separators should be normalized to forward slashes
-        let path = Path::new(r"C:\Users\project/src/lib.rs");
-        assert_eq!(normalize_path(path), "C:/Users/project/src/lib.rs");
-    }
-
-    #[test]
-    fn test_normalize_path_str_mixed_separators() {
-        assert_eq!(
-            normalize_path_str(r"C:\Users\project/src/lib.rs"),
-            "C:/Users/project/src/lib.rs"
-        );
-    }
-
-    #[test]
-    fn test_normalize_path_already_normalized() {
-        // Already normalized paths should remain unchanged
-        let path = Path::new("C:/WorkArea/AI/codesearch/src/main.rs");
-        assert_eq!(
-            normalize_path(path),
-            "C:/WorkArea/AI/codesearch/src/main.rs"
-        );
-    }
-
-    #[test]
-    fn test_normalize_path_deeply_nested() {
-        // Deeply nested paths
-        let path = Path::new(r"\\?\C:\Very\Deep\Nested\Path\To\Some\File.rs");
-        assert_eq!(
-            normalize_path(path),
-            "C:/Very/Deep/Nested/Path/To/Some/File.rs"
-        );
-    }
-
-    #[test]
-    fn test_normalize_path_consecutive_backslashes() {
-        // Consecutive backslashes (edge case from file systems)
-        let path = Path::new(r"C:\\Double\\Backslashes\\file.rs");
-        assert_eq!(normalize_path(path), "C://Double//Backslashes//file.rs");
-    }
-
-    #[test]
-    fn test_migrate_paths_normalizes_keys() {
-        let mut store = FileMetaStore::new("test-model".to_string(), 384);
-        // Insert with non-normalized key (simulating old format)
-        store.files.insert(
-            r"C:\WorkArea\src\main.rs".to_string(),
-            FileMeta {
-                hash: "abc123".to_string(),
-                mtime: 1000,
-                size: 100,
-                chunk_count: 2,
-                chunk_ids: vec![1, 2],
-            },
-        );
-        store.files.insert(
-            r"\\?\C:\WorkArea\src\lib.rs".to_string(),
-            FileMeta {
-                hash: "def456".to_string(),
-                mtime: 2000,
-                size: 200,
-                chunk_count: 3,
-                chunk_ids: vec![3, 4, 5],
-            },
-        );
-
-        store.migrate_paths();
-
-        // Both should be normalized
-        assert!(store.files.contains_key("C:/WorkArea/src/main.rs"));
-        assert!(store.files.contains_key("C:/WorkArea/src/lib.rs"));
-        // Old keys should be gone
-        assert!(!store.files.contains_key(r"C:\WorkArea\src\main.rs"));
-        assert!(!store.files.contains_key(r"\\?\C:\WorkArea\src\lib.rs"));
-    }
-
-    #[test]
-    fn test_file_meta_store() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path();
-
-        let mut store = FileMetaStore::new("test-model".to_string(), 384);
-
-        // Create a test file
-        let test_file = dir.path().join("test.txt");
-        fs::write(&test_file, "hello world").unwrap();
-
-        // Check new file
-        let (needs_reindex, old_chunks) = store.check_file(&test_file).unwrap();
-        assert!(needs_reindex);
-        assert!(old_chunks.is_empty());
-
-        // Update metadata
-        store.update_file(&test_file, vec![1, 2, 3]).unwrap();
-
-        // Check again - should not need reindex
-        let (needs_reindex, _) = store.check_file(&test_file).unwrap();
-        assert!(!needs_reindex);
-
-        // Modify file
-        fs::write(&test_file, "hello world modified").unwrap();
-
-        // Now should need reindex
-        let (needs_reindex, old_chunks) = store.check_file(&test_file).unwrap();
-        assert!(needs_reindex);
-        assert_eq!(old_chunks, vec![1, 2, 3]);
-
-        // Save and load
-        store.save(db_path).unwrap();
-        let loaded = FileMetaStore::load_or_create(db_path, "test-model", 384).unwrap();
-        assert_eq!(loaded.files.len(), 1);
-    }
-
-    // =========================================================================
-    // Path comparison tests — verify that different path formats match correctly
-    // These test the exact bug patterns that have caused issues in production.
-    // =========================================================================
-
-    #[test]
-    fn test_path_comparison_unc_vs_normal() {
-        // UNC prefix (from Windows canonicalize) must match normal path
-        let unc = normalize_path(Path::new(r"\\?\C:\WorkArea\src\main.rs"));
-        let normal = normalize_path(Path::new(r"C:\WorkArea\src\main.rs"));
-        assert_eq!(unc, normal);
-    }
-
-    #[test]
-    fn test_path_comparison_backslash_vs_forward() {
-        let backslash = normalize_path(Path::new(r"C:\WorkArea\src\main.rs"));
-        let forward = normalize_path(Path::new("C:/WorkArea/src/main.rs"));
-        assert_eq!(backslash, forward);
-    }
-
-    #[test]
-    fn test_path_str_comparison_unc_vs_normal() {
-        let unc = normalize_path_str(r"\\?\C:\WorkArea\src\main.rs");
-        let normal = normalize_path_str(r"C:\WorkArea\src\main.rs");
-        assert_eq!(unc, normal);
-    }
-
-    #[test]
-    fn test_path_comparison_stored_vs_walker() {
-        // Simulates: FileMetaStore stored path vs FileWalker discovered path
-        // FileMetaStore stores via normalize_path(&file.path)
-        // FileWalker returns paths via canonicalize() which adds UNC on Windows
-        let stored = normalize_path(Path::new("C:/WorkArea/AI/codesearch/src/main.rs"));
-        let walked = normalize_path(Path::new(r"\\?\C:\WorkArea\AI\codesearch\src\main.rs"));
-        assert_eq!(
-            stored, walked,
-            "Stored path must match walked path after normalization"
-        );
-    }
-
-    #[test]
-    fn test_path_filter_starts_with() {
-        // Simulates: --filter-path src/ matching against stored paths
-        let filter = normalize_path_str("src/");
-        let stored = normalize_path_str("src/main.rs");
-        assert!(stored.starts_with(&filter));
-
-        // Backslash filter should also work
-        let filter_bs = normalize_path_str(r"src\");
-        assert!(stored.starts_with(&filter_bs));
-    }
-
-    #[test]
-    fn test_path_filter_with_unc_prefix() {
-        // Agent sends UNC path as filter, stored paths are normalized
-        let filter = normalize_path_str(r"\\?\C:\WorkArea\src");
-        let stored = normalize_path_str("C:/WorkArea/src/main.rs");
-        assert!(stored.starts_with(&filter));
-    }
-
-    #[test]
-    fn test_normalize_idempotent() {
-        // Normalizing an already-normalized path should produce the same result
-        let original = "C:/WorkArea/AI/codesearch/src/main.rs";
-        let once = normalize_path_str(original);
-        let twice = normalize_path_str(&once);
-        assert_eq!(once, twice, "normalize_path_str must be idempotent");
-    }
-
-    #[test]
-    fn test_normalize_path_equals_normalize_path_str() {
-        // Both functions must produce identical output for the same input
-        let input = r"\\?\C:\WorkArea\AI\src\main.rs";
-        let from_path = normalize_path(Path::new(input));
-        let from_str = normalize_path_str(input);
-        assert_eq!(from_path, from_str);
-    }
-
-    #[test]
-    fn test_normalize_path_relative_strips_project_root() {
-        let root = normalize_path_str(r"C:\WorkArea\AI\codesearch");
-        let relative = normalize_path_relative(r"\\?\C:\WorkArea\AI\codesearch\src\main.rs", &root);
-        assert_eq!(relative, "src/main.rs");
-    }
-
-    #[test]
-    fn test_normalize_path_relative_keeps_path_when_root_not_matching() {
-        let root = normalize_path_str("/repo");
-        let relative = normalize_path_relative("/other/place/src/main.rs", &root);
-        assert_eq!(relative, "/other/place/src/main.rs");
-    }
-
-    #[test]
-    fn test_normalize_path_relative_trims_dot_slash_for_relative_input() {
-        let root = normalize_path_str("C:/WorkArea/AI/codesearch");
-        let relative = normalize_path_relative("./src/lib.rs", &root);
-        assert_eq!(relative, "src/lib.rs");
-    }
-
-    #[test]
-    fn test_normalize_filter_path_trims_prefix_and_suffix() {
-        assert_eq!(normalize_filter_path("./src/"), "src/");
-    }
-
-    #[test]
-    fn test_path_matches_filter_with_absolute_windows_path() {
-        let root = normalize_path_str(r"C:\WorkArea\AI\codesearch");
-        let filter = normalize_filter_path("src/");
-        assert!(path_matches_filter(
-            r"\\?\C:\WorkArea\AI\codesearch\src\main.rs",
-            &filter,
-            &root,
-        ));
-    }
-
-    #[test]
-    fn test_path_matches_filter_with_non_matching_prefix() {
-        let root = normalize_path_str("/repo");
-        let filter = normalize_filter_path("src/");
-        assert!(!path_matches_filter("/repo/tests/main.rs", &filter, &root));
-    }
-
-    #[test]
-    fn test_path_matches_filter_does_not_match_partial_directory_name() {
-        let root = normalize_path_str("/repo");
-        let filter = normalize_filter_path("src/");
-        assert!(!path_matches_filter("/repo/src2/main.rs", &filter, &root));
-    }
-
-    #[test]
-    fn test_path_matches_filter_matches_exact_directory_name() {
-        let root = normalize_path_str("/repo");
-        let filter = normalize_filter_path("src");
-        assert!(path_matches_filter("/repo/src/main.rs", &filter, &root));
-    }
-}
+#[path = "file_meta_tests.rs"]
+mod tests;

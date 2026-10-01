@@ -7,11 +7,9 @@ use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
-use crate::cache::{normalize_path, safe_canonicalize, FileMetaStore};
+use crate::cache::{normalize_path, safe_canonicalize, storage_key, FileMetaStore};
 use crate::chunker::SemanticChunker;
-use crate::db_discovery::{
-    find_best_database, is_registered_repository, register_repository, unregister_repository,
-};
+use crate::db_discovery::{find_best_database, is_registered_repository, register_repository};
 use crate::embed::{EmbeddingService, ModelType};
 use crate::file::FileWalker;
 use crate::fts::FtsStore;
@@ -20,8 +18,15 @@ use crate::vectordb::{merge_metadata_atomic, VectorStore};
 // Index manager module
 mod manager;
 pub use manager::{
-    is_database_locked, CSharpRebuildNotifier, IndexManager, IndexingStatusCallback, SharedStores,
+    is_database_locked, CSharpRebuildNotifier, IndexManager, IndexingHeartbeat,
+    IndexingStatusCallback, SharedStores, SymbolRebuildSignal,
 };
+
+mod build_log;
+pub use build_log::BuildLog;
+
+mod key_migration;
+pub(crate) use key_migration::repair_legacy_index;
 
 /// Ensure the HNSW vector index is built if it was never built in a previous
 /// (possibly cancelled) run.
@@ -45,6 +50,58 @@ pub(crate) fn ensure_hnsw_index_if_needed(
             tracing::warn!("could not check vector index status: {}", e);
             Ok(false)
         }
+    }
+}
+
+/// Dimensions recorded in an index's `metadata.json` (fallback: the default).
+///
+/// The vector store MUST be opened with the dimensions the index was built
+/// with. `codesearch stats` / `get_db_stats` used to pass a hardcoded 384, so
+/// they reported `Dimensions: 384` for every index — including 768-dim
+/// EmbeddingGemma ones — and opened those stores with the wrong dimension.
+fn recorded_dimensions(db_path: &Path) -> usize {
+    let from_metadata = std::fs::read_to_string(db_path.join("metadata.json"))
+        .ok()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+        .and_then(|j| j.get("dimensions").and_then(|v| v.as_u64()))
+        .map(|d| d as usize);
+    from_metadata
+        .or_else(|| ModelType::from_index_metadata(db_path).map(|m| m.dimensions()))
+        .unwrap_or(crate::constants::DEFAULT_EMBEDDING_DIMENSIONS)
+}
+
+/// Resolve the embedding model for an indexing run.
+///
+/// On an existing index the model recorded in `metadata.json` wins: embedding
+/// with any other model (including the hardcoded default) either fails with a
+/// dimension mismatch or silently mixes vector spaces. An explicit `--model`
+/// that disagrees with the recorded model is rejected — the index must be
+/// rebuilt with `--force` to change models.
+///
+/// This mirrors `IndexManager::resolve_embed_model`, which the serve and
+/// watcher paths already use; the CLI `index` path used `model.unwrap_or_default()`
+/// and therefore downgraded any non-default index to 384-dim MiniLM.
+fn resolve_index_model(
+    db_path: &Path,
+    force: bool,
+    requested: Option<ModelType>,
+) -> Result<ModelType> {
+    // `--force` deletes the database (see `get_db_path_smart`), so there is no
+    // recorded model to honour; a non-existent/legacy index has none either.
+    if force || !db_path.join("metadata.json").exists() {
+        return Ok(requested.unwrap_or_default());
+    }
+    let (recorded, _dims) = IndexManager::resolve_embed_model(db_path)?;
+    match requested {
+        Some(req) if req != recorded => Err(anyhow::anyhow!(
+            "Model mismatch: {} was indexed with '{}', but --model '{}' was requested.\n\
+             To change models, rebuild the index: codesearch --model {} index <path> --force",
+            db_path.display(),
+            recorded.short_name(),
+            req.short_name(),
+            req.short_name()
+        )),
+        _ => Ok(recorded),
     }
 }
 
@@ -88,8 +145,21 @@ fn get_db_path_smart(
     let project_path = path.as_deref().unwrap_or(Path::new("."));
 
     // Canonicalize and strip any Windows UNC prefix (\\?\) via the central helper.
-    let canonical_path =
-        safe_canonicalize(project_path).unwrap_or_else(|_| PathBuf::from(project_path));
+    //
+    // SECURITY: We deliberately propagate the error instead of falling back to
+    // the raw user-supplied path. The previous `unwrap_or_else` fallback silently
+    // bypassed canonicalization when the path did not exist or was inaccessible,
+    // which defeated every downstream `starts_with`/`join` containment check
+    // (Aikido group 30640695). Bailing here gives a clear error and guarantees
+    // every later comparison operates on a real, canonicalized absolute path.
+    let canonical_path = safe_canonicalize(project_path).map_err(|e| {
+        anyhow::anyhow!(
+            "Cannot resolve project path '{}': {}. \
+             Ensure the path exists and is accessible before indexing.",
+            project_path.display(),
+            e
+        )
+    })?;
 
     // Step 1: Handle --force flag — delete databases
     if force {
@@ -441,17 +511,20 @@ fn get_global_db_path(path: Option<PathBuf>) -> Result<(PathBuf, PathBuf)> {
 /// * `global` - Create global index instead of local
 /// * `model` - Override embedding model
 /// * `quiet` - Suppress verbose output (for server/MCP mode)
+#[allow(clippy::too_many_arguments)]
 pub async fn index(
     path: Option<PathBuf>,
     dry_run: bool,
     force: bool,
     global: bool,
     model: Option<ModelType>,
+    local: bool,
+    log_file: Option<PathBuf>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
     // Always try to delegate to a running serve instance via HTTP.
     // This avoids file-lock conflicts between CLI and serve holding the same LMDB.
-    if !dry_run {
+    if !dry_run && !local {
         // Try to delegate; if serve is unresponsive (warming up), wait and retry.
         let delegate_result = serve_delegate_with_warmup_wait(|| {
             let path = path.clone();
@@ -502,7 +575,17 @@ pub async fn index(
             }
         }
     }
-    index_with_options(path, dry_run, force, global, model, false, cancel_token).await
+    index_with_options(
+        path,
+        dry_run,
+        force,
+        global,
+        model,
+        false,
+        log_file,
+        cancel_token,
+    )
+    .await
 }
 
 /// Index a repository with quiet mode option (for server/MCP use)
@@ -512,10 +595,22 @@ pub async fn index_quiet(
     global: bool,
     cancel_token: CancellationToken,
 ) -> Result<()> {
-    index_with_options(path, false, force, global, None, true, cancel_token).await
+    index_quiet_with_model(path, force, global, None, cancel_token).await
+}
+
+/// Index a repository quietly while selecting the model for a new index.
+pub async fn index_quiet_with_model(
+    path: Option<PathBuf>,
+    force: bool,
+    global: bool,
+    model: Option<ModelType>,
+    cancel_token: CancellationToken,
+) -> Result<()> {
+    index_with_options(path, false, force, global, model, true, None, cancel_token).await
 }
 
 /// Internal index function with all options
+#[allow(clippy::too_many_arguments)]
 async fn index_with_options(
     path: Option<PathBuf>,
     dry_run: bool,
@@ -523,18 +618,43 @@ async fn index_with_options(
     global: bool,
     model: Option<ModelType>,
     quiet: bool,
+    log_file: Option<PathBuf>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
     let (db_path, project_path) = get_db_path_smart(path, global, force)?;
-    let model_type = model.unwrap_or_default();
+    // Resolve the embedding model BEFORE touching the index: on an existing
+    // index the model recorded in metadata.json wins, and an explicit `--model`
+    // that disagrees is rejected (rebuild with --force). Defaulting here would
+    // embed 384-dim MiniLM vectors into a 768-dim index. See `resolve_index_model`.
+    let model_type = resolve_index_model(&db_path, force, model)?;
+
+    // Clean build log: written next to the DB when stdout is redirected
+    // (progress-bar redraws mangle piped output), or to --log-file always.
+    let build_log = match BuildLog::open(&project_path, log_file.as_deref()) {
+        Ok(l) => Some(l),
+        Err(e) => {
+            tracing::warn!("could not open build log: {}", e);
+            None
+        }
+    };
 
     // Macro to conditionally print
     macro_rules! log_print {
-        ($($arg:tt)*) => {
+        ($($arg:tt)*) => {{
+            let msg = format!($($arg)*);
             if !quiet {
-                println!($($arg)*);
+                println!("{}", msg);
             }
-        };
+            if let Some(log) = &build_log {
+                log.line(&msg);
+            }
+        }};
+    }
+
+    if let (Some(l), false) = (&build_log, quiet) {
+        if let Some(p) = l.path() {
+            log_print!("📝 Build log: {}", p.display());
+        }
     }
 
     log_print!("{}", "🚀 Codesearch Indexer".bright_cyan().bold());
@@ -625,12 +745,26 @@ async fn index_with_options(
             }
         }
 
+        if !file_meta_store.is_empty() {
+            let mut vs = VectorStore::new(&db_path, model_type.dimensions())?;
+            let mut fts = FtsStore::new_with_writer(&db_path)?;
+            if key_migration::repair_legacy_index(
+                &project_path,
+                file_meta_store,
+                &mut vs,
+                &mut fts,
+            )? {
+                file_meta_store.save(&db_path)?;
+            }
+        }
+
         // Find changed and deleted files
         let mut changed_files = Vec::new();
         let mut unchanged_files = 0;
 
         for file in &files {
-            let (needs_reindex, _old_chunk_ids) = file_meta_store.check_file(&file.path)?;
+            let key = storage_key(&file.path, &project_path);
+            let (needs_reindex, _old_chunk_ids) = file_meta_store.check_file(&file.path, &key)?;
 
             if needs_reindex {
                 changed_files.push(file.clone());
@@ -642,7 +776,7 @@ async fn index_with_options(
         }
 
         // Find deleted files (in metadata but not on disk)
-        let deleted_files = file_meta_store.find_deleted_files();
+        let deleted_files = file_meta_store.find_deleted_files(&project_path);
 
         for (file_path, _chunk_ids) in &deleted_files {
             debug!("🗑️  File deleted from disk: {}", file_path);
@@ -684,14 +818,15 @@ async fn index_with_options(
             total_chunks_to_delete += chunk_ids.len() as u32;
         }
         for file in &changed_files {
-            let (_, chunk_ids) = file_meta_store.check_file(&file.path)?;
+            let key = storage_key(&file.path, &project_path);
+            let (_, chunk_ids) = file_meta_store.check_file(&file.path, &key)?;
             total_chunks_to_delete += chunk_ids.len() as u32;
         }
 
         if total_chunks_to_delete > 0 {
             log_print!("\n🔄 Deleting {} old chunks...", total_chunks_to_delete);
 
-            let mut store = VectorStore::new(&db_path, 384)?; // Will load dimensions from DB
+            let mut store = VectorStore::new(&db_path, model_type.dimensions())?;
             let mut fts_store = FtsStore::new_with_writer(&db_path)?;
 
             // Delete deleted files' metadata and chunks
@@ -708,12 +843,13 @@ async fn index_with_options(
                         fts_store.delete_chunk(*chunk_id)?;
                     }
                 }
-                file_meta_store.remove_file(Path::new(&file_path));
+                file_meta_store.remove_file(file_path.as_str());
             }
 
             // Delete changed files' old chunks
             for file in &changed_files {
-                let (_, old_chunk_ids) = file_meta_store.check_file(&file.path)?;
+                let key = storage_key(&file.path, &project_path);
+                let (_, old_chunk_ids) = file_meta_store.check_file(&file.path, &key)?;
                 if !old_chunk_ids.is_empty() {
                     let file_path_str = file.path.to_string_lossy().to_string();
                     info!(
@@ -849,7 +985,10 @@ async fn index_with_options(
         };
 
         // Phase 2a: Chunk this file only (memory efficient!)
-        let chunks = chunker.chunk_semantic(file.language, &file.path, &source_code)?;
+        // The path stored in chunk metadata is project-relative so the built
+        // database stays machine-portable (snapshot tarballs move the DB dir).
+        let rel_path = PathBuf::from(storage_key(&file.path, &project_path));
+        let chunks = chunker.chunk_semantic(file.language, &rel_path, &source_code)?;
         let chunk_count = chunks.len();
         debug!(
             "   Created {} chunks for {}",
@@ -862,7 +1001,7 @@ async fn index_with_options(
             // A file with 0 chunks (e.g. minified JS, empty file) is "processed
             // but unchunkable" — record it with an empty chunk list so check_file()
             // returns (unchanged) on future runs and doctor doesn't flag it.
-            let path_str = file.path.to_string_lossy().to_string();
+            let path_str = storage_key(&file.path, &project_path);
             file_chunks.insert(path_str, vec![]);
             pb.inc(1);
             continue;
@@ -920,7 +1059,7 @@ async fn index_with_options(
         }
 
         // Track chunk IDs per file for metadata (only paths and IDs, not chunk content)
-        let file_path = file.path.to_string_lossy().to_string();
+        let file_path = storage_key(&file.path, &project_path);
         file_chunks.insert(file_path, chunk_ids.clone());
 
         total_chunks += chunk_count;
@@ -979,18 +1118,7 @@ async fn index_with_options(
         // partial chunks we already built are still searchable.
         // Uses read-modify-write so existing stats (total_chunks/total_files) are preserved.
         if let Err(e) = merge_metadata_atomic(&db_path, |obj| {
-            obj.insert(
-                "model_short_name".to_string(),
-                serde_json::Value::String(model_type.short_name().to_string()),
-            );
-            obj.insert(
-                "model_name".to_string(),
-                serde_json::Value::String(model_type.name().to_string()),
-            );
-            obj.insert(
-                "dimensions".to_string(),
-                serde_json::Value::Number(model_type.dimensions().into()),
-            );
+            model_type.write_metadata_fields(obj);
             obj.insert(
                 "indexed_at".to_string(),
                 serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
@@ -1007,7 +1135,9 @@ async fn index_with_options(
             let save_result = if is_incremental {
                 let mut meta = file_meta_store.take().unwrap();
                 for (file_path, chunk_ids) in file_chunks {
-                    if let Err(e) = meta.update_file(Path::new(&file_path), chunk_ids) {
+                    if let Err(e) =
+                        meta.update_file(&project_path.join(&file_path), &file_path, chunk_ids)
+                    {
                         log_print!(
                             "{}   file-meta update warning for '{}': {}",
                             "⚠️ ".yellow(),
@@ -1023,7 +1153,9 @@ async fn index_with_options(
                     model_type.dimensions(),
                 );
                 for (file_path, chunk_ids) in file_chunks {
-                    if let Err(e) = meta.update_file(Path::new(&file_path), chunk_ids) {
+                    if let Err(e) =
+                        meta.update_file(&project_path.join(&file_path), &file_path, chunk_ids)
+                    {
                         log_print!(
                             "{}   file-meta update warning for '{}': {}",
                             "⚠️ ".yellow(),
@@ -1061,11 +1193,6 @@ async fn index_with_options(
 
         return Ok(());
     }
-
-    // Capture model info before dropping the ONNX model
-    let model_short_name = embedding_service.model_short_name().to_string();
-    let model_name = embedding_service.model_name().to_string();
-    let model_dimensions = embedding_service.dimensions();
 
     // Free ONNX model + arena allocator memory before final index operations
     // This releases hundreds of MB of inference buffers
@@ -1108,7 +1235,7 @@ async fn index_with_options(
                 let mut store = file_meta_store.take().unwrap();
                 let file_count = file_chunks.len();
                 for (file_path, chunk_ids) in file_chunks {
-                    store.update_file(Path::new(&file_path), chunk_ids)?;
+                    store.update_file(&project_path.join(&file_path), &file_path, chunk_ids)?;
                 }
                 store.save(&db_path)?;
                 log_print!(
@@ -1121,7 +1248,7 @@ async fn index_with_options(
                     model_type.dimensions(),
                 );
                 for (file_path, chunk_ids) in file_chunks {
-                    store.update_file(Path::new(&file_path), chunk_ids)?;
+                    store.update_file(&project_path.join(&file_path), &file_path, chunk_ids)?;
                 }
                 store.save(&db_path)?;
             }
@@ -1148,18 +1275,7 @@ async fn index_with_options(
     // (which writes `partial: true`); readers can always check the field
     // regardless of how indexing completed.
     merge_metadata_atomic(&db_path, |obj| {
-        obj.insert(
-            "model_short_name".to_string(),
-            serde_json::Value::String(model_short_name.to_string()),
-        );
-        obj.insert(
-            "model_name".to_string(),
-            serde_json::Value::String(model_name.to_string()),
-        );
-        obj.insert(
-            "dimensions".to_string(),
-            serde_json::Value::Number(model_dimensions.into()),
-        );
+        model_type.write_metadata_fields(obj);
         obj.insert(
             "indexed_at".to_string(),
             serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
@@ -1178,7 +1294,7 @@ async fn index_with_options(
 
         // Update FileMetaStore with new/changed files (unchanged files are already preserved)
         for (file_path, chunk_ids) in file_chunks {
-            file_meta_store.update_file(Path::new(&file_path), chunk_ids)?;
+            file_meta_store.update_file(&project_path.join(&file_path), &file_path, chunk_ids)?;
         }
 
         // Save FileMetaStore (includes both unchanged + updated files)
@@ -1195,7 +1311,7 @@ async fn index_with_options(
 
         // Update FileMetaStore
         for (file_path, chunk_ids) in file_chunks {
-            file_meta_store.update_file(Path::new(&file_path), chunk_ids)?;
+            file_meta_store.update_file(&project_path.join(&file_path), &file_path, chunk_ids)?;
         }
 
         // Save FileMetaStore
@@ -1296,7 +1412,7 @@ pub async fn stats(path: Option<PathBuf>) -> Result<()> {
     println!("💾 Database: {}", db_path.display());
     println!("📂 Project: {}", project_path.display());
 
-    let store = VectorStore::new(&db_path, 384)?; // We'll need to store dimensions in metadata
+    let store = VectorStore::new(&db_path, recorded_dimensions(&db_path))?;
     let stats = store.stats()?;
 
     println!("\n{}", "Vector Store:".bright_green());
@@ -1371,7 +1487,7 @@ fn print_repo_stats(repo_path: &Path, db_path: &Path) -> Result<()> {
     println!("   📂 {}", repo_path.display());
 
     // Try to load stats
-    match VectorStore::new(db_path, 384) {
+    match VectorStore::new(db_path, recorded_dimensions(db_path)) {
         Ok(store) => match store.stats() {
             Ok(stats) => {
                 println!(
@@ -1429,6 +1545,8 @@ pub async fn prune_index() -> Result<()> {
 pub async fn add_to_index(
     path: Option<PathBuf>,
     global: bool,
+    local: bool,
+    log_file: Option<PathBuf>,
     model: Option<ModelType>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
@@ -1441,13 +1559,22 @@ pub async fn add_to_index(
 
     // Try delegating to a running serve instance first.
     // Serve handles: register in repos.json + create index + warmup.
-    let add_delegate = serve_delegate_with_warmup_wait(|| {
-        let path = path.clone();
-        // Alias is always derived from the directory name; the CLI no longer
-        // lets the user set it. Pass None so serve derives it consistently.
-        async move { try_delegate_add_to_serve(&path, &None, global, &model).await }
-    })
-    .await;
+    // `--local` short-circuits the delegation attempt entirely.
+    let add_delegate = if local {
+        println!(
+            "{}",
+            "🏠 --local: building in-process (serve delegation skipped).".cyan()
+        );
+        Err(DelegateError::ServeDown)
+    } else {
+        serve_delegate_with_warmup_wait(|| {
+            let path = path.clone();
+            // Alias is always derived from the directory name; the CLI no longer
+            // lets the user set it. Pass None so serve derives it consistently.
+            async move { try_delegate_add_to_serve(&path, &None, global, &model).await }
+        })
+        .await
+    };
 
     match add_delegate {
         Ok((assigned_alias, _)) => {
@@ -1566,6 +1693,8 @@ pub async fn add_to_index(
             false,
             true,
             model,
+            local,
+            log_file,
             cancel_token.clone(),
         )
         .await?;
@@ -1579,6 +1708,8 @@ pub async fn add_to_index(
             false,
             false,
             model,
+            local,
+            log_file,
             cancel_token,
         )
         .await?;
@@ -1647,10 +1778,35 @@ pub async fn remove_from_index(path: Option<PathBuf>, keep_config: bool) -> Resu
     // which the serve endpoint doesn't support — serve always unregisters).
     if !keep_config {
         match try_delegate_rm_to_serve(&effective_path).await {
-            Ok((alias, _)) => {
+            Ok(removed) => {
                 println!("\n{}", "✅ Delegated to running serve instance.".green());
-                println!("   Removed alias '{}'.", alias);
-                println!("   FSW stopped, repo evicted from memory, DB deleted.");
+                println!("   Removed alias '{}'.", removed.alias);
+                println!("   FSW stopped, repo evicted from memory, unregistered from repos.json.");
+                if removed.db_deleted {
+                    println!("   Database files deleted.");
+                } else {
+                    // Serve answered 200 but its DB dir survived the delete
+                    // (`removed_db_locked`): report what actually happened —
+                    // never claim a delete that did not occur. This stays Ok
+                    // rather than Err because serve has ALREADY unregistered
+                    // the alias: the Layer-1 local-path error text
+                    // ("repos.json was NOT modified") would be false here, and
+                    // the leftover files are retryable — with the alias gone
+                    // from repos.json the next run skips delegation and
+                    // finishes via the local file-delete path below.
+                    let db_dir = removed.project_path.join(crate::constants::DB_DIR_NAME);
+                    eprintln!(
+                        "⚠️ Database files could not be deleted and are still on disk at {}: {}",
+                        db_dir.display(),
+                        removed
+                            .db_delete_error
+                            .as_deref()
+                            .unwrap_or("unknown error")
+                    );
+                    eprintln!(
+                        "The alias is already unregistered; re-run the same command to retry the file delete."
+                    );
+                }
                 return Ok(());
             }
             Err(reason) => {
@@ -1671,51 +1827,64 @@ pub async fn remove_from_index(path: Option<PathBuf>, keep_config: bool) -> Resu
         return Ok(());
     }
 
-    // Auto-unregister from repos.json unless --keep-config
+    // FILE REMOVAL FIRST. The previous order (unregister from repos.json,
+    // then delete the files) left an inconsistent state whenever the delete
+    // failed — typically LMDB files still held by a serve instance the
+    // delegation probe could not see (a second serve on another port, a
+    // crashed one, or a CLI process holding the env): the entry was already
+    // gone from repos.json while the still-locked database sat on disk, and
+    // nothing could clean that up except a manual serve-stop. Now repos.json
+    // is only mutated after the files are actually gone, so a failed delete
+    // leaves the config untouched and the same command can simply be retried.
+    if has_local {
+        if has_global {
+            println!(
+                "\n{}",
+                "⚠️  Warning: Both local and global indexes exist!".yellow()
+            );
+        }
+        println!("\n{}", "Removing local index...".cyan());
+        if let Err(e) = fs::remove_dir_all(&local_db) {
+            eprintln!(
+                "⚠️ Database files may be locked by a running codesearch serve. \
+                 repos.json was NOT modified — stop the locking process and re-run \
+                 the same command."
+            );
+            return Err(anyhow::anyhow!("Failed to remove local index: {}", e));
+        }
+        println!("{}", "✅ Local index removed!".green());
+    }
+
+    // Files are gone (or never existed) — only now update repos.json.
+    // (This also folds the old "both exist" early-return into the same
+    // files-then-config flow: that path used to print "(Global index
+    // remains)" AFTER the unregister above had already removed the global
+    // entry, and the global-only path used to unregister twice.)
     if !keep_config {
         let mut config = crate::db_discovery::repos::ReposConfig::load().unwrap_or_default();
         if config.unregister_path(&canonical_path) {
             if let Err(e) = config.save() {
-                eprintln!("⚠️ Failed to update repos config: {}", e);
-            } else {
-                println!("{}", "🗑️  Unregistered from repos.json".green());
+                // The files are gone but the registry still names them. Say so
+                // and fail loudly instead of reporting partial success as Ok —
+                // re-running the same command finishes the job (the file
+                // removal step is now a no-op).
+                eprintln!(
+                    "⚠️ Local index files were removed, but saving repos.json failed. \
+                     The config entry remains; re-run the same command to unregister it."
+                );
+                return Err(anyhow::anyhow!("Failed to update repos config: {}", e));
             }
+            println!("{}", "🗑️  Unregistered from repos.json".green());
         }
     } else {
         println!("{}", "ℹ️ Config entry preserved.".cyan());
     }
 
-    // If both exist (shouldn't happen), remove local with warning
-    if has_local && has_global {
-        println!(
-            "\n{}",
-            "⚠️  Warning: Both local and global indexes exist!".yellow()
-        );
-        println!("   Removing local index...");
-        if let Err(e) = fs::remove_dir_all(&local_db) {
-            eprintln!(
-                "⚠️ Database files may be locked by a running codesearch serve. Stop it and retry."
-            );
-            return Err(anyhow::anyhow!("Failed to remove local index: {}", e));
-        }
-        println!("   {}", "✅ Local index removed".green());
-        println!("   (Global index remains)");
-        return Ok(());
-    }
-
-    // Remove whichever exists
-    if has_local {
-        println!("\n{}", "Removing local index...".cyan());
-        if let Err(e) = fs::remove_dir_all(&local_db) {
-            eprintln!(
-                "⚠️ Database files may be locked by a running codesearch serve. Stop it and retry."
-            );
-            return Err(anyhow::anyhow!("Failed to remove local index: {}", e));
-        }
-        println!("{}", "✅ Local index removed!".green());
-    } else if has_global {
-        println!("\n{}", "Removing global index...".cyan());
-        unregister_repository(&canonical_path)?;
+    // `!keep_config` matters: with --keep-config the entry is deliberately
+    // left in repos.json, so claiming the global index was removed would
+    // contradict the "Config entry preserved." line printed just above and
+    // send the caller looking for a cleanup that never happened.
+    if !has_local && has_global && !keep_config {
         println!("{}", "✅ Global index removed!".green());
     }
 
@@ -1779,7 +1948,7 @@ async fn get_db_stats(db_path: &Path) -> Result<DbStats> {
     }
 
     // Try to get stats from vector store
-    let store = VectorStore::new(db_path, 384)?;
+    let store = VectorStore::new(db_path, recorded_dimensions(db_path))?;
     let stats = store.stats()?;
 
     // Calculate database size
@@ -1928,8 +2097,8 @@ const SERVE_HEALTH_RETRY_SLEEP: std::time::Duration = std::time::Duration::from_
 /// makes. This is required:
 /// - when serve is bound to a non-localhost address (the `require_auth_for_network`
 ///   middleware guards ALL endpoints, including `/health`), and
-/// - for management endpoints (`POST /repos`, `DELETE /repos/:alias`,
-///   `POST /repos/:alias/reindex`, `POST /reload`) when serve is bound to
+/// - for management endpoints (`POST /repos`, `DELETE /repos/{alias}`,
+///   `POST /repos/{alias}/reindex`, `POST /reload`) when serve is bound to
 ///   localhost with the key set.
 ///
 /// Without this, delegation to a network-bound serve returns 401 and falls back
@@ -2062,8 +2231,11 @@ async fn try_delegate_reindex_to_serve(
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     // Canonicalize and strip UNC prefix (\\?\) for reliable path operations.
-    let project_path =
-        safe_canonicalize(&raw_project_path).unwrap_or_else(|_| raw_project_path.clone());
+    // normalize_user_path on the fallback handles caller-supplied MSYS POSIX
+    // paths (`/c/...` → `C:/...`) even when canonicalize fails (path doesn't
+    // exist yet) — same defect class as register(), see AGENTS.md.
+    let project_path = safe_canonicalize(&raw_project_path)
+        .unwrap_or_else(|_| crate::cache::normalize_user_path(&raw_project_path));
 
     let config = crate::db_discovery::repos::ReposConfig::load()
         .map_err(|e| format!("cannot load repos.json: {}", e))?;
@@ -2072,7 +2244,10 @@ async fn try_delegate_reindex_to_serve(
     /// relative components), then normalize via `cache::normalize_path` (strips
     /// Windows UNC prefix, converts backslashes) and lowercases for case-insensitive match.
     fn normalize_for_cmp(p: &std::path::Path) -> String {
-        let canonical = safe_canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        // Same translate-on-fallback discipline as the outer call site and the
+        // twin closure in try_delegate_rm_to_serve — see stage-1/stage-2.
+        let canonical =
+            safe_canonicalize(p).unwrap_or_else(|_| crate::cache::normalize_user_path(p));
         crate::cache::normalize_path(&canonical).to_lowercase()
     }
 
@@ -2294,8 +2469,10 @@ pub(crate) async fn try_delegate_add_to_serve(
     let raw_project_path = path
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let project_path =
-        safe_canonicalize(&raw_project_path).unwrap_or_else(|_| raw_project_path.clone());
+    // normalize_user_path on the fallback: caller-supplied MSYS POSIX paths
+    // (`/c/...` → `C:/...`) must not leak to the serve POST body.
+    let project_path = safe_canonicalize(&raw_project_path)
+        .unwrap_or_else(|_| crate::cache::normalize_user_path(&raw_project_path));
 
     // 3. Build request body
     let mut body = serde_json::json!({
@@ -2343,13 +2520,29 @@ pub(crate) async fn try_delegate_add_to_serve(
     }
 }
 
+/// The outcome a running serve instance reported for a delegated `index rm`
+/// — the parsed `DELETE /repos/{alias}` success payload.
+///
+/// `db_deleted == false` means the repo is functionally removed (FSW stopped,
+/// evicted from memory, unregistered from repos.json) but the database
+/// directory is still on disk: serve's lock-class retry budget was exhausted
+/// by a transient `Arc<SharedStores>` holder. Callers must report that
+/// honestly instead of claiming the files were deleted (BUG2 class).
+pub(crate) struct ServeRemoval {
+    pub(crate) alias: String,
+    pub(crate) project_path: PathBuf,
+    pub(crate) db_deleted: bool,
+    pub(crate) db_delete_error: Option<String>,
+}
+
 /// Try to delegate `index rm` to a running serve instance.
 ///
-/// Returns `Ok((alias, project_path))` if the serve accepted the remove request.
+/// Returns `Ok(removed)` — including serve's honest DB-delete outcome — if
+/// the serve accepted the remove request.
 /// Returns `Err(reason)` with a human-readable reason if delegation failed.
 pub(crate) async fn try_delegate_rm_to_serve(
     path: &Option<PathBuf>,
-) -> std::result::Result<(String, PathBuf), String> {
+) -> std::result::Result<ServeRemoval, String> {
     use crate::constants::{resolve_serve_host, DEFAULT_SERVE_PORT, SERVE_PORT_ENV};
 
     let port: u16 = std::env::var(SERVE_PORT_ENV)
@@ -2392,11 +2585,14 @@ pub(crate) async fn try_delegate_rm_to_serve(
     let raw_project_path = path
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let project_path =
-        safe_canonicalize(&raw_project_path).unwrap_or_else(|_| raw_project_path.clone());
+    // normalize_user_path on the fallback: same defect-class fix as register().
+    let project_path = safe_canonicalize(&raw_project_path)
+        .unwrap_or_else(|_| crate::cache::normalize_user_path(&raw_project_path));
 
     fn normalize_for_cmp(p: &std::path::Path) -> String {
-        let canonical = safe_canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        // Same translate-on-fallback discipline as the outer call site.
+        let canonical =
+            safe_canonicalize(p).unwrap_or_else(|_| crate::cache::normalize_user_path(p));
         crate::cache::normalize_path(&canonical).to_lowercase()
     }
 
@@ -2411,15 +2607,58 @@ pub(crate) async fn try_delegate_rm_to_serve(
         .map(|(a, _)| a.clone())
         .ok_or_else(|| format!("path '{}' not found in repos.json", project_path.display()))?;
 
-    // 3. DELETE /repos/:alias
-    let delete_resp = client
+    // 3. DELETE /repos/{alias}
+    //
+    // The DELETE needs its OWN client with a timeout that covers serve's
+    // legitimate worst-case removal time: `remove_repo` can spend up to
+    // BG_TASK_COOPERATIVE_TIMEOUT_SECS per cooperative join (FSW + index
+    // task) plus the full DB_DELETE_RETRY_BUDGET_SECS lock-class retry
+    // window while transient holders release. Reusing the 3 s health-probe
+    // client here fired the CLI's own timeout MID-REMOVAL, surfaced as
+    // "delete failed: operation timed out", and fell through to the local
+    // path — whose delete then failed on the files serve was still tearing
+    // down. That made "stop serve and re-run" the only working flow, which
+    // is exactly what todo #48 Layer 2 removes. The health probe KEEPS the
+    // short timeout: it must classify Down/Unresponsive quickly.
+    let delete_client = build_serve_client(std::time::Duration::from_secs(
+        crate::constants::DB_DELETE_RETRY_BUDGET_SECS
+            + 2 * crate::constants::BG_TASK_COOPERATIVE_TIMEOUT_SECS
+            + crate::constants::RM_DELEGATE_DELETE_MARGIN_SECS,
+    ))?;
+    let delete_resp = delete_client
         .delete(format!("{}/repos/{}", base_url, alias))
         .send()
         .await
         .map_err(|e| format!("delete failed: {}", e))?;
 
     if delete_resp.status().is_success() {
-        Ok((alias, project_path))
+        // BUG2-class honesty: a 200 from `remove_repo_handler` is NOT a
+        // guarantee the DB files are gone — serve reports the real outcome in
+        // the body (`db_deleted` / `db_delete_error`) because a transient
+        // Arc<SharedStores> holder can outlast its lock-class retry budget.
+        // Parse and carry it; returning only `(alias, path)` flattened that
+        // to plain success and the CLI printed "DB deleted." for files that
+        // were still on disk.
+        let body = delete_resp.text().await.unwrap_or_default();
+        let payload: serde_json::Value =
+            serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+        // Pre-BUG2 serves have no `db_deleted` field and only ever answered
+        // "removed" — defaulting to true keeps their behavior unchanged
+        // instead of fabricating a failure they did not report.
+        let db_deleted = payload
+            .get("db_deleted")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let db_delete_error = payload
+            .get("db_delete_error")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        Ok(ServeRemoval {
+            alias,
+            project_path,
+            db_deleted,
+            db_delete_error,
+        })
     } else {
         let status = delete_resp.status();
         let text = delete_resp.text().await.unwrap_or_default();
@@ -2749,5 +2988,534 @@ mod index_quality_tests {
         let rebuilt =
             ensure_hnsw_index_if_needed(&db_path, DIMS).expect("should succeed on empty DB");
         assert!(!rebuilt, "empty DB needs no rebuild");
+    }
+}
+
+/// Regression tests for `remove_from_index`'s operation ORDER (todo #48).
+///
+/// The bug: repos.json was unregistered BEFORE the database files were
+/// deleted. When the delete failed — typically LMDB files locked by a serve
+/// instance the delegation probe could not see — the command errored out
+/// with the config entry already gone: the registry claimed the repo no
+/// longer existed while its still-locked database sat on disk. The fix
+/// deletes the files first and only mutates repos.json on success, so a
+/// failed delete leaves the config untouched and the same command can be
+/// retried after stopping the locking process.
+#[cfg(test)]
+mod remove_order_tests {
+    use super::remove_from_index;
+    use crate::db_discovery::repos::ReposConfig;
+    use crate::testing::EnvRestore;
+    use serial_test::serial;
+    use std::path::{Path, PathBuf};
+
+    // Every test in this module is `#[serial]`: they mutate the
+    // process-global CODESEARCH_REPOS_CONFIG (the same var the doctor
+    // tests read) and CODESEARCH_SERVE_PORT. The EnvRestore guard returned
+    // by seed_repos_config snapshots and restores both on drop, so even a
+    // panicking assertion cannot leak a stale value into a later test.
+
+    /// Create a project dir and return its CANONICAL path. Everything in
+    /// these tests (db path, registered path, assertions) must use the
+    /// canonical form — `ReposConfig::register` canonicalizes before
+    /// storing, and on Windows CI the temp root sits under an 8.3 short
+    /// name (`RUNNER~1`) that only `canonicalize` resolves (the same trap
+    /// the MSYS regression tests hit in PR #197).
+    fn make_proj(tmp: &std::path::Path, name: &str) -> PathBuf {
+        let raw = tmp.join(name);
+        std::fs::create_dir(&raw).unwrap();
+        crate::cache::safe_canonicalize(&raw).unwrap()
+    }
+
+    /// Bind an ephemeral listener whose connections are accepted and closed
+    /// immediately (TCP RST). Pointing CODESEARCH_SERVE_PORT here makes the
+    /// delegation health probe inside `remove_from_index` fail FAST and
+    /// hermetically: the reset surfaces as a non-timeout connect error, which
+    /// the probe classifies as `ServeProbe::Down` on the first attempt.
+    /// Without this the probe would either reach a REAL serve on the default
+    /// port (live DELETE /repos/<alias> against the developer's registry —
+    /// observed during review) or, on an unused port, hit the Windows
+    /// loopback hang: 3 retries x 3s client timeout of dead air per
+    /// delegating test.
+    async fn spawn_reset_server() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                if listener.accept().await.is_err() {
+                    break;
+                }
+                // The accepted TcpStream drops at the end of this arm ->
+                // immediate close -> RST to the probing client.
+            }
+        });
+        port
+    }
+
+    /// Seed an isolated repos.json with `proj` registered, and isolate both
+    /// env vars the remove path reads (config path + serve port). The
+    /// returned guard restores the previous values when the test ends.
+    fn seed_repos_config(
+        tmp: &std::path::Path,
+        proj: &std::path::Path,
+        serve_port: u16,
+    ) -> EnvRestore {
+        let cfg_path = tmp.join("repos.json");
+        // Env vars FIRST, then save: `ReposConfig::save()` resolves its
+        // destination the same way `load()` does (env override, else the
+        // global default). Saving before the override is set writes the
+        // seed into the developer's REAL ~/.codesearch/repos.json — which
+        // is exactly how this test once destroyed a registry during
+        // development. The canary below pins that invariant.
+        //
+        // SERVE_HOST_ENV is pinned too: `try_delegate_rm_to_serve` resolves
+        // the probe host via `resolve_serve_host()` — a machine with the var
+        // set would send the delegation somewhere other than the 127.0.0.1
+        // listener these tests bind (same trap the serve e2e test documents).
+        let guard = EnvRestore::set(&[
+            (
+                crate::constants::REPOS_CONFIG_ENV,
+                &cfg_path.to_string_lossy(),
+            ),
+            (
+                crate::constants::SERVE_PORT_ENV,
+                serve_port.to_string().as_str(),
+            ),
+            (crate::constants::SERVE_HOST_ENV, "127.0.0.1"),
+        ]);
+        let mut cfg = ReposConfig::default();
+        cfg.register(proj.to_path_buf());
+        cfg.save().expect("seed repos.json save must succeed");
+        // Paranoia guard: the seed MUST have landed in the temp dir.
+        assert!(
+            cfg_path.exists(),
+            "seed repos.json must be written to the temp path, not the global default"
+        );
+        guard
+    }
+
+    /// Snapshot of the developer's REAL global repos.json (if present).
+    /// Tests assert it is byte-identical when they finish — a mis-ordered
+    /// seed or a stray save must fail the test, not silently destroy the
+    /// registry.
+    fn global_config_canary() -> Option<String> {
+        let home = std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .unwrap_or_default();
+        if home.is_empty() {
+            return None;
+        }
+        let p = std::path::Path::new(&home)
+            .join(".codesearch")
+            .join("repos.json");
+        std::fs::read_to_string(p).ok()
+    }
+
+    fn assert_global_config_unchanged(before: Option<String>) {
+        let now = global_config_canary();
+        assert_eq!(
+            before, now,
+            "the developer's global repos.json changed during the test — \
+             a save bypassed the CODESEARCH_REPOS_CONFIG override"
+        );
+    }
+
+    fn registered_paths() -> Vec<String> {
+        ReposConfig::load()
+            .expect("repos.json load must succeed")
+            .repos
+            .values()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect()
+    }
+
+    /// The actual defect: a delete that FAILS must leave repos.json
+    /// untouched. `.codesearch.db` as a FILE (not a directory) makes
+    /// `fs::remove_dir_all` fail deterministically on every platform —
+    /// standing in for a locked LMDB dir.
+    #[tokio::test]
+    #[serial]
+    async fn failed_delete_leaves_repos_json_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = make_proj(tmp.path(), "proj");
+        std::fs::write(proj.join(".codesearch.db"), b"not a directory").unwrap();
+        let _env = seed_repos_config(tmp.path(), &proj, spawn_reset_server().await);
+        let _canary = global_config_canary();
+
+        let result = remove_from_index(Some(proj.clone()), false).await;
+        assert!(
+            result.is_err(),
+            "remove must fail when the db dir cannot be deleted"
+        );
+
+        // The entry must STILL be registered — the whole point of the fix.
+        let paths = registered_paths();
+        assert!(
+            paths.iter().any(|p| Path::new(p) == proj),
+            "repos.json must be untouched after a failed delete, got: {:?}",
+            paths
+        );
+        // And the db file itself is still there (nothing half-deleted).
+        assert!(
+            proj.join(".codesearch.db").exists(),
+            "the db path must still exist"
+        );
+        assert_global_config_unchanged(_canary);
+    }
+
+    /// Happy path: files removed AND entry unregistered, in that order.
+    #[tokio::test]
+    #[serial]
+    async fn successful_delete_unregisters_from_repos_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = make_proj(tmp.path(), "proj");
+        let db = proj.join(".codesearch.db");
+        std::fs::create_dir_all(&db).unwrap();
+        std::fs::write(db.join("data.mdb"), b"fake").unwrap();
+        let _env = seed_repos_config(tmp.path(), &proj, spawn_reset_server().await);
+        let _canary = global_config_canary();
+
+        remove_from_index(Some(proj.clone()), false)
+            .await
+            .expect("remove must succeed when nothing locks the db");
+
+        assert!(!db.exists(), "db dir must be gone");
+        let paths = registered_paths();
+        assert!(
+            !paths.iter().any(|p| Path::new(p) == proj),
+            "entry must be unregistered after successful delete, got: {:?}",
+            paths
+        );
+        assert_global_config_unchanged(_canary);
+    }
+
+    /// `--keep-config`: files removed, entry preserved.
+    #[tokio::test]
+    #[serial]
+    async fn keep_config_removes_files_but_preserves_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = make_proj(tmp.path(), "proj");
+        let db = proj.join(".codesearch.db");
+        std::fs::create_dir_all(&db).unwrap();
+        std::fs::write(db.join("data.mdb"), b"fake").unwrap();
+        let _env = seed_repos_config(tmp.path(), &proj, spawn_reset_server().await);
+        let _canary = global_config_canary();
+
+        remove_from_index(Some(proj.clone()), true)
+            .await
+            .expect("keep-config remove must succeed");
+
+        assert!(!db.exists(), "db dir must be gone");
+        let paths = registered_paths();
+        assert!(
+            paths.iter().any(|p| Path::new(p) == proj),
+            "entry must be PRESERVED with keep_config, got: {:?}",
+            paths
+        );
+        assert_global_config_unchanged(_canary);
+    }
+
+    /// Global-only WITH `--keep-config`: the entry must survive. Before the
+    /// todo #48 rework this quadrant ran `unregister_repository(..)?` in an
+    /// `else if has_global` arm that never consulted `keep_config`, so the
+    /// flag was silently ignored and the entry was removed anyway.
+    #[tokio::test]
+    #[serial]
+    async fn keep_config_global_only_preserves_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = make_proj(tmp.path(), "proj"); // no .codesearch.db at all
+        let _env = seed_repos_config(tmp.path(), &proj, spawn_reset_server().await);
+        let _canary = global_config_canary();
+
+        remove_from_index(Some(proj.clone()), true)
+            .await
+            .expect("keep-config global-only remove must succeed");
+
+        let paths = registered_paths();
+        assert!(
+            paths.iter().any(|p| Path::new(p) == proj),
+            "entry must be PRESERVED with keep_config in the global-only case, got: {:?}",
+            paths
+        );
+        assert_global_config_unchanged(_canary);
+    }
+
+    /// Global-only (no local db, only a repos.json entry): unregister works,
+    /// previously via a redundant second unregister call.
+    #[tokio::test]
+    #[serial]
+    async fn global_only_unregisters_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = make_proj(tmp.path(), "proj"); // no .codesearch.db at all
+        let _env = seed_repos_config(tmp.path(), &proj, spawn_reset_server().await);
+        let _canary = global_config_canary();
+
+        remove_from_index(Some(proj.clone()), false)
+            .await
+            .expect("global-only remove must succeed");
+
+        let paths = registered_paths();
+        assert!(
+            !paths.iter().any(|p| Path::new(p) == proj),
+            "entry must be unregistered in global-only case, got: {:?}",
+            paths
+        );
+        assert_global_config_unchanged(_canary);
+    }
+
+    /// Serve answered 200 but honestly reported `removed_db_locked` — the
+    /// delegated removal must CARRY that outcome (`db_deleted == false` plus
+    /// the reason), never flatten it to plain success. The old delegation
+    /// checked only `status().is_success()`, so the CLI printed "DB deleted."
+    /// for files that were still on disk (BUG2 class, at the IPC boundary).
+    #[tokio::test]
+    #[serial]
+    async fn delegated_removal_carries_locked_db_outcome() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = make_proj(tmp.path(), "proj");
+        let db = proj.join(".codesearch.db");
+        std::fs::create_dir_all(&db).unwrap();
+        std::fs::write(db.join("data.mdb"), b"fake").unwrap();
+
+        // A stand-in serve answering what `remove_repo_handler` emits when
+        // the lock-class retry budget is exhausted: 200 + honest payload.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = axum::Router::new()
+            .route(
+                "/health",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({ "codesearch_server": true }))
+                }),
+            )
+            .route(
+                "/repos/{alias}",
+                axum::routing::delete(
+                    |axum::extract::Path(alias): axum::extract::Path<String>| async move {
+                        axum::Json(serde_json::json!({
+                            "status": "removed_db_locked",
+                            "alias": alias,
+                            "db_deleted": false,
+                            "db_delete_error": "mock: dir still held by a transient store holder",
+                        }))
+                    },
+                ),
+            );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        // Bounded readiness wait (same pattern as the serve e2e test — take
+        // `.port()`, never the SocketAddr, or URLs silently degrade).
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let _env = seed_repos_config(tmp.path(), &proj, port);
+        let _canary = global_config_canary();
+
+        let removed = super::try_delegate_rm_to_serve(&Some(proj.clone()))
+            .await
+            .expect("delegation must succeed against a 200-answering serve");
+
+        assert_eq!(removed.alias, "proj");
+        assert_eq!(removed.project_path, proj);
+        assert!(
+            !removed.db_deleted,
+            "the locked-DB outcome must be carried, not flattened to success"
+        );
+        assert_eq!(
+            removed.db_delete_error.as_deref(),
+            Some("mock: dir still held by a transient store holder"),
+            "serve's delete-error reason must survive the IPC boundary"
+        );
+        // The stand-in left the files alone, exactly like a locked serve.
+        assert!(db.exists(), "db dir must still be on disk in this scenario");
+        assert_global_config_unchanged(_canary);
+    }
+
+    /// The DELETE request must wait out serve's legitimate slow removal
+    /// instead of firing the CLI's own 3 s health-probe timeout
+    /// mid-removal (todo #48 L2: "file-delete succeeds without
+    /// serve-stop"). A stand-in serve whose DELETE handler sleeps 4 s —
+    /// past the old client timeout, far under the new budget-derived one —
+    /// then answers the honest payload: delegation must succeed and carry
+    /// the outcome. Under the old shared 3 s client this test fails with
+    /// "delete failed: operation timed out" (mutation-verified), which in
+    /// production dropped the CLI onto the local path whose delete then
+    /// failed on the files serve was still tearing down.
+    #[tokio::test]
+    #[serial]
+    async fn delegated_rm_delete_outlives_slow_serve_removal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = make_proj(tmp.path(), "slowproj");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // 4 s: comfortably past the old 3 s client timeout, comfortably
+        // under the new one (60 + 2*5 + 10 = 80 s) so the test stays fast.
+        let app = axum::Router::new()
+            .route(
+                "/health",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({ "codesearch_server": true }))
+                }),
+            )
+            .route(
+                "/repos/{alias}",
+                axum::routing::delete(
+                    |axum::extract::Path(alias): axum::extract::Path<String>| async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+                        axum::Json(serde_json::json!({
+                            "status": "removed",
+                            "alias": alias,
+                            "db_deleted": true,
+                            "db_delete_error": serde_json::Value::Null,
+                        }))
+                    },
+                ),
+            );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        // Bounded readiness wait (same pattern as the serve e2e test — take
+        // `.port()`, never the SocketAddr, or URLs silently degrade).
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let _env = seed_repos_config(tmp.path(), &proj, port);
+        let _canary = global_config_canary();
+
+        let removed = super::try_delegate_rm_to_serve(&Some(proj.clone()))
+            .await
+            .expect("the DELETE must outlive a slow serve removal, not time out at 3 s");
+
+        assert_eq!(removed.alias, "slowproj");
+        assert!(
+            removed.db_deleted,
+            "the slow-but-successful outcome must be carried"
+        );
+        assert_global_config_unchanged(_canary);
+    }
+}
+
+/// Model resolution for the CLI `index` path: the model recorded in the index's
+/// `metadata.json` must win, so re-indexing a non-default index (e.g. rebuilt
+/// with EmbeddingGemma) does not silently downgrade it to 384-dim MiniLM.
+///
+/// Regression guard for `index_with_options` using `model.unwrap_or_default()`:
+/// with the defect reintroduced, `resolve_index_model` returns the default for
+/// the gemma case below and the test fails.
+#[cfg(test)]
+mod index_model_resolution_tests {
+    use super::*;
+
+    /// Write an index metadata.json recording `model` (as the indexer does).
+    fn write_metadata(db_path: &Path, model: ModelType) {
+        std::fs::create_dir_all(db_path).unwrap();
+        let mut obj = serde_json::Map::new();
+        model.write_metadata_fields(&mut obj);
+        std::fs::write(
+            db_path.join("metadata.json"),
+            serde_json::to_string(&obj).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn recorded_dimensions_reads_metadata_dimensions() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(".codesearch.db");
+        write_metadata(&db, ModelType::EmbeddingGemma300MQ4);
+        assert_eq!(recorded_dimensions(&db), 768);
+    }
+
+    #[test]
+    fn recorded_dimensions_falls_back_to_model_then_default() {
+        // Dimensions key absent, model known -> model's dimensions.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(".codesearch.db");
+        std::fs::create_dir_all(&db).unwrap();
+        std::fs::write(
+            db.join("metadata.json"),
+            r#"{"model_short_name":"embeddinggemma-q4"}"#,
+        )
+        .unwrap();
+        assert_eq!(recorded_dimensions(&db), 768);
+
+        // No metadata at all -> default.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            recorded_dimensions(&dir.path().join(".codesearch.db")),
+            crate::constants::DEFAULT_EMBEDDING_DIMENSIONS
+        );
+    }
+
+    #[test]
+    fn resolve_index_model_prefers_recorded_model_on_existing_index() {
+        // The defect: a bare `codesearch index` on a gemma index picked the
+        // default (384-dim MiniLM). The recorded model must win.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(".codesearch.db");
+        write_metadata(&db, ModelType::EmbeddingGemma300MQ4);
+
+        assert_eq!(
+            resolve_index_model(&db, false, None).unwrap(),
+            ModelType::EmbeddingGemma300MQ4,
+            "an existing index's recorded model must be used, not the default"
+        );
+        // An explicit --model that agrees is accepted.
+        assert_eq!(
+            resolve_index_model(&db, false, Some(ModelType::EmbeddingGemma300MQ4)).unwrap(),
+            ModelType::EmbeddingGemma300MQ4
+        );
+    }
+
+    #[test]
+    fn resolve_index_model_rejects_disagreeing_override_without_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(".codesearch.db");
+        write_metadata(&db, ModelType::EmbeddingGemma300MQ4);
+
+        let err = resolve_index_model(&db, false, Some(ModelType::AllMiniLML6V2Q))
+            .expect_err("a --model that disagrees with the index must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Model mismatch") && msg.contains("embeddinggemma-q4"),
+            "error must name the recorded model and the mismatch, got: {msg}"
+        );
+
+        // --force deletes the DB, so the requested model is honoured.
+        assert_eq!(
+            resolve_index_model(&db, true, Some(ModelType::AllMiniLML6V2Q)).unwrap(),
+            ModelType::AllMiniLML6V2Q
+        );
+    }
+
+    #[test]
+    fn resolve_index_model_uses_requested_model_for_a_fresh_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(".codesearch.db"); // does not exist
+
+        assert_eq!(
+            resolve_index_model(&db, false, Some(ModelType::EmbeddingGemma300MQ4)).unwrap(),
+            ModelType::EmbeddingGemma300MQ4
+        );
+        assert_eq!(
+            resolve_index_model(&db, false, None).unwrap(),
+            ModelType::default()
+        );
     }
 }

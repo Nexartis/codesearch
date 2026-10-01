@@ -11,12 +11,12 @@ use std::path::PathBuf;
 use codesearch::constants::{SCIP_LMDB_DEFAULT_MAP_SIZE_MB, SCIP_LMDB_MAP_SIZE_MB_ENV};
 use codesearch::symbols::csharp::CSharpSymbolIndexer;
 use codesearch::symbols::scip_parse;
-use codesearch::symbols::{RebuildScope, SymbolIndexer};
+use codesearch::symbols::{ImpactQuery, KeyMatch, RebuildScope, SymbolIndexer};
 use tempfile::TempDir;
 
 /// Sample JSON mimicking the output of scip-csharp for a small C# project.
 const SAMPLE_INDEX_JSON: &str = r#"{
-    "metadata": {"version": "1.0", "tool_info": "scip-csharp"},
+    "metadata": {"version": "2.0", "tool_info": "scip-csharp"},
     "documents": [
         {
             "relative_path": "src/Library/Calculator.cs",
@@ -146,25 +146,25 @@ fn test_indexer_returns_empty_when_db_missing() {
     // open_scip_env creates the dir, so just verify it doesn't panic
     let _ = age;
 
-    // Test find_references with no data — should return Ok(empty) because
-    // resolve_canonical_key returns None when no LMDB tables exist.
+    // Test resolve_query with no data — should return NotFound because no
+    // LMDB tables exist.
     //
     // On CI runners with constrained resources, LMDB may fail to reopen after
     // the index_age call dropped its env (lock file not yet released). Accept
-    // both Ok(empty) and Err as valid outcomes — the important invariant is
+    // both NotFound and Err as valid outcomes — the important invariant is
     // that it never panics and never returns stale data.
-    let result = indexer.find_references(&db_path, "Calculator.Add");
+    let result = indexer.resolve_query(&db_path, &ImpactQuery::Name("Calculator.Add".into()));
     match result {
-        Ok(refs) => assert!(
-            refs.is_empty(),
-            "Should return empty vec when no SCIP data exists, got {:?}",
-            refs
+        Ok(key) => assert_eq!(
+            key,
+            KeyMatch::NotFound,
+            "Should not resolve when no SCIP data exists, got {key:?}"
         ),
         Err(e) => {
             // LMDB reopen failed (e.g. lock contention on CI). This is
             // acceptable — the function correctly returns an error rather
             // than panicking or returning stale data.
-            eprintln!("Note: find_references returned Err (LMDB lock contention?): {e:#}");
+            eprintln!("Note: resolve_query returned Err (LMDB lock contention?): {e:#}");
         }
     }
 }
@@ -172,7 +172,7 @@ fn test_indexer_returns_empty_when_db_missing() {
 #[test]
 fn test_parse_json_index_multiple_symbols_same_file() {
     let json = r#"{
-        "metadata": {"version": "1.0", "tool_info": "test"},
+        "metadata": {"version": "2.0", "tool_info": "test"},
         "documents": [{
             "relative_path": "src/A.cs",
             "occurrences": [
@@ -214,7 +214,7 @@ fn test_parse_json_index_multiple_symbols_same_file() {
 fn test_parse_json_index_role_fallback() {
     // When kind is empty string, should derive from symbol_roles
     let json = r#"{
-        "metadata": {"version": "1.0", "tool_info": "test"},
+        "metadata": {"version": "2.0", "tool_info": "test"},
         "documents": [{
             "relative_path": "src/A.cs",
             "occurrences": [
@@ -256,8 +256,8 @@ fn test_scip_lmdb_default_map_size_is_512mb() {
 ///
 /// We cannot directly inspect the `EnvOpenOptions` after the fact, so instead
 /// we exercise the observable behaviour: with a small custom map_size the
-/// environment still opens successfully on an empty DB and `find_references`
-/// returns `Ok(empty)` (no panic, no MDB_MAP_FULL).
+/// environment still opens successfully on an empty DB and `resolve_query`
+/// returns `Ok(NotFound)` (no panic, no MDB_MAP_FULL).
 ///
 /// A mutex serialises env-var mutation so this test is safe when `cargo test`
 /// runs suites in parallel.
@@ -285,11 +285,11 @@ fn test_scip_lmdb_env_var_override() {
 
         let indexer = CSharpSymbolIndexer::new();
         // On an empty DB the env-var path is exercised by open_scip_env().
-        // The call must succeed and return an empty result set.
-        let result = indexer.find_references(&db_path, "SomeSymbol");
+        // The call must succeed and report nothing found.
+        let result = indexer.resolve_query(&db_path, &ImpactQuery::Name("SomeSymbol".into()));
         assert!(
-            result.is_ok() && result.unwrap().is_empty(),
-            "Expected Ok(empty) from empty DB with env-var map_size override"
+            matches!(result, Ok(KeyMatch::NotFound)),
+            "Expected Ok(NotFound) from empty DB with env-var map_size override, got {result:?}"
         );
     });
 
@@ -358,13 +358,18 @@ fn test_csharp_pipeline_smallsolution_roundtrip() {
         "No symbols indexed from fixture"
     );
 
-    // Query: exact match for Calculator.Add should have >=2 occurrences
+    // Query: exact key for Calculator.Add should have >=2 occurrences
+    let add_key = "csharp SmallSolution.Library . Calculator#Add(int, int).";
+    let resolved = indexer
+        .resolve_query(db_path, &ImpactQuery::ExactKey(add_key.to_string()))
+        .expect("ExactKey resolution failed");
+    let canonical = match resolved {
+        KeyMatch::Resolved(k) => k,
+        other => panic!("ExactKey must resolve verbatim, got {other:?}"),
+    };
     let add_refs = indexer
-        .find_references(
-            db_path,
-            "csharp SmallSolution.Library . Calculator#Add(int, int).",
-        )
-        .expect("find_references failed");
+        .find_references_for_key(db_path, &canonical)
+        .expect("find_references_for_key failed");
     assert!(
         add_refs.len() >= 2,
         "Expected >=2 refs for Calculator.Add, got {}",
@@ -375,20 +380,75 @@ fn test_csharp_pipeline_smallsolution_roundtrip() {
     let defs: Vec<_> = add_refs.iter().filter(|r| r.kind == "definition").collect();
     assert_eq!(defs.len(), 1, "Expected 1 definition for Calculator.Add");
 
-    // Fuzzy query: "Add" should resolve to Calculator.Add
+    // Ambiguity contract: "Add" has two overloads — the adapter must list
+    // them, never pick one silently (the #238 contract: overloads come back
+    // as a sorted Ambiguous envelope; an explicit key selects one).
+    let resolved = indexer
+        .resolve_query(db_path, &ImpactQuery::Name("Add".into()))
+        .expect("ambiguous-name resolution failed");
+    let candidates = match resolved {
+        KeyMatch::Ambiguous(c) => c,
+        other => panic!("'Add' has two overloads and must come back Ambiguous, got {other:?}"),
+    };
+    assert!(
+        candidates.len() >= 2,
+        "Expected >=2 Add overload candidates, got {candidates:?}"
+    );
+    assert!(
+        candidates.iter().all(|k| k.contains("Calculator#Add")),
+        "Add candidates must be Calculator.Add overloads, got {candidates:?}"
+    );
+    assert!(
+        candidates.windows(2).all(|w| w[0] <= w[1]),
+        "candidates must be sorted for deterministic output: {candidates:?}"
+    );
+    let picked = candidates[0].clone();
+    let resolved = indexer
+        .resolve_query(db_path, &ImpactQuery::ExactKey(picked.clone()))
+        .expect("explicit selection failed");
+    assert_eq!(
+        resolved,
+        KeyMatch::Resolved(picked.clone()),
+        "an explicit candidate selection must resolve to itself"
+    );
     let fuzzy_refs = indexer
-        .find_references(db_path, "Add")
-        .expect("fuzzy find_references failed");
+        .find_references_for_key(db_path, &picked)
+        .expect("find_references_for_key failed");
     assert!(
         !fuzzy_refs.is_empty(),
-        "Fuzzy lookup for 'Add' should resolve to Calculator.Add"
+        "the picked Add overload must have references"
+    );
+
+    // A class name resolves to the class: methods register under their own
+    // simple name (see extract_simple_name), so "Calculator" is NOT
+    // ambiguous even though method keys contain the word.
+    let resolved = indexer
+        .resolve_query(db_path, &ImpactQuery::Name("Calculator".into()))
+        .expect("class-name resolution failed");
+    assert_eq!(
+        resolved,
+        KeyMatch::Resolved("csharp SmallSolution.Library . Calculator#".to_string()),
+        "class name must resolve to the class symbol"
     );
 
     // Position-based lookup: find what's defined on Calculator.cs line 8
     // Note: paths are solution-relative as produced by the helper
+    let resolved = indexer
+        .resolve_query(
+            db_path,
+            &ImpactQuery::Position {
+                file: PathBuf::from("Library/Calculator.cs"),
+                line: 8,
+            },
+        )
+        .expect("position resolution failed");
+    let canonical = match resolved {
+        KeyMatch::Resolved(k) => k,
+        other => panic!("single-definition position must resolve, got {other:?}"),
+    };
     let pos_refs = indexer
-        .find_references_by_position(db_path, &PathBuf::from("Library/Calculator.cs"), 8)
-        .expect("find_references_by_position failed");
+        .find_references_for_key(db_path, &canonical)
+        .expect("find_references_for_key failed");
     assert!(
         !pos_refs.is_empty(),
         "Position lookup for Library/Calculator.cs:8 should return references"
@@ -399,5 +459,99 @@ fn test_csharp_pipeline_smallsolution_roundtrip() {
         pos_defs.len(),
         1,
         "Expected 1 definition at Calculator.cs:8"
+    );
+}
+
+/// Regression for todo #168: an incremental rebuild must clear
+/// `scip_ref_cache` in full, not just for symbols the OLD selective scheme
+/// could see. That scheme only purged a cache entry whose ALREADY-CACHED
+/// reference list pointed at an affected file — it could never catch an
+/// unrelated, already-cached symbol (defined elsewhere, no prior reference
+/// into the changed file) gaining a brand-new reference FROM the changed
+/// file, since that requires reading the changed file's new content, not
+/// the old cache. This test deliberately caches `Program.Main` — defined in
+/// `App/Main.cs`, untouched by the incremental rebuild below, with no
+/// existing reference into `Library/Calculator.cs` — so the old scheme
+/// would leave it cached; only a whole-table clear catches it.
+#[test]
+#[cfg_attr(not(feature = "csharp_helper_integration"), ignore)]
+fn test_incremental_rebuild_clears_the_reference_cache() {
+    let fixture_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("helpers/csharp/tests/Fixtures/SmallSolution");
+    let helper = std::env::var("CODESEARCH_SCIP_CSHARP")
+        .map(PathBuf::from)
+        .or_else(|_| {
+            let candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("helpers/csharp/bin/Release/net10.0/scip-csharp");
+            if candidate.exists() {
+                Ok(candidate)
+            } else {
+                Err(())
+            }
+        })
+        .expect("scip-csharp helper not found");
+    std::env::set_var("CODESEARCH_SCIP_CSHARP", &helper);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path();
+    let indexer = CSharpSymbolIndexer::new();
+
+    indexer
+        .rebuild(&fixture_root, db_path, RebuildScope::Full)
+        .expect("full rebuild failed");
+
+    // Resolve dynamically rather than hardcode the canonical key format.
+    let main_key = match indexer
+        .resolve_query(db_path, &ImpactQuery::Name("Main".into()))
+        .expect("resolving 'Main' failed")
+    {
+        KeyMatch::Resolved(k) => k,
+        other => panic!("expected 'Main' to resolve unambiguously, got {other:?}"),
+    };
+    assert!(
+        main_key.contains("App") && main_key.contains("Program"),
+        "expected Program.Main from App/Main.cs, got {main_key}"
+    );
+
+    // First lookup is always a cache miss (nothing cached yet) — it must
+    // populate scip_ref_cache as a side effect.
+    indexer
+        .find_references_for_key(db_path, &main_key)
+        .expect("find_references_for_key failed (pre-incremental)");
+    let uncached_after_first_lookup = indexer
+        .collect_uncached_symbol_keys(db_path)
+        .expect("collect_uncached_symbol_keys failed");
+    assert!(
+        !uncached_after_first_lookup.contains(&main_key),
+        "Program.Main must be cached after its first lookup"
+    );
+
+    // Incremental rebuild scoped to a DIFFERENT file (Calculator.cs) —
+    // Main.cs, and Program.Main's defining project, are not touched.
+    let changed_file = fixture_root.join("Library").join("Calculator.cs");
+    indexer
+        .rebuild(
+            &fixture_root,
+            db_path,
+            RebuildScope::Files {
+                changed: vec![changed_file],
+                deleted: vec![],
+            },
+        )
+        .expect("incremental rebuild failed");
+
+    // The fix: the incremental rebuild must clear the WHOLE cache, so
+    // Program.Main — untouched by the old selective invalidation, since
+    // neither its definition nor its cached refs point at Calculator.cs —
+    // is uncached again too.
+    let uncached_after_incremental = indexer
+        .collect_uncached_symbol_keys(db_path)
+        .expect("collect_uncached_symbol_keys failed");
+    assert!(
+        uncached_after_incremental.contains(&main_key),
+        "an incremental rebuild must clear scip_ref_cache in full — Program.Main's \
+         pre-change cache entry must not survive an unrelated file's rebuild, \
+         got uncached list: {:?}",
+        uncached_after_incremental
     );
 }

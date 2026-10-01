@@ -1,15 +1,51 @@
 #!/bin/sh
-# post-checkout hook — auto-create AGENTS.md from AGENTS.develop.md on branch switch.
+# post-checkout hook — branch-local AGENTS.md/CLAUDE.md lifecycle on branch switch.
 # Runs after: git checkout, git switch, git checkout -b
 #
-# Only copies if AGENTS.md does not yet exist — never overwrites an existing work plan.
-# Install once per machine: git config core.hooksPath .githooks
+# Feature branches: create AGENTS.md from AGENTS.develop.md plus the CLAUDE.md
+# pointer when absent — never overwrites an existing work plan (plans are
+# tracked on the branch and restored by git itself on switch).
+#
+# develop/master: these branches carry NO AGENTS.md/CLAUDE.md (dropped at
+# feature finalization). Untracked local leftovers are deleted so a stale plan
+# from a previous feature checkout cannot leak into integration-branch work.
+#
+# Installed via `git config core.hooksPath .githooks` — see .githooks/README.md.
 
 AGENTS_DEVELOP="AGENTS.develop.md"
 AGENTS_MD="AGENTS.md"
+CLAUDE_MD="CLAUDE.md"
 
 # $3 is 1 for branch checkout, 0 for file checkout — only act on branch switches
-if [ "$3" = "1" ] && [ -f "$AGENTS_DEVELOP" ] && [ ! -f "$AGENTS_MD" ]; then
-    cp "$AGENTS_DEVELOP" "$AGENTS_MD"
-    echo "[hook] Created AGENTS.md from AGENTS.develop.md"
-fi
+[ "$3" = "1" ] || exit 0
+
+BRANCH=$(git branch --show-current 2>/dev/null)
+
+# Empty on detached HEAD (bisect/rebase steps) — no lifecycle there: files
+# created on a detached HEAD would block later checkouts of any commit that
+# tracks them ("untracked working tree files would be overwritten").
+# (On unborn HEAD git prints the branch name — harmless feature-branch
+# treatment, self-heals on the next develop/master checkout.)
+[ -n "$BRANCH" ] || exit 0
+
+case "$BRANCH" in
+    develop|master)
+        for f in "$AGENTS_MD" "$CLAUDE_MD"; do
+            # only untracked leftovers — a tracked file is managed by git itself
+            if [ -f "$f" ] && ! git ls-files --error-unmatch "$f" >/dev/null 2>&1; then
+                rm -f "$f"
+                echo "[hook] Removed untracked $f (integration branches keep no agent files)"
+            fi
+        done
+        ;;
+    *)
+        if [ -f "$AGENTS_DEVELOP" ] && [ ! -f "$AGENTS_MD" ]; then
+            cp "$AGENTS_DEVELOP" "$AGENTS_MD"
+            echo "[hook] Created AGENTS.md from AGENTS.develop.md"
+        fi
+        if [ ! -f "$CLAUDE_MD" ]; then
+            printf 'Read AGENTS.md.\n' > "$CLAUDE_MD"
+            echo "[hook] Created CLAUDE.md pointer"
+        fi
+        ;;
+esac

@@ -163,11 +163,41 @@ pub const ALL_GROUP_NAME: &str = "all";
 /// Override with `CODESEARCH_LMDB_MAP_SIZE_MB` environment variable.
 pub const DEFAULT_LMDB_MAP_SIZE_MB: usize = 1024;
 
-/// Maximum LMDB map size in megabytes (8192MB = 8GB).
+/// Maximum LMDB map size in megabytes (16384MB = 16GB).
 ///
 /// This is the hard upper limit for auto-resizing when MDB_MAP_FULL errors occur.
-/// Prevents unbounded growth and potential disk exhaustion.
-pub const MAX_LMDB_MAP_SIZE_MB: usize = 8192;
+/// Prevents unbounded growth and potential disk exhaustion. On 64-bit Linux/macOS
+/// the mapsize is only a virtual-address-space reservation (free until written),
+/// so a high cap is safe; on Windows the LMDB file may be pre-allocated to the
+/// current (grown) size, but growth only happens on demand when MDB_MAP_FULL
+/// actually bites, so raising the ceiling does not change the steady-state size.
+///
+/// The previous 8GB cap was too low for very large corpora — e.g. a 1GB /
+/// 53k-file cargo-registry source producing >1.2M chunks legitimately exceeds
+/// it (GitHub issue #189). 16GB is ample headroom for monorepo-scale indexes
+/// (the #189 repro needed just past 8GB; ~1.2M 384-dim quantized vectors +
+/// arroy overhead ≈ 1.8GB raw), without risking disk exhaustion.
+///
+/// Override at runtime with `CODESEARCH_MAX_LMDB_MAP_SIZE_MB` (see
+/// [`max_lmdb_map_size_mb`]); the override is clamped to at least
+/// [`DEFAULT_LMDB_MAP_SIZE_MB`] — use it to raise the ceiling on extreme corpora
+/// that need more than the 16GB default.
+pub const MAX_LMDB_MAP_SIZE_MB: usize = 16384;
+
+/// Resolve the effective maximum LMDB map size in MB for the current process.
+///
+/// Reads the `CODESEARCH_MAX_LMDB_MAP_SIZE_MB` env var if set (clamped to at
+/// least [`DEFAULT_LMDB_MAP_SIZE_MB`]); otherwise falls back to the
+/// [`MAX_LMDB_MAP_SIZE_MB`] compile-time default. This lets operators with
+/// extreme corpora — or Windows instances that want a lower ceiling — tune the
+/// auto-resize cap without rebuilding.
+pub fn max_lmdb_map_size_mb() -> usize {
+    std::env::var("CODESEARCH_MAX_LMDB_MAP_SIZE_MB")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|v| v.max(DEFAULT_LMDB_MAP_SIZE_MB))
+        .unwrap_or(MAX_LMDB_MAP_SIZE_MB)
+}
 
 #[allow(dead_code)]
 /// Default maximum number of entries in persistent embedding cache.
@@ -187,6 +217,20 @@ pub const DEFAULT_EMBEDDING_CACHE_MAX_ENTRIES: usize = 200_000;
 /// 100MB is sufficient since files are processed sequentially during indexing.
 /// Override with `CODESEARCH_CACHE_MAX_MEMORY` environment variable.
 pub const DEFAULT_CACHE_MAX_MEMORY_MB: usize = 100;
+
+/// Default LMDB map size (in MB) for the **persistent** embedding cache
+/// (`PersistentEmbeddingCache` at `~/.codesearch/embedding_cache/<model>/`).
+///
+/// Each cache entry is a SHA256 key + `Vec<f32>` of 384 dims ≈ 1.5 KB, so 512 MB
+/// holds roughly 340k embeddings — enough for typical multi-branch use. The cache
+/// auto-resizes (doubling, up to [`MAX_LMDB_MAP_SIZE_MB`]) on `MDB_MAP_FULL`, so
+/// this is only the *starting* size: very large corpora (e.g. the >1.2M-chunk
+/// cargo-registry repro from issue #189) will grow past it on demand.
+///
+/// Distinct from [`DEFAULT_LMDB_MAP_SIZE_MB`] (the *vector store* starting size,
+/// 1024 MB) because the cache holds only `(hash → Vec<f32>)`, no arroy tree or
+/// chunk metadata, so it is smaller per-entry.
+pub const DEFAULT_EMBEDDING_CACHE_LMDB_MAP_SIZE_MB: usize = 512;
 
 /// File watcher debounce time in milliseconds
 pub const DEFAULT_FSW_DEBOUNCE_MS: u64 = 2000;
@@ -221,8 +265,8 @@ pub fn resolve_serve_host() -> String {
 }
 
 /// Environment variable to set the admin API key for management endpoints.
-/// When set, all management routes (`POST /repos`, `DELETE /repos/:alias`,
-/// `POST /repos/:alias/reindex`, `POST /reload`) require this key.
+/// When set, all management routes (`POST /repos`, `DELETE /repos/{alias}`,
+/// `POST /repos/{alias}/reindex`, `POST /reload`) require this key.
 /// When unset or empty, management routes are unauthenticated (backward compatible).
 /// The key is validated against `Authorization: Bearer <key>` or `X-API-Key: <key>` headers.
 pub const SERVE_API_KEY_ENV: &str = "CODESEARCH_SERVE_API_KEY";
@@ -233,6 +277,31 @@ pub const SERVE_API_KEY_ENV: &str = "CODESEARCH_SERVE_API_KEY";
 /// When unset or empty, all paths are allowed (backward compatible).
 /// Example: `CODESEARCH_ALLOWED_ROOTS=/home/user/repos;/opt/code`
 pub const ALLOWED_ROOTS_ENV: &str = "CODESEARCH_ALLOWED_ROOTS";
+
+/// Environment variable to override the rmcp Streamable HTTP server's
+/// `allowed_hosts` list (DNS-rebinding defence, GHSA-89vp-x53w-74fx).
+///
+/// rmcp's default is loopback-only (`["localhost", "127.0.0.1", "::1"]`),
+/// which rejects the container hostname in containerised deployments with
+/// `WARN ... rejected request with disallowed Host header`. Setting this
+/// env var to a comma-separated list of hostnames / `host:port` replaces
+/// the default allowlist.
+///
+/// When unset or empty, the rmcp default applies. See issue #149.
+/// Example: `CODESEARCH_ALLOWED_HOSTS=codesearch.internal, codesearch:39725`
+pub const ALLOWED_HOSTS_ENV: &str = "CODESEARCH_ALLOWED_HOSTS";
+
+/// Environment variable to disable the rmcp Streamable HTTP server's
+/// `Host` header validation entirely.
+///
+/// **Dangerous**: turns off DNS-rebinding protection (GHSA-89vp-x53w-74fx).
+/// Only set when codesearch runs behind a reverse proxy (nginx, Caddy,
+/// Traefik) that itself validates the `Host` header against an allowlist.
+/// Any other value leaves validation enabled.
+///
+/// Accepts `1` or `true` (case-insensitive) to disable.
+/// Example: `CODESEARCH_DISABLE_HOST_VALIDATION=1`
+pub const DISABLE_HOST_VALIDATION_ENV: &str = "CODESEARCH_DISABLE_HOST_VALIDATION";
 
 /// Default base URL for connecting to a local `codesearch serve` instance.
 /// Used as the clap `--url` default and in `serve_base_url()`.
@@ -280,6 +349,20 @@ pub const MCP_ENDPOINT_PATH: &str = "/mcp";
 /// Returns JSON snapshot of all repo states, sessions, and CPU usage.
 pub const STATUS_PATH: &str = "/status";
 
+/// Indexing-freshness endpoint path served by `codesearch serve`.
+///
+/// Cheap single-question probe for the grep-guard hook (and any caller that
+/// needs to distinguish "no results" from "index mid-rebuild"): takes
+/// `?path=<absolute path>`, resolves the containing registered repo, and
+/// returns `{"covered":bool,"alias":..,"indexing":bool}` — `indexing` is true
+/// while that repo has an active (non-stale) reindex in flight, which
+/// includes the full refresh fired by a branch switch. Same auth class as
+/// [`STATUS_PATH`]: reachable without the admin key on localhost, protected
+/// by `require_auth_for_network` on network binds. `/healthz` remains the
+/// ONLY always-unauthenticated endpoint — liveness and freshness are
+/// different questions and stay on different paths.
+pub const INDEXING_PATH: &str = "/indexing";
+
 /// Remotes endpoint path served by `codesearch serve`.
 ///
 /// Observability companion to [`STATUS_PATH`]: lists the configured federation
@@ -304,8 +387,13 @@ pub const FIND_PATH: &str = "/find";
 pub const EXPLORE_PATH: &str = "/explore";
 
 /// REST get-chunk endpoint (HTTP mirror of the `get_chunk` MCP tool).
-/// GET `/chunk/:id?context_lines=&project=&group=`.
-pub const CHUNK_PATH: &str = "/chunk/:id";
+/// GET `/chunk/{id}?context_lines=&project=&group=`.
+pub const CHUNK_PATH: &str = "/chunk/{id}";
+
+/// REST find-impact endpoint (HTTP mirror of the `find_impact` MCP tool).
+/// POST a `FindImpactRequest` body; returns the tool's JSON payload
+/// (busy envelope and index-freshness fields included).
+pub const FIND_IMPACT_PATH: &str = "/find-impact";
 
 /// How long an open repo may remain idle (no queries) before it is evicted.
 /// Eviction closes the DB handles, stops the FSW, and releases memory.
@@ -315,6 +403,11 @@ pub const REPO_IDLE_TIMEOUT_SECS: u64 = 30 * 60; // 30 minutes
 
 /// How often the idle-reaper background task checks for repos to evict.
 pub const REAPER_INTERVAL_SECS: u64 = 5 * 60; // 5 minutes
+
+/// Longest a query waits for another task's cold open of the same repo.
+/// Kept well under the MCP client's request timeout so the caller gets a
+/// "retry shortly" error instead of a cancelled request whose handler lingers.
+pub const REPO_OPEN_WAIT_SECS: u64 = 20;
 
 /// Environment variable to override the repo idle timeout.
 pub const REPO_IDLE_TIMEOUT_ENV: &str = "CODESEARCH_REPO_IDLE_TIMEOUT_SECS";
@@ -343,16 +436,62 @@ pub const DEFAULT_IDLE_SUSPEND_SECS: u64 = 2 * 60 * 60;
 /// How often the keep-warm task pings its own ingress while active.
 pub const KEEP_WARM_INTERVAL_SECS: u64 = 2 * 60; // 2 minutes
 
+// --- MCP proxy idle-disconnect (client side of scale-to-zero) -----------------
+
+/// Environment variable to override how long the local `codesearch mcp` proxy
+/// keeps its HTTP MCP session to the remote `codesearch serve` open while no
+/// tool calls are flowing.
+///
+/// This is the client-side counterpart of `IDLE_SUSPEND_SECS_ENV`: a single
+/// long-lived Streamable-HTTP session registers as a permanently open request at
+/// the remote's ingress, so a scale-to-zero host (e.g. Azure Container Apps with
+/// a KEDA HTTP scaler) never observes 0 concurrent requests and never suspends
+/// the replica. Closing the session while idle lets it scale down; the next tool
+/// call reconnects on demand.
+pub const MCP_PROXY_IDLE_DISCONNECT_SECS_ENV: &str = "CODESEARCH_MCP_PROXY_IDLE_DISCONNECT_SECS";
+
+/// Default idle window before the local MCP proxy closes its connection to the
+/// remote serve hub (1 minute).
+///
+/// Deliberately short: it has to elapse *before* the host's own scale-in
+/// cooldown can start, otherwise the replica never gets the chance to suspend
+/// after real use stops. Still long enough that closely-spaced tool calls (an
+/// agent issuing `search` → `get_chunk` → `find` in sequence) reuse one session
+/// instead of thrashing connect/teardown.
+///
+/// `0` disables idle-disconnect entirely, restoring the previous behaviour of
+/// one connection held open for the whole lifetime of the proxy process.
+pub const DEFAULT_MCP_PROXY_IDLE_DISCONNECT_SECS: u64 = 60;
+
+/// How often the MCP proxy's idle-checker task ticks. Bounds how long past the
+/// configured window a connection may linger before being closed.
+pub const MCP_PROXY_IDLE_CHECK_INTERVAL_SECS: u64 = 10;
+
 /// Default per-peer federation request timeout (seconds) when a remote peer
 /// does not specify its own `timeout_secs`. Shared by the federation client
 /// and the `remote` CLI command so both report/apply the same default.
 pub const DEFAULT_REMOTE_TIMEOUT_SECS: u64 = 15;
 
-/// How often the embedded TUI re-discovers mounted remote projects (queries each
-/// peer's `/status` in the background). Slow enough that per-peer HTTP never
-/// competes with the ~500ms render tick; a peer blip is masked by the in-memory
-/// last-known list until the next successful poll.
-pub const REMOTE_DISCOVERY_INTERVAL_SECS: u64 = 30;
+/// How long after a federated peer's `/status` refresh the embedded TUI still
+/// considers that peer's activity "live" before reverting the activity column to
+/// a stale `-`.
+///
+/// There is **no background `/status` poll of a federated peer at all**: a peer
+/// is contacted only when a real tool call hits it (event-driven, see
+/// `ServeState::record_remote_peer_activity`) or on an explicit operator
+/// keypress (`i` info overlay). Outside of active use a mount's activity column
+/// simply reads `-`, so this window only governs how long a *poked* value stays
+/// visible before going stale again.
+pub const REMOTE_ACTIVITY_FRESH_SECS: u64 = 5 * 60; // 5 minutes
+
+/// Cadence of the embedded TUI's **config-only** mounted-remote row rebuild.
+///
+/// This tick issues NO HTTP to any peer: it re-reads the repos config (via
+/// `ServeState::config_snapshot`) and rebuilds the mounted-remote rows so
+/// mount/unmount edits and `l` reloads show up promptly. Because it never
+/// contacts a peer it cannot wake a scale-to-zero replica, which is precisely
+/// why it is safe to run on a short interval.
+pub const REMOTE_ROW_REFRESH_SECS: u64 = 5;
 
 /// Maximum wall-clock duration a single reindex may take before its
 /// `active_reindexes` entry is considered **stale** (leaked).
@@ -378,6 +517,91 @@ pub const MAX_INDEXING_SECS: u64 = 30 * 60; // 30 minutes
 
 /// Environment variable to override the maximum indexing duration.
 pub const MAX_INDEXING_SECS_ENV: &str = "CODESEARCH_MAX_INDEXING_SECS";
+
+/// How long an MCP handler may wait for the vector-store read lock before
+/// giving up with a "store busy" error.
+///
+/// A handler queued on this lock keeps its `Arc<SharedStores>` — and with it
+/// the repo's LMDB env and `.writer.lock` — alive for the whole wait, and a
+/// cancelled rmcp request does not reliably drop its handler future. An
+/// unbounded wait therefore pinned stores open long after the client gave
+/// up, blocking idle eviction and writer-lock recovery. The bound also turns
+/// a wait behind a long `build_index()` into a retryable error instead of a
+/// hang. Generous by design: it must outlast any legitimate reader queue
+/// behind a single batch or graph build, not the whole warmup.
+pub const STORE_LOCK_WAIT_SECS: u64 = 300;
+
+/// Environment variable overriding [`STORE_LOCK_WAIT_SECS`].
+pub const STORE_LOCK_WAIT_SECS_ENV: &str = "CODESEARCH_STORE_LOCK_WAIT_SECS";
+
+/// Total number of attempts (initial request + retries) the federation client
+/// makes against a remote peer that answers with a transient HTTP status
+/// (502/503/504). Federated peers commonly run on scale-to-zero hosts (Azure
+/// Container Apps): the first request after an idle period can hit a cold
+/// start and surface as a 503 even though the peer is perfectly healthy. A
+/// short bounded retry inside the active tool call absorbs most cold starts
+/// before the caller ever sees them. This is NOT a poll: retries only happen
+/// while a user-initiated tool call is already in flight against that peer
+/// (the "never contact a federated peer on a cadence" rule in AGENTS.md is
+/// about timers, and stays intact).
+pub const REMOTE_PEER_RETRY_ATTEMPTS: u32 = 3;
+
+/// Backoff (milliseconds) between federation retry attempts, one entry per
+/// retry (so `REMOTE_PEER_RETRY_ATTEMPTS - 1` entries; the last entry is
+/// reused if there are ever more retries than entries). Short by design —
+/// the retry exists to catch a peer that is already warming, not to outwait
+/// a long deployment. If the peer is still transient-failing after the last
+/// attempt, the error message tells the caller to retry the same call in
+/// ~30s instead of blocking the tool call longer.
+pub const REMOTE_PEER_RETRY_BACKOFF_MS: &[u64] = &[3000, 8000];
+
+/// Environment variable overriding every federation retry backoff with a
+/// single millisecond value (test hook so retry tests don't sleep for real).
+pub const REMOTE_PEER_RETRY_BACKOFF_ENV: &str = "CODESEARCH_REMOTE_RETRY_BACKOFF_MS";
+
+/// Cooperative join window (seconds) for `await_index_task` and
+/// `await_fsw_shutdown`: how long a background indexing / file-watcher task
+/// is given to observe its `CancellationToken` and exit on its own before it
+/// is force-aborted. Kept short so a stuck task cannot wedge `remove_repo`;
+/// the follow-on DB-delete retry budget (`DB_DELETE_RETRY_BUDGET_SECS`) is
+/// the outer bound for the whole shutdown.
+pub const BG_TASK_COOPERATIVE_TIMEOUT_SECS: u64 = 5;
+
+/// Total wall-clock budget (seconds) `remove_repo` spends retrying a locked
+/// `.codesearch.db` delete after the background task is aborted. An indexing
+/// task that ignores its token is force-aborted, but its `Arc<SharedStores>`
+/// / LMDB handles are only released once the runtime finishes dropping the
+/// aborted future; this budget covers that release window plus any OS
+/// handle-close lag on Windows.
+pub const DB_DELETE_RETRY_BUDGET_SECS: u64 = 60;
+
+/// Initial backoff (milliseconds) for the locked-DB delete retry loop in
+/// `remove_repo`; doubled each attempt up to `DB_DELETE_RETRY_BACKOFF_CAP_MS`.
+pub const DB_DELETE_RETRY_INITIAL_MS: u64 = 200;
+
+/// Upper bound (milliseconds) for the exponential backoff between locked-DB
+/// delete retries in `remove_repo`.
+pub const DB_DELETE_RETRY_BACKOFF_CAP_MS: u64 = 2000;
+
+/// Poll interval (milliseconds) for the in-process LMDB-holder release wait
+/// inside `remove_repo`'s locked-DB delete retry loop. After a lock-class
+/// delete failure the loop polls `lmdb_registry::open_holders_under` at this
+/// cadence until every in-process env under the DB dir is released (or
+/// `DB_DELETE_RETRY_BUDGET_SECS` expires), so the next attempt runs against
+/// an actually-unlocked directory instead of burning attempts blind.
+pub const DB_DELETE_ENV_RELEASE_POLL_MS: u64 = 100;
+
+/// Unallocated margin (seconds) the CLI's delegated `DELETE /repos/{alias}`
+/// request adds on top of serve's legitimate worst-case removal time —
+/// `DB_DELETE_RETRY_BUDGET_SECS` plus one `BG_TASK_COOPERATIVE_TIMEOUT_SECS`
+/// per cooperative join (FSW task + index task) — so the CLI receives
+/// serve's honest locked-DB outcome (`db_deleted` / payload) instead of its
+/// own request timeout firing first. The shared delegation client's 3 s
+/// total timeout is fine for the `/health` probe but far shorter than a
+/// legitimate slow removal (warmup cancellation + env-release wait +
+/// retries); `try_delegate_rm_to_serve` builds the DELETE its own client
+/// sized from these constants.
+pub const RM_DELEGATE_DELETE_MARGIN_SECS: u64 = 10;
 
 /// Default embedding dimensions used when metadata is missing or unreadable.
 pub const DEFAULT_EMBEDDING_DIMENSIONS: usize = 384;
@@ -413,8 +637,29 @@ pub const SCIP_CSHARP_DEBOUNCE_MS: u64 = 60_000; // 60 seconds
 /// LMDB database name for the SCIP symbols table.
 pub const SCIP_SYMBOLS_DB_NAME: &str = "scip_symbols";
 
+/// LMDB database name for the SCIP per-repo metadata table.
+pub const SCIP_META_DB_NAME: &str = "scip_meta";
+
 /// LMDB metadata key for the last rebuild timestamp.
 pub const SCIP_REBUILD_TIMESTAMP_KEY: &str = "last_rebuild_ts";
+
+/// LMDB metadata key for the git HEAD sha the symbol index was built for.
+/// Written on rebuild when the repo HEAD is readable; absent means unknown
+/// (never written, or git could not be read at build time).
+pub const SCIP_HEAD_SHA_KEY: &str = "head_sha";
+
+/// LMDB metadata key recording which symbol-key format generation an index
+/// was built with. Written at every C# SCIP rebuild; `has_index` refuses an
+/// index whose value is absent or differs from [`SCIP_KEY_FORMAT`], so a
+/// change to the canonical key format forces exactly one rebuild instead of
+/// old-format keys being served as fresh.
+pub const SCIP_KEY_FORMAT_KEY: &str = "key_format";
+
+/// Current value written for [`SCIP_KEY_FORMAT_KEY`]. Bump whenever the
+/// canonical SCIP symbol key format produced by a language helper changes
+/// shape (B4: C# generic arity / containing-type path / fully qualified
+/// parameter types).
+pub const SCIP_KEY_FORMAT: &str = "2";
 
 /// LMDB table mapping `(file:line)` positions to `[symbol_keys]`.
 /// Used for O(1) position-based symbol lookup.
@@ -430,9 +675,48 @@ pub const SCIP_SIMPLE_NAMES_DB_NAME: &str = "scip_simple_names";
 /// cleared when the definition index is rebuilt. Gives O(1) lookup on 2nd+ calls.
 pub const SCIP_REF_CACHE_DB_NAME: &str = "scip_ref_cache";
 
+/// LMDB table caching per-symbol completeness warnings from on-demand
+/// reference resolution (`scip-csharp find-refs` / `batch-find-refs`).
+/// Key: full SCIP symbol key. Value: `[v1, bincode(Vec<String>)]` (same wire
+/// format as the key lists). Non-empty means the cached references may be
+/// INCOMPLETE — a helper failure was survived rather than fatal. Empty
+/// warnings are REMOVED rather than stored, so absence means "complete" and
+/// a later clean re-resolution clears a stale warning.
+pub const SCIP_REF_WARNINGS_DB_NAME: &str = "scip_ref_warnings";
+
 /// Language identifier for the C# symbol indexer.
 /// Used as a key in `SymbolIndexerRegistry` lookups and TUI status maps.
 pub const LANG_CSHARP: &str = "csharp";
+
+/// Language identifier for the TypeScript symbol indexer.
+/// Used as a key in `SymbolIndexerRegistry` lookups and TUI status maps.
+pub const LANG_TYPESCRIPT: &str = "typescript";
+
+/// Environment variable override for the `scip-typescript` helper/CLI path.
+/// When unset, the indexer falls back to `npx scip-typescript`.
+pub const SCIP_TYPESCRIPT_HELPER_ENV: &str = "CODESEARCH_SCIP_TYPESCRIPT";
+
+/// LMDB metadata key for the TypeScript indexer's last rebuild timestamp.
+/// Namespaced per-language (unlike C#'s un-namespaced `SCIP_REBUILD_TIMESTAMP_KEY`)
+/// so both adapters can safely share the same `scip_meta` table if ever merged.
+pub const SCIP_TYPESCRIPT_REBUILD_TIMESTAMP_KEY: &str = "last_rebuild_ts:typescript";
+
+/// TypeScript-specific key for `SCIP_HEAD_SHA_KEY` (the C# and TypeScript
+/// adapters share one `scip_meta` table, so keys are language-prefixed).
+pub const SCIP_TYPESCRIPT_HEAD_SHA_KEY: &str = "head_sha:typescript";
+
+/// TypeScript-specific key for the index-warnings entry: a JSON array of
+/// warnings from the LAST `scip-typescript` run. Non-empty means the index
+/// may be incomplete (the run exited non-zero and partial output was kept);
+/// an empty array is written on every clean rebuild so a successful reindex
+/// clears stale warnings. Absence (indexes written before this key existed)
+/// is read as complete — there is nothing to claim otherwise.
+pub const SCIP_TYPESCRIPT_INDEX_WARNINGS_KEY: &str = "index_warnings:typescript";
+
+/// Debounce window (ms) for the TypeScript file-watcher symbol rebuild.
+/// Mirrors `SCIP_CSHARP_DEBOUNCE_MS` — a single quiet-period flush avoids
+/// spawning `scip-typescript` once per saved file during a burst of edits.
+pub const SCIP_TYPESCRIPT_DEBOUNCE_MS: u64 = 60_000; // 60 seconds
 
 /// Environment variable controlling phase-2 C# SCIP rebuild concurrency.
 /// Parsed in `ServeState::csharp_scip_concurrency()` and clamped to [1, 4].
@@ -487,6 +771,67 @@ pub const SCIP_LMDB_DEFAULT_MAP_SIZE_MB: usize = 512;
 /// Environment variable to override the SCIP LMDB map size in megabytes.
 /// When set, takes precedence over `SCIP_LMDB_DEFAULT_MAP_SIZE_MB`.
 pub const SCIP_LMDB_MAP_SIZE_MB_ENV: &str = "CODESEARCH_SCIP_LMDB_MAP_MB";
+
+/// Internal wall-clock budget (seconds) for a single `find_impact` reference
+/// lookup.
+///
+/// A cold reference-cache miss makes the `find_impact` handler invoke the
+/// external SCIP helper (`scip-csharp find-refs`), which can take several
+/// minutes on a large solution. Without an internal deadline the MCP client
+/// is the timeout mechanism: it aborts with an opaque `-32001 Request timed
+/// out` and the calling agent falls back to plain-text search exactly when
+/// the precise SCIP call graph is most useful. This budget makes the server
+/// answer first with a structured busy envelope
+/// (`{"busy": true, "state": ..., "waited_ms": ..., "advice": ...}`) while
+/// the lookup continues in the background, so a retry is served warm from
+/// the reference cache instead of cold again.
+///
+/// Override at runtime with `CODESEARCH_FIND_IMPACT_BUDGET_SECS` (integer
+/// seconds). `0` disables the budget entirely, restoring the previous
+/// unbounded-blocking behaviour. Unparseable values fall back to the default.
+///
+/// The default is deliberately BELOW typical MCP client timeouts (observed
+/// live: an MCP client gave up at ~60s with `-32001` while the busy answer
+/// was still being prepared at the 60s budget) — the structured busy answer
+/// is only useful if it arrives before the client stops listening.
+pub const DEFAULT_FIND_IMPACT_BUDGET_SECS: u64 = 45;
+
+/// Environment variable to override `DEFAULT_FIND_IMPACT_BUDGET_SECS`.
+pub const FIND_IMPACT_BUDGET_SECS_ENV: &str = "CODESEARCH_FIND_IMPACT_BUDGET_SECS";
+
+/// Maximum number of resident SCIP helper workspaces (todo #115).
+///
+/// Admission control IS the memory governor: each resident workspace holds a
+/// fully loaded Roslyn solution (1-2 GB on large solutions), so the pool cap
+/// bounds total helper memory to `MAX_RESIDENT x heap cap`. A third repo's
+/// lookup evicts the least-recently-used workspace — eviction is safe because
+/// resolved references persist in the LMDB ref cache, so only latency is
+/// lost, never data.
+pub const DEFAULT_SCIP_MAX_RESIDENT_WORKSPACES: usize = 2;
+pub const SCIP_MAX_RESIDENT_WORKSPACES_ENV: &str = "CODESEARCH_SCIP_MAX_RESIDENT";
+
+/// Per-workspace managed-heap cap passed to the helper as
+/// `DOTNET_GCHeapHardLimit` (bytes; the env var is interpreted as hex by the
+/// .NET runtime, so the Rust side formats it without a prefix). A runaway
+/// workspace fails fast at the cap instead of taking the machine with it —
+/// the typed `failed` path turns that into an agent-actionable answer.
+pub const DEFAULT_SCIP_WORKSPACE_HEAP_CAP: u64 = 1_610_612_736; // 1.5 GiB
+pub const SCIP_WORKSPACE_HEAP_CAP_ENV: &str = "CODESEARCH_SCIP_WORKSPACE_HEAP_CAP";
+
+/// Resident workspaces idle longer than this are torn down by lazy reaping
+/// (checked on pool access). Restarting a workspace costs one solution load —
+/// acceptable for an idle repo, which is exactly what the TTL measures.
+pub const DEFAULT_SCIP_WORKSPACE_IDLE_SECS: u64 = 600;
+pub const SCIP_WORKSPACE_IDLE_SECS_ENV: &str = "CODESEARCH_SCIP_WORKSPACE_IDLE_SECS";
+
+/// How long (seconds) a budget-overrun `find_impact` lookup stays tracked
+/// for retry observation. Must comfortably exceed the slowest legitimate
+/// `scip-csharp find-refs` run (several minutes on a large solution): an
+/// entry dropped while its lookup is still running would turn a retry into
+/// a cold restart, voiding the dedupe the busy advice promises. Finished
+/// entries are removed on their first retry read, so this cap only bounds
+/// abandoned lookups.
+pub const FIND_IMPACT_TRACK_TTL_SECS: u64 = 1800;
 
 /// Debounce window (seconds) for persisting repos.json metadata updates.
 /// Coalesces bursts of file changes into a single write.
