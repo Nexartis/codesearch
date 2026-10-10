@@ -9,6 +9,26 @@ namespace ScipCsharp;
 /// missing or stale. Compiled into both scip-csharp and the test project via
 /// a linked Compile item (same pattern as WorkspaceLoad.cs).
 /// </summary>
+/// <summary>
+/// File names whose change invalidates NuGet restore state even though no
+/// .csproj changed: under central package management versions live in
+/// Directory.Packages.props, and MSBuild/NuGet import the rest from parent
+/// directories. Compared case-insensitively.
+/// </summary>
+public static class RestoreInputs
+{
+    public const string PackagesProps = "Directory.Packages.props";
+    public const string BuildProps = "Directory.Build.props";
+    public const string BuildTargets = "Directory.Build.targets";
+    public const string NuGetConfig = "NuGet.config";
+    public const string GlobalJson = "global.json";
+
+    public static readonly string[] FileNames =
+    {
+        PackagesProps, BuildProps, BuildTargets, NuGetConfig, GlobalJson,
+    };
+}
+
 internal static class RestorePolicy
 {
     /// <summary>Env override for the restore kill timeout, in seconds.</summary>
@@ -17,14 +37,16 @@ internal static class RestorePolicy
     private const int DefaultRestoreTimeoutSeconds = 300;
 
     /// <summary>
-    /// True when at least one project lacks <c>obj/project.assets.json</c> or
-    /// has one older than its .csproj (a package reference or target framework
-    /// was edited since the last restore). False means every project has fresh
+    /// True when at least one project lacks <c>obj/project.assets.json</c>, has
+    /// one older than its .csproj, or has one older than ANY restore input
+    /// (<see cref="RestoreInputs"/>) found walking up from the project dir to
+    /// the solution dir and the repo root. False means every project has fresh
     /// assets and restore can be skipped entirely — the steady state of an
     /// actively developed repo.
     /// </summary>
     public static bool NeedsRestore(IEnumerable<string> projectRelativePaths, string solutionDir)
     {
+        var walkRoot = FindWalkRoot(solutionDir);
         foreach (var relative in projectRelativePaths)
         {
             var projectPath = Path.GetFullPath(Path.Combine(solutionDir, relative));
@@ -34,13 +56,77 @@ internal static class RestorePolicy
             {
                 return true;
             }
-            if (File.GetLastWriteTimeUtc(projectPath) > File.GetLastWriteTimeUtc(assetsPath))
+            var assetsTime = File.GetLastWriteTimeUtc(assetsPath);
+            if (File.GetLastWriteTimeUtc(projectPath) > assetsTime)
+            {
+                return true;
+            }
+            if (AnyRestoreInputNewerThan(projectDir, walkRoot, assetsTime))
             {
                 return true;
             }
         }
         return false;
     }
+
+    /// <summary>
+    /// The highest directory restore inputs are collected from: the repo root
+    /// when one sits at or above the solution dir (inputs above the solution
+    /// dir still apply to it), otherwise the solution dir itself.
+    /// </summary>
+    private static string FindWalkRoot(string solutionDir)
+    {
+        var dir = Path.GetFullPath(solutionDir);
+        while (true)
+        {
+            if (Directory.Exists(Path.Combine(dir, ".git")) || File.Exists(Path.Combine(dir, ".git")))
+            {
+                return dir;
+            }
+            var parent = Directory.GetParent(dir)?.FullName;
+            if (string.IsNullOrEmpty(parent) || PathsEqual(parent, dir))
+            {
+                return Path.GetFullPath(solutionDir);
+            }
+            dir = parent;
+        }
+    }
+
+    private static bool AnyRestoreInputNewerThan(string startDir, string walkRoot, DateTime assetsTime)
+    {
+        var dir = Path.GetFullPath(startDir);
+        while (true)
+        {
+            // Enumerate + compare case-insensitively instead of File.Exists
+            // probes: NuGet honours e.g. lowercase nuget.config on
+            // case-sensitive filesystems where an exact-case probe misses it.
+            foreach (var file in Directory.GetFiles(dir))
+            {
+                var fileName = Path.GetFileName(file);
+                if (RestoreInputs.FileNames.Contains(fileName, StringComparer.OrdinalIgnoreCase)
+                    && File.GetLastWriteTimeUtc(file) > assetsTime)
+                {
+                    return true;
+                }
+            }
+            if (PathsEqual(dir, walkRoot))
+            {
+                return false;
+            }
+            var parent = Directory.GetParent(dir)?.FullName;
+            if (string.IsNullOrEmpty(parent) || PathsEqual(parent, dir))
+            {
+                return false;
+            }
+            dir = parent;
+        }
+    }
+
+    private static bool PathsEqual(string left, string right) =>
+        string.Equals(
+            Path.GetFullPath(left).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+            Path.GetFullPath(right).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+            StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
     /// Restore wait timeout in seconds: <c>CODESEARCH_RESTORE_TIMEOUT_SECS</c>

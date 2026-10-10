@@ -123,4 +123,92 @@ public class RestorePolicyTests : IDisposable
         Assert.DoesNotContain("killed", warning, StringComparison.OrdinalIgnoreCase);
         Assert.Contains(RestorePolicy.TimeoutEnvName, warning);
     }
+
+    private string AddRestoreInput(string relativePath, bool touched) =>
+        AddRestoreInputAt(Path.Combine(_solutionDir, relativePath), touched);
+
+    private string AddRestoreInputAt(string inputPath, bool touched)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(inputPath)!);
+        File.WriteAllText(inputPath, "<Project />");
+        File.SetLastWriteTimeUtc(
+            inputPath,
+            DateTime.UtcNow.AddMinutes(touched ? 5 : -5));
+        return inputPath;
+    }
+
+    /// <summary>
+    /// Central package management: bumping a version in
+    /// Directory.Packages.props must mark the assets stale even though no
+    /// .csproj changed — the CS0246 class of false-fresh assets.
+    /// </summary>
+    [Fact]
+    public void TouchedPackagesPropsAtSolutionRootTriggersRestore()
+    {
+        AddProject(@"src\Acme.Core\Acme.Core.csproj", withAssets: true);
+        AddRestoreInput(@"Directory.Packages.props", touched: true);
+
+        Assert.True(RestorePolicy.NeedsRestore(
+            new[] { @"src\Acme.Core\Acme.Core.csproj" }, _solutionDir));
+    }
+
+    [Fact]
+    public void UntouchedPackagesPropsKeepsRestoreSkipped()
+    {
+        AddProject(@"src\Acme.Core\Acme.Core.csproj", withAssets: true);
+        AddRestoreInput(@"Directory.Packages.props", touched: false);
+
+        Assert.False(RestorePolicy.NeedsRestore(
+            new[] { @"src\Acme.Core\Acme.Core.csproj" }, _solutionDir));
+    }
+
+    /// <summary>
+    /// The walk must extend ABOVE the solution dir: a Directory.Build.props at
+    /// the repo root applies to a solution sitting deeper in the repo.
+    /// </summary>
+    [Fact]
+    public void InputAboveSolutionDirAtRepoRootTriggersRestore()
+    {
+        var repoDir = Directory.CreateDirectory(Path.Combine(_solutionDir, "repo")).FullName;
+        var solutionDir = Directory.CreateDirectory(Path.Combine(repoDir, "sln")).FullName;
+        Directory.CreateDirectory(Path.Combine(repoDir, ".git"));
+
+        var projectPath = Path.Combine(solutionDir, "src", "Acme.Core", "Acme.Core.csproj");
+        Directory.CreateDirectory(Path.GetDirectoryName(projectPath)!);
+        File.WriteAllText(projectPath, "<Project Sdk=\"Microsoft.NET.Sdk\" />");
+        var objDir = Path.Combine(Path.GetDirectoryName(projectPath)!, "obj");
+        Directory.CreateDirectory(objDir);
+        File.WriteAllText(Path.Combine(objDir, "project.assets.json"), "{}");
+
+        AddRestoreInputAt(Path.Combine(repoDir, "Directory.Build.props"), touched: true);
+
+        Assert.True(RestorePolicy.NeedsRestore(
+            new[] { @"src\Acme.Core\Acme.Core.csproj" }, solutionDir));
+    }
+
+    [Fact]
+    public void TouchedNuGetConfigAndGlobalJsonTriggerRestore()
+    {
+        AddProject(@"src\Acme.Core\Acme.Core.csproj", withAssets: true);
+        AddRestoreInput(@"NuGet.config", touched: true);
+        AddRestoreInput(@"global.json", touched: false);
+
+        Assert.True(RestorePolicy.NeedsRestore(
+            new[] { @"src\Acme.Core\Acme.Core.csproj" }, _solutionDir));
+    }
+
+    /// <summary>
+    /// Pins the case-insensitive input-name match: NuGet honours lowercase
+    /// nuget.config on case-sensitive filesystems, where an exact-case probe
+    /// would miss it.
+    /// </summary>
+    [Fact]
+    public void CaseVariantInputNameStillTriggersRestore()
+    {
+        AddProject(@"src\Acme.Core\Acme.Core.csproj", withAssets: true);
+        AddRestoreInput(@"nuget.config", touched: true);
+
+        Assert.True(RestorePolicy.NeedsRestore(
+            new[] { @"src\Acme.Core\Acme.Core.csproj" }, _solutionDir));
+    }
 }
