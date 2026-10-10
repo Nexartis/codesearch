@@ -72,12 +72,32 @@ public static class Program
 
         if (!TryRegisterMsBuild(out var regErr)) { await Console.Error.WriteLineAsync(regErr).ConfigureAwait(false); return 1; }
 
+        // A resident workspace must not come up mid-restore: the host CACHES
+        // its find-refs answers, so degraded answers from a workspace loaded
+        // while restore is in flight would be persisted (issue #225
+        // acceptance). Startup refuses so the pool falls back to the one-shot
+        // path, which handles restore-pending explicitly. Reloads of an
+        // ALREADY-RUNNING resident keep answering (gateRestorePending: false).
+        if (RestorePendingMarker.IsActive(parsed))
+        {
+            Console.Error.WriteLine(
+                "[RESTORE-PENDING] a dotnet restore for this solution is already running — " +
+                $"serve refuses to load the workspace; the pool will retry once it finishes.");
+            return ExitCodes.RestorePending;
+        }
+
         using var workspace = CreateTolerantWorkspace();
 
         try
         {
             Console.Error.WriteLine($"serve: loading solution: {parsed}");
-            await OpenSolutionFilteredAsync(workspace, parsed, gateRestorePending: false).ConfigureAwait(false);
+            await OpenSolutionFilteredAsync(workspace, parsed, gateRestorePending: true).ConfigureAwait(false);
+        }
+        catch (RestorePendingException)
+        {
+            // Serve's own startup restore overran its bounded wait: refuse the
+            // same way an active marker does — the pool falls back and retries.
+            return ExitCodes.RestorePending;
         }
         catch (Exception ex)
         {
@@ -384,6 +404,24 @@ public static class Program
     private static void RestoreSolution(string solutionPath, bool gateRestorePending)
     {
         var timeoutSeconds = RestorePolicy.RestoreTimeoutSeconds();
+        // Never start a second restore while one is already running for this
+        // solution: an ACTIVE marker means another process (or an earlier
+        // timed-out run of this one) still has dotnet restore going. A stale
+        // marker is deleted by the check and the run proceeds normally.
+        if (RestorePendingMarker.IsActive(solutionPath))
+        {
+            if (gateRestorePending)
+            {
+                Console.Error.WriteLine(
+                    "[RESTORE-PENDING] a dotnet restore for this solution is already running — " +
+                    $"exiting {ExitCodes.RestorePending} without building an index; retry when it finishes.");
+                throw new RestorePendingException();
+            }
+            Console.Error.WriteLine(
+                "[WARN] a dotnet restore for this solution is already running — serve reload " +
+                "keeps answering from the existing workspace until it finishes.");
+            return;
+        }
         try
         {
             var psi = new ProcessStartInfo

@@ -676,6 +676,12 @@ pub const HELPERS_SUBDIR: &str = "helpers";
 /// Debounce time in milliseconds for .cs file changes triggering a symbol rebuild.
 pub const SCIP_CSHARP_DEBOUNCE_MS: u64 = 60_000; // 60 seconds
 
+/// Environment variable overriding the restore-pending retry interval in
+/// seconds (issue #225). Values ≤ 0 or unparseable fall back to the
+/// built-in interval (a zero interval would hot-spin the helper); tests
+/// use 1 to exercise the retry loop in seconds instead of minutes.
+pub const SCIP_RESTORE_RETRY_INTERVAL_SECS_ENV: &str = "CODESEARCH_RESTORE_RETRY_INTERVAL_SECS";
+
 /// LMDB database name for the SCIP symbols table.
 pub const SCIP_SYMBOLS_DB_NAME: &str = "scip_symbols";
 
