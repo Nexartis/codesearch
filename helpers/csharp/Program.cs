@@ -77,7 +77,7 @@ public static class Program
         try
         {
             Console.Error.WriteLine($"serve: loading solution: {parsed}");
-            await OpenSolutionFilteredAsync(workspace, parsed).ConfigureAwait(false);
+            await OpenSolutionFilteredAsync(workspace, parsed, gateRestorePending: false).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -103,7 +103,7 @@ public static class Program
         // process death is (todo #115).
         return await ServeHost.LoopAsync(
             workspace,
-            solution => OpenSolutionFilteredAsync(workspace, solution)).ConfigureAwait(false);
+            solution => OpenSolutionFilteredAsync(workspace, solution, gateRestorePending: false)).ConfigureAwait(false);
     }
 
     private static string? ParseServeArgs(string[] args)
@@ -147,6 +147,9 @@ public static class Program
             }
             else if (!string.IsNullOrEmpty(parsed.Value.ProjectPath))
             {
+                // No restore gate on this path: restore (and its marker) is
+                // solution-keyed and a bare --project load has no solution.
+                // The host never passes --project — out of scope for #225.
                 Console.Error.WriteLine($"Loading project: {parsed.Value.ProjectPath}");
                 await workspace.OpenProjectAsync(parsed.Value.ProjectPath).ConfigureAwait(false);
             }
@@ -155,6 +158,12 @@ public static class Program
                 await Console.Error.WriteLineAsync("Either --solution or --project must be specified.").ConfigureAwait(false);
                 return 1;
             }
+        }
+        catch (RestorePendingException)
+        {
+            // No output file written: restore is still in flight and the
+            // Rust host must treat this as restore-pending, not as failure.
+            return ExitCodes.RestorePending;
         }
         catch (Exception ex)
         {
@@ -204,6 +213,12 @@ public static class Program
         {
             Console.Error.WriteLine($"find-refs: loading solution: {parsed.Value.SolutionPath}");
             await OpenSolutionFilteredAsync(workspace, parsed.Value.SolutionPath).ConfigureAwait(false);
+        }
+        catch (RestorePendingException)
+        {
+            // No output file written: the Rust host maps exit 75 to a
+            // restore-pending outcome, never a generic resolver failure.
+            return ExitCodes.RestorePending;
         }
         catch (Exception ex)
         {
@@ -259,6 +274,12 @@ public static class Program
         {
             Console.Error.WriteLine($"batch-find-refs: loading solution: {parsed.Value.SolutionPath}");
             await OpenSolutionFilteredAsync(workspace, parsed.Value.SolutionPath).ConfigureAwait(false);
+        }
+        catch (RestorePendingException)
+        {
+            // No output file written: the Rust host maps exit 75 to a
+            // restore-pending outcome, never a generic resolver failure.
+            return ExitCodes.RestorePending;
         }
         catch (Exception ex)
         {
@@ -360,7 +381,7 @@ public static class Program
     /// never killed: on timeout it continues in the background and the next
     /// reindex picks up the fresh assets.
     /// </summary>
-    private static void RestoreSolution(string solutionPath)
+    private static void RestoreSolution(string solutionPath, bool gateRestorePending)
     {
         var timeoutSeconds = RestorePolicy.RestoreTimeoutSeconds();
         try
@@ -388,21 +409,41 @@ public static class Program
             // Bounded WAIT, never a kill: a killed restore wastes all of its
             // work and leaves assets missing, so every reindex would pay the
             // same wait and stay degraded. On timeout the restore keeps
-            // running in the background (the child outlives this process);
-            // this load proceeds degraded and the next reindex finds the
-            // fresh assets and loads clean. Timeout is env-tunable for large
-            // solutions on slow feeds.
+            // running in the background (the child outlives this process) and
+            // is recorded in a marker so later runs can detect it. Gated
+            // commands refuse to build an index (exit RestorePending) — a
+            // degraded index stored now would poison LMDB until the next
+            // rebuild — while serve keeps answering from the existing
+            // workspace. Timeout is env-tunable for large solutions.
             if (!process.WaitForExit(timeoutSeconds * 1000))
             {
+                RestorePendingMarker.Write(
+                    solutionPath, process.Id, process.StartTime.ToUniversalTime());
+                if (gateRestorePending)
+                {
+                    Console.Error.WriteLine(
+                        $"[RESTORE-PENDING] dotnet restore still running after {timeoutSeconds}s for " +
+                        $"'{solutionPath}' — not building an index while restore is in flight; the " +
+                        "previous index stays live. Retry when restore finishes, or raise " +
+                        $"{RestorePolicy.TimeoutEnvName}.");
+                    throw new RestorePendingException();
+                }
                 Console.Error.WriteLine(RestorePolicy.StillRunningWarning(timeoutSeconds));
                 return;
             }
             if (process.ExitCode != 0)
             {
+                // A restore that itself failed is NOT pending: the gate must
+                // not wait on a restore that will never succeed — today's
+                // degraded-with-warning behaviour stays.
                 Console.Error.WriteLine(
-                    $"[WARN] dotnet restore exited {process.ExitCode} for '{solutionPath}' — continuing; " +
-                    "package references may be unresolved (degraded symbols).");
+                    $"[WARN] dotnet restore itself failed (exit {process.ExitCode}) for '{solutionPath}' — " +
+                    "continuing with a degraded index; package references may be unresolved.");
             }
+        }
+        catch (RestorePendingException)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -420,7 +461,10 @@ public static class Program
     /// If the filtered solution still fails to load (e.g. BuildHost crash), falls
     /// back to loading individual .csproj files from the solution.
     /// </summary>
-    private static async Task OpenSolutionFilteredAsync(MSBuildWorkspace workspace, string solutionPath)
+    private static async Task OpenSolutionFilteredAsync(
+        MSBuildWorkspace workspace,
+        string solutionPath,
+        bool gateRestorePending = true)
     {
         var solutionDir = Path.GetDirectoryName(solutionPath) ?? ".";
         var lines = await File.ReadAllLinesAsync(solutionPath).ConfigureAwait(false);
@@ -442,9 +486,19 @@ public static class Program
         // cascade into CS0246 noise that would otherwise pin the repo's index
         // warning. But restoring on every reindex is far too heavy for
         // multi-repo hubs — fresh assets mean no restore at all.
+        //
+        // Gate: while a restore is in flight, gated commands (index,
+        // find-refs, batch-find-refs) refuse to load the workspace at all, so
+        // no index or cached find-refs answer can ever be produced from a
+        // solution loaded mid-restore. Serve passes gateRestorePending: false
+        // — a resident process must keep answering from the existing index.
+        if (gateRestorePending)
+        {
+            RestoreGate.ThrowIfRestorePending(solutionPath);
+        }
         if (RestorePolicy.NeedsRestore(supported.Select(p => p.RelativePath), solutionDir))
         {
-            RestoreSolution(solutionPath);
+            RestoreSolution(solutionPath, gateRestorePending);
         }
 
         // Log skipped projects
