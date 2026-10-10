@@ -291,6 +291,21 @@ impl FileWatcher {
             }
         }
 
+        // C# restore inputs (Directory.Packages.props etc.) are not an
+        // indexable language, but the watcher must still see them: a change
+        // invalidates NuGet restore state for the whole solution and drives
+        // a full C# symbol rebuild (issue #225). Checked before the
+        // 0-byte/language gates — an empty NuGet.config is a meaningful
+        // restore input too.
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if crate::constants::CSHARP_RESTORE_INPUT_FILES
+                .iter()
+                .any(|f| name.eq_ignore_ascii_case(f))
+            {
+                return true;
+            }
+        }
+
         // Skip 0-byte files (empty build artifacts)
         if path.metadata().map(|m| m.len() == 0).unwrap_or(false) {
             return false;

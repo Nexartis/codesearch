@@ -375,6 +375,47 @@ fn is_ts_extension(path: &Path) -> bool {
     )
 }
 
+/// Returns true when `path` is a C# restore input (file NAME match,
+/// case-insensitive): its change invalidates NuGet restore state and drives
+/// a FULL C# symbol rebuild rather than the per-project incremental.
+fn is_csharp_restore_input(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| {
+            crate::constants::CSHARP_RESTORE_INPUT_FILES
+                .iter()
+                .any(|f| name.eq_ignore_ascii_case(f))
+        })
+}
+
+/// Which symbol-rebuild debounce one watched file event feeds. Pure path
+/// decision shared by the modify/delete/rename FSW arms so the
+/// classification is table-testable without driving the async loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SymbolRebuildTrigger {
+    /// Per-project incremental (.cs) rebuild.
+    CSharpIncremental,
+    /// FULL solution rebuild: a restore-input change invalidates restore
+    /// state for every project at once (issue #225).
+    CSharpRestoreInput,
+    /// Full TypeScript rebuild (single tsconfig).
+    TypeScript,
+    /// Text-index only.
+    None,
+}
+
+fn classify_symbol_rebuild_event(path: &Path) -> SymbolRebuildTrigger {
+    if path.extension().and_then(|e| e.to_str()) == Some("cs") {
+        SymbolRebuildTrigger::CSharpIncremental
+    } else if is_csharp_restore_input(path) {
+        SymbolRebuildTrigger::CSharpRestoreInput
+    } else if is_ts_extension(path) {
+        SymbolRebuildTrigger::TypeScript
+    } else {
+        SymbolRebuildTrigger::None
+    }
+}
+
 /// Where an embed pass gets its `EmbeddingService`: the serve-wide pool
 /// (which already holds the persistent cache's LMDB env open) or a fresh
 /// service (CLI / standalone MCP, own process).
@@ -1591,6 +1632,12 @@ impl IndexManager {
             let mut cs_files_deleted: HashSet<PathBuf> = HashSet::new();
             let mut cs_last_event_time: Option<std::time::Instant> = None;
             let cs_debounce = std::time::Duration::from_millis(SCIP_CSHARP_DEBOUNCE_MS);
+            // C# restore inputs (Directory.Packages.props, NuGet.config, ...)
+            // use the same debounce length but their OWN timer: a CPM bump
+            // invalidates the whole solution's restore state, so the flush is
+            // a FULL rebuild, not the per-project incremental (issue #225).
+            let mut restore_inputs_changed = false;
+            let mut restore_input_last_event_time: Option<std::time::Instant> = None;
 
             // Symbol indexer debounce: .ts/.tsx/.mts/.cts files are buffered separately
             // and flushed after SCIP_TYPESCRIPT_DEBOUNCE_MS of quiet time. Unlike C#'s
@@ -1700,33 +1747,52 @@ impl IndexManager {
                                 // If file was marked for removal, cancel that
                                 files_to_remove.remove(&p);
                                 files_to_index.insert(p.clone());
-                                // Track .cs file modifications for symbol rebuild debounce
-                                if p.extension().and_then(|e| e.to_str()) == Some("cs") {
-                                    // If previously queued as deleted, promote to modified
-                                    cs_files_deleted.remove(&p);
-                                    cs_files_modified.insert(p);
-                                    cs_last_event_time = Some(now);
-                                } else if is_ts_extension(&p) {
-                                    ts_files_deleted.remove(&p);
-                                    ts_files_modified.insert(p);
-                                    ts_last_event_time = Some(now);
+                                // Track modifications for the symbol rebuild debounces
+                                match classify_symbol_rebuild_event(&p) {
+                                    SymbolRebuildTrigger::CSharpIncremental => {
+                                        // If previously queued as deleted, promote to modified
+                                        cs_files_deleted.remove(&p);
+                                        cs_files_modified.insert(p);
+                                        cs_last_event_time = Some(now);
+                                    }
+                                    SymbolRebuildTrigger::CSharpRestoreInput => {
+                                        restore_inputs_changed = true;
+                                        restore_input_last_event_time = Some(now);
+                                    }
+                                    SymbolRebuildTrigger::TypeScript => {
+                                        ts_files_deleted.remove(&p);
+                                        ts_files_modified.insert(p);
+                                        ts_last_event_time = Some(now);
+                                    }
+                                    SymbolRebuildTrigger::None => {}
                                 }
                             }
                             FileEvent::Deleted(p) => {
                                 // If file was marked for indexing, cancel that
                                 files_to_index.remove(&p);
                                 files_to_remove.insert(p.clone());
-                                // Track .cs deletions separately — the symbol rebuilder
-                                // needs to explicitly purge LMDB entries for deleted files
-                                // since they won't appear in the new scip-csharp output.
-                                if p.extension().and_then(|e| e.to_str()) == Some("cs") {
-                                    cs_files_modified.remove(&p);
-                                    cs_files_deleted.insert(p);
-                                    cs_last_event_time = Some(now);
-                                } else if is_ts_extension(&p) {
-                                    ts_files_modified.remove(&p);
-                                    ts_files_deleted.insert(p);
-                                    ts_last_event_time = Some(now);
+                                // Track deletions per debounce — .cs deletions must
+                                // be passed explicitly to the incremental rebuild so
+                                // their LMDB entries are purged even though they're
+                                // absent from the new scip-csharp output.
+                                match classify_symbol_rebuild_event(&p) {
+                                    SymbolRebuildTrigger::CSharpIncremental => {
+                                        cs_files_modified.remove(&p);
+                                        cs_files_deleted.insert(p);
+                                        cs_last_event_time = Some(now);
+                                    }
+                                    SymbolRebuildTrigger::CSharpRestoreInput => {
+                                        // A deleted restore input changes restore
+                                        // semantics just as much as an edited one.
+                                        restore_inputs_changed = true;
+                                        restore_input_last_event_time = Some(now);
+                                    }
+                                    SymbolRebuildTrigger::TypeScript => {
+                                        ts_files_modified.remove(&p);
+                                        ts_files_deleted.insert(p);
+                                        ts_last_event_time = Some(now);
+                                    }
+                                    SymbolRebuildTrigger::None => {}
                                 }
                             }
                             FileEvent::Renamed(old_p, new_p) => {
@@ -1735,37 +1801,43 @@ impl IndexManager {
                                 files_to_remove.insert(old_p.clone());
                                 files_to_remove.remove(&new_p);
                                 files_to_index.insert(new_p.clone());
-                                // Track .cs renames: old path is a deletion, new path is a modification
-                                let old_is_cs =
-                                    old_p.extension().and_then(|e| e.to_str()) == Some("cs");
-                                let new_is_cs =
-                                    new_p.extension().and_then(|e| e.to_str()) == Some("cs");
-                                if old_is_cs || new_is_cs {
-                                    if old_is_cs {
+                                // A rename is a deletion of the old path and a
+                                // modification of the new one; each side feeds its
+                                // own debounce independently (a .cs → restore-input
+                                // rename must trip both).
+                                match classify_symbol_rebuild_event(&old_p) {
+                                    SymbolRebuildTrigger::CSharpIncremental => {
                                         cs_files_modified.remove(&old_p);
                                         cs_files_deleted.insert(old_p);
+                                        cs_last_event_time = Some(now);
                                     }
-                                    if new_is_cs {
-                                        cs_files_deleted.remove(&new_p);
-                                        cs_files_modified.insert(new_p);
+                                    SymbolRebuildTrigger::CSharpRestoreInput => {
+                                        restore_inputs_changed = true;
+                                        restore_input_last_event_time = Some(now);
                                     }
-                                    cs_last_event_time = Some(now);
-                                } else {
-                                    // Track .ts/.tsx/.mts/.cts renames: old path is a
-                                    // deletion, new path is a modification.
-                                    let old_is_ts = is_ts_extension(&old_p);
-                                    let new_is_ts = is_ts_extension(&new_p);
-                                    if old_is_ts || new_is_ts {
-                                        if old_is_ts {
-                                            ts_files_modified.remove(&old_p);
-                                            ts_files_deleted.insert(old_p);
-                                        }
-                                        if new_is_ts {
-                                            ts_files_deleted.remove(&new_p);
-                                            ts_files_modified.insert(new_p);
-                                        }
+                                    SymbolRebuildTrigger::TypeScript => {
+                                        ts_files_modified.remove(&old_p);
+                                        ts_files_deleted.insert(old_p);
                                         ts_last_event_time = Some(now);
                                     }
+                                    SymbolRebuildTrigger::None => {}
+                                }
+                                match classify_symbol_rebuild_event(&new_p) {
+                                    SymbolRebuildTrigger::CSharpIncremental => {
+                                        cs_files_deleted.remove(&new_p);
+                                        cs_files_modified.insert(new_p);
+                                        cs_last_event_time = Some(now);
+                                    }
+                                    SymbolRebuildTrigger::CSharpRestoreInput => {
+                                        restore_inputs_changed = true;
+                                        restore_input_last_event_time = Some(now);
+                                    }
+                                    SymbolRebuildTrigger::TypeScript => {
+                                        ts_files_deleted.remove(&new_p);
+                                        ts_files_modified.insert(new_p);
+                                        ts_last_event_time = Some(now);
+                                    }
+                                    SymbolRebuildTrigger::None => {}
                                 }
                             }
                         }
@@ -2008,6 +2080,74 @@ impl IndexManager {
                                         }
                                     }
                                     // Clear "Indexing" now that all groups are done
+                                    if let Some(ref cb) = indexing_cb_scip {
+                                        cb(false);
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+
+                // Flush the restore-input debounce: a changed/deleted
+                // Directory.Packages.props (or sibling) invalidates restore
+                // state for EVERY project at once, so the flush is a FULL
+                // solution rebuild — a per-project incremental would index
+                // mid-restore against stale assets (issue #225). The helper's
+                // own gate refuses to index while the triggered restore is
+                // still running; rebuild()'s retry loop waits it out.
+                if restore_inputs_changed {
+                    if let Some(restore_last) = restore_input_last_event_time {
+                        let elapsed = now.duration_since(restore_last);
+                        if elapsed >= cs_debounce {
+                            restore_inputs_changed = false;
+                            restore_input_last_event_time = None;
+
+                            info!(
+                                "🔬 [{}] C# restore input changed, triggering full symbol rebuild (after {}s debounce)",
+                                repo_label,
+                                cs_debounce.as_secs()
+                            );
+
+                            let reg = symbol_registry.clone();
+                            let rp = path.clone();
+                            let dp = db_path.clone();
+                            // Clone the repo label into the blocking task (the outer
+                            // binding is reused by later loop iterations).
+                            let repo_label = repo_label.clone();
+                            let notifier = csharp_notifier.clone();
+                            let indexing_cb_scip = indexing_cb.clone();
+                            tokio::task::spawn_blocking(move || {
+                                if let Some(indexer) = reg.get(LANG_CSHARP) {
+                                    if !indexer.applies_to(&rp) {
+                                        info!(
+                                            "🔬 [{}] symbol rebuild skipped: not applicable (no .sln)",
+                                            repo_label
+                                        );
+                                        return;
+                                    }
+                                    if !indexer.is_available() {
+                                        info!(
+                                            "🔬 [{}] symbol rebuild skipped: helper not available",
+                                            repo_label
+                                        );
+                                        return;
+                                    }
+                                    if let Some(ref cb) = indexing_cb_scip {
+                                        cb(true);
+                                    }
+                                    if let Some(ref n) = notifier {
+                                        n(SymbolRebuildSignal::Started);
+                                    }
+                                    Self::run_full_rebuild_logged(
+                                        indexer,
+                                        &rp,
+                                        &dp,
+                                        &repo_label,
+                                        "C#",
+                                        notifier.as_ref(),
+                                    );
+                                    // Clear "Indexing" regardless of outcome
                                     if let Some(ref cb) = indexing_cb_scip {
                                         cb(false);
                                     }
@@ -2821,6 +2961,72 @@ mod tests {
     use super::*;
     use crate::cache::FileMetaStore;
     use tempfile::tempdir;
+
+    /// The watcher must classify every restore input by file NAME,
+    /// case-insensitively (NuGet honours lowercase nuget.config on
+    /// case-sensitive filesystems), and must not classify lookalikes.
+    #[test]
+    fn restore_input_classification_table() {
+        let cases = [
+            ("Directory.Packages.props", true),
+            ("directory.packages.props", true),
+            ("Directory.Build.props", true),
+            ("Directory.Build.targets", true),
+            ("nuget.config", true),
+            ("NuGet.CONFIG", true),
+            ("global.json", true),
+            // Lookalikes that must NOT trigger a full rebuild.
+            ("Global.json.bak", false),
+            ("MyNuGet.config", false),
+            ("Program.cs", false),
+            ("Directory.Packages.props.bak", false),
+            ("packages.props", false),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(
+                is_csharp_restore_input(Path::new(name)),
+                expected,
+                "file name: {name}"
+            );
+            // Same answer through a directory-bearing path.
+            let nested = Path::new("src").join(name);
+            assert_eq!(
+                is_csharp_restore_input(&nested),
+                expected,
+                "nested path: {nested:?}"
+            );
+        }
+    }
+
+    /// The per-event decision the FSW arms rely on: .cs feeds the
+    /// per-project incremental, a restore input the FULL-rebuild debounce,
+    /// .ts/.tsx the TypeScript one — this is the wiring the deliverable
+    /// behaviour depends on, pinned without driving the async loop.
+    #[test]
+    fn symbol_rebuild_event_classification_table() {
+        use SymbolRebuildTrigger::*;
+        let cases = [
+            ("src/Acme.Core.cs", CSharpIncremental),
+            ("Acme.cs", CSharpIncremental),
+            ("Directory.Packages.props", CSharpRestoreInput),
+            ("nuget.config", CSharpRestoreInput),
+            ("Directory.Build.targets", CSharpRestoreInput),
+            ("global.json", CSharpRestoreInput),
+            ("src/app.ts", TypeScript),
+            ("src/app.tsx", TypeScript),
+            ("src/app.mts", TypeScript),
+            ("README.md", None),
+            ("Cargo.toml", None),
+            ("Directory.Packages.props.bak", None),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(
+                classify_symbol_rebuild_event(Path::new(path)),
+                expected,
+                "path: {path}"
+            );
+        }
+    }
 
     /// Dropping the last `Arc<SharedStores>` must release every handle inside
     /// the DB directory — the precondition `index rm`'s delete path depends on.
