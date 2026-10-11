@@ -101,4 +101,24 @@ public class RestoreGateTests : IDisposable
 
         RestoreGate.ThrowIfRestorePending(_solutionPath); // stale: deleted, no throw
     }
+
+    /// <summary>
+    /// Pins the serve-startup refusal: an ACTIVE marker must yield the
+    /// dedicated exit code so the resident pool falls back instead of caching
+    /// answers from a workspace loaded mid-restore.
+    /// </summary>
+    [Fact]
+    public void ServeStartupRefusesWhileRestoreInFlight()
+    {
+        using var current = Process.GetCurrentProcess();
+        RestorePendingMarker.Write(_solutionPath, current.Id, current.StartTime.ToUniversalTime());
+
+        Assert.Equal(75, RestoreGate.ServeStartupPendingExit(_solutionPath));
+    }
+
+    [Fact]
+    public void ServeStartupProceedsWithoutActiveMarker()
+    {
+        Assert.Null(RestoreGate.ServeStartupPendingExit(_solutionPath));
+    }
 }

@@ -1704,7 +1704,17 @@ impl SymbolIndexer for CSharpSymbolIndexer {
                         restore_pending_retry_interval_secs(),
                     ));
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    // A non-pending failure ends the retry loop: the flag
+                    // describes THIS loop's wait, so it must not outlive it
+                    // — otherwise find_impact would warn "restore in
+                    // progress" long after the loop gave up for another
+                    // reason (helper crash, solution deleted mid-wait).
+                    if marked_pending {
+                        restore_pending_flag_clear(db_path);
+                    }
+                    return Err(e);
+                }
             }
         };
         let index_warnings = summarize_index_warnings(&raw_index_warnings, INDEX_WARNINGS_CAP);
@@ -2735,6 +2745,17 @@ mod tests {
     if std::env::var("CS_FAKE_HELPER_MODE").as_deref() == Ok("exit75") {
         std::process::exit(75);
     }
+    if std::env::var("CS_FAKE_HELPER_MODE").as_deref() == Ok("pend-then-fail") {
+        // First invocation pends (75), every later one fails generically (2):
+        // drives a mid-retry non-pending failure through the real loop.
+        let flag = std::env::var("CS_FAKE_PEND_FLAG")
+            .unwrap_or_else(|_| "pend-flag".into());
+        if std::path::Path::new(&flag).exists() {
+            std::process::exit(2);
+        }
+        std::fs::write(&flag, "x").unwrap();
+        std::process::exit(75);
+    }
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("serve") {
         return;
@@ -3063,6 +3084,44 @@ mod tests {
         assert!(
             cache.get(&rtxn, key).unwrap().is_none(),
             "a pending find-refs must not write the ref cache"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rebuild_non_pending_failure_mid_retry_clears_the_pending_flag() {
+        use super::SymbolIndexer as _;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("db");
+        std::fs::write(dir.path().join("FakeSolution.sln"), "").unwrap();
+        let flag_path = dir.path().join("pend-flag");
+
+        let helper_dir = dir.path().join("helper");
+        std::fs::create_dir(&helper_dir).unwrap();
+        let helper = build_fake_csharp_helper(&helper_dir);
+        let _guard = crate::testing::EnvRestore::set(&[
+            (HELPER_ENV_VAR, helper.to_string_lossy().as_ref()),
+            ("CS_FAKE_HELPER_MODE", "pend-then-fail"),
+            ("CS_FAKE_PEND_FLAG", flag_path.to_string_lossy().as_ref()),
+            (crate::constants::SCIP_RESTORE_RETRY_INTERVAL_SECS_ENV, "1"),
+        ]);
+
+        let indexer = CSharpSymbolIndexer::new();
+        let err = indexer
+            .rebuild(dir.path(), &db, RebuildScope::Full)
+            .unwrap_err();
+
+        // Attempt 1 pends (flag set), attempt 2 fails generically: the
+        // surfaced error is the generic one (never the typed pending
+        // outcome) and the flag must not outlive the loop that set it.
+        assert!(
+            !is_restore_pending(&err),
+            "the generic failure must surface, got: {err:#}"
+        );
+        assert!(
+            !indexer.restore_pending(&db),
+            "the pending flag must be cleared when the retry loop ends on a non-pending failure"
         );
     }
 }

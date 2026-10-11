@@ -52,6 +52,26 @@ internal static class RestoreGate
             throw new RestorePendingException();
         }
     }
+
+    /// <summary>
+    /// Serve-startup refusal: returns
+    /// <see cref="ExitCodes.RestorePending"/> when a restore is in flight, so
+    /// the resident pool falls back to the one-shot path — a workspace loaded
+    /// mid-restore would have its find-refs answers CACHED by the host. Null
+    /// when the load may proceed. Exit-code form instead of throwing: a
+    /// resident process reports refusal as its exit status.
+    /// </summary>
+    public static int? ServeStartupPendingExit(string solutionPath)
+    {
+        if (RestorePendingMarker.IsActive(solutionPath))
+        {
+            Console.Error.WriteLine(
+                "[RESTORE-PENDING] a dotnet restore for this solution is already running — " +
+                "serve refuses to load the workspace; the pool will retry once it finishes.");
+            return ExitCodes.RestorePending;
+        }
+        return null;
+    }
 }
 
 /// <summary>

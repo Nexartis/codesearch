@@ -78,12 +78,9 @@ public static class Program
         // acceptance). Startup refuses so the pool falls back to the one-shot
         // path, which handles restore-pending explicitly. Reloads of an
         // ALREADY-RUNNING resident keep answering (gateRestorePending: false).
-        if (RestorePendingMarker.IsActive(parsed))
+        if (RestoreGate.ServeStartupPendingExit(parsed) is { } startupPendingExit)
         {
-            Console.Error.WriteLine(
-                "[RESTORE-PENDING] a dotnet restore for this solution is already running — " +
-                $"serve refuses to load the workspace; the pool will retry once it finishes.");
-            return ExitCodes.RestorePending;
+            return startupPendingExit;
         }
 
         using var workspace = CreateTolerantWorkspace();
