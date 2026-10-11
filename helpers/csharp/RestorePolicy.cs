@@ -29,6 +29,54 @@ public static class RestoreInputs
     };
 }
 
+/// <summary>
+/// End-of-life <c>netcoreapp</c> frameworks: a modern SDK can still build
+/// them, but the design-time workspace load cannot resolve their reference
+/// assemblies, and every type use cascades into CS0518 ("System.Object is
+/// not defined") — a tool-side gap, not a code-health signal. Projects
+/// targeting one of these prefixes are skipped with an [INFO] note instead
+/// of being compiled into warning noise. Compared case-insensitively;
+/// <c>netstandard2.0</c> libraries are deliberately NOT skipped (legitimately
+/// modern) and neither is anything on the supported <c>net</c> line.
+/// </summary>
+public static class SkippedFrameworks
+{
+    public static readonly string[] EndOfLifePrefixes =
+    {
+        "netcoreapp1", "netcoreapp2", "netcoreapp3",
+    };
+
+    public static bool IsEndOfLife(string targetFramework)
+    {
+        var tfm = targetFramework.Trim();
+        foreach (var prefix in EndOfLifePrefixes)
+        {
+            if (tfm.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// The first target framework from raw .csproj text — best effort:
+    /// conditional property groups are not evaluated, which is fine for a
+    /// skip-guard (a project whose FIRST target is EOL is exactly the one
+    /// whose load would cascade).
+    /// </summary>
+    public static string? ExtractFromProjectText(string projectText)
+    {
+        var match = System.Text.RegularExpressions.Regex.Match(
+            projectText, @"<TargetFrameworks?>([^<]+)</");
+        if (!match.Success)
+        {
+            return null;
+        }
+        return match.Groups[1].Value.Split(';')[0].Trim();
+    }
+}
+
 internal static class RestorePolicy
 {
     /// <summary>Env override for the restore kill timeout, in seconds.</summary>
@@ -120,6 +168,19 @@ internal static class RestorePolicy
             }
             dir = parent;
         }
+    }
+
+    /// <summary>
+    /// True when the project has an <c>obj/project.assets.json</c> at all:
+    /// after a FAILED restore this distinguishes "restore-failed but usable
+    /// existing assets" (index it; its compile errors are restore-caused)
+    /// from "nothing to compile against" (exclude the project entirely).
+    /// </summary>
+    public static bool HasUsableAssets(string projectRelativePath, string solutionDir)
+    {
+        var projectPath = Path.GetFullPath(Path.Combine(solutionDir, projectRelativePath));
+        var projectDir = Path.GetDirectoryName(projectPath) ?? solutionDir;
+        return File.Exists(Path.Combine(projectDir, "obj", "project.assets.json"));
     }
 
     private static bool PathsEqual(string left, string right) =>

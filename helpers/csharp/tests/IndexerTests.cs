@@ -254,6 +254,20 @@ public class ScipModelTests
         Assert.StartsWith("[WARN] Compilation errors in", warning);
     }
 
+    /// <summary>
+    /// A project whose own restore failed (dead package/feed) compiles
+    /// against stale assets: its diagnostics are restore-caused and must be
+    /// reported as [INFO] — they must not drive the warning icon for what is
+    /// not a code-health problem.
+    /// </summary>
+    [Fact]
+    public void SelectMarkerDowngradesRestoreFailedProjectsToInfo()
+    {
+        Assert.Equal("[WARN] ", SymbolIndexer.SelectMarker(GeneratorRunOutcome.Ran, restoreFailed: false));
+        Assert.Equal("[INFO] ", SymbolIndexer.SelectMarker(GeneratorRunOutcome.Failed, restoreFailed: false));
+        Assert.Equal("[INFO] ", SymbolIndexer.SelectMarker(GeneratorRunOutcome.Ran, restoreFailed: true));
+    }
+
     /// The specimen is capped: a full Roslyn diagnostic string can run
     /// hundreds of chars, and the warnings channel caps the whole list.
     [Fact]

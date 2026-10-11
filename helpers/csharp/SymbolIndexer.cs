@@ -10,7 +10,10 @@ namespace ScipCsharp;
 /// </summary>
 public sealed class SymbolIndexer
 {
-    public async Task<ScipIndex> IndexAsync(MSBuildWorkspace workspace, string? projectFilter)
+    public async Task<ScipIndex> IndexAsync(
+        MSBuildWorkspace workspace,
+        string? projectFilter,
+        IReadOnlyCollection<string>? restoreFailedProjects = null)
     {
         var index = new ScipIndex();
         var solution = workspace.CurrentSolution;
@@ -81,8 +84,14 @@ public sealed class SymbolIndexer
                 // A failed generator run is a tool-side gap the user cannot
                 // fix, so its leftover errors (the CS0103/CS0115 Razor
                 // cascades) are downgraded to [INFO] — they must not land in
-                // the index warnings as a "fix your build" claim.
-                var marker = generatorOutcome == GeneratorRunOutcome.Failed ? "[INFO] " : "[WARN] ";
+                // the index warnings as a "fix your build" claim. The same
+                // applies to a project whose own restore failed: its
+                // diagnostics are restore-caused (dead package/feed), and the
+                // existing assets it compiles against say nothing about code
+                // health.
+                var marker = SelectMarker(
+                    generatorOutcome,
+                    restoreFailedProjects?.Contains(project.Name) == true);
                 erroringProjects.Add((diagnostics.Count,
                     WarningLineFor(project.Name, diagnostics, marker)));
             }
@@ -186,9 +195,12 @@ public sealed class SymbolIndexer
     /// The channel-emittable form. The `[WARN] ` prefix is LOAD-BEARING:
     /// the Rust capture (`is_helper_warning_line`) keys on it, so a dropped
     /// prefix does not flood the channel — it silently empties it. The
-    /// `[INFO] ` variant is for tool-side gaps (generator pipeline failed)
-    /// that must NOT enter the warnings channel.
+    /// `[INFO] ` variant is for tool-side gaps (generator pipeline failed,
+    /// restore-caused diagnostics) that must NOT enter the warnings channel.
     /// </summary>
+    internal static string SelectMarker(GeneratorRunOutcome generatorOutcome, bool restoreFailed) =>
+        generatorOutcome == GeneratorRunOutcome.Failed || restoreFailed ? "[INFO] " : "[WARN] ";
+
     internal static string WarningLineFor(string project, IReadOnlyList<Diagnostic> errors) =>
         "[WARN] " + CompilationErrorSummaryLine(project, errors);
 

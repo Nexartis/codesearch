@@ -219,7 +219,7 @@ public static class Program
         }
 
         var indexer = new SymbolIndexer();
-        var index = await indexer.IndexAsync(workspace, parsed.Value.ProjectFilter).ConfigureAwait(false);
+        var index = await indexer.IndexAsync(workspace, parsed.Value.ProjectFilter, RestoreFailedProjects).ConfigureAwait(false);
 
         await OutputWriter.WriteAsync(index, parsed.Value.OutputPath).ConfigureAwait(false);
 
@@ -403,18 +403,47 @@ public static class Program
         return workspace;
     }
 
+    /// A project whose own restore failed during the per-project fallback.
+    /// With usable existing assets it is still indexed — its compilation
+    /// diagnostics are restore-caused (reported as [INFO], never driving the
+    /// warning icon); without assets it is excluded from the load entirely.
+    private sealed record ProjectRestoreFailure(string ProjectName, string RelativePath, string FirstError);
+
+    private static readonly IReadOnlyCollection<string> NoRestoreFailures = Array.Empty<string>();
+
+    /// <summary>
+    /// Restore-failed project NAMES of the most recent workspace load: the
+    /// command runner hands them to <see cref="SymbolIndexer.IndexAsync"/> so
+    /// their compilation diagnostics are classified restore-caused ([INFO])
+    /// instead of code-health warnings. Reset on every load (including serve
+    /// reloads).
+    /// </summary>
+    internal static IReadOnlyCollection<string> RestoreFailedProjects { get; private set; } = NoRestoreFailures;
+
     /// <summary>
     /// Restores the solution before the design-time load. MSBuildWorkspace
     /// does not restore: with stale or missing obj/project.assets.json,
     /// package-typed references fail to resolve and the load drowns in CS0246
     /// cascades even though `dotnet build` (which restores first) succeeds.
-    /// Gated by <see cref="RestorePolicy.NeedsRestore"/>; best effort: a
-    /// failed or missing `dotnet` is logged and the load proceeds — degraded
-    /// indexing beats no indexing. The wait is bounded, but the restore is
-    /// never killed: on timeout it continues in the background and the next
-    /// reindex picks up the fresh assets.
+    /// Gated by <see cref="RestorePolicy.NeedsRestore"/>.
+    ///
+    /// Restore is the ONLY all-or-nothing step in NuGet: one unresolvable
+    /// package anywhere fails the solution restore for EVERY project. That
+    /// is why a failing solution restore falls back to per-project restores:
+    /// each project that succeeds gets fresh assets and is indexed fully;
+    /// each project that fails keeps its existing (usable) assets and is
+    /// reported as a restore-caused caveat instead of drowning the index in
+    /// unrelated CS noise. Best effort throughout: a failed or missing
+    /// `dotnet` is logged and the load proceeds. The wait is bounded, but a
+    /// running restore is never killed: on timeout it continues in the
+    /// background and the next reindex picks up the fresh assets.
     /// </summary>
-    private static void RestoreSolution(string solutionPath, bool gateRestorePending)
+    /// <returns>The per-project failures from the fallback (empty when the
+    /// solution-level restore succeeded or nothing needed restoring).</returns>
+    private static List<ProjectRestoreFailure> RestoreSolution(
+        string solutionPath,
+        bool gateRestorePending,
+        List<(int LineIndex, string RelativePath)> loadable)
     {
         var timeoutSeconds = RestorePolicy.RestoreTimeoutSeconds();
         // Never start a second restore while one is already running for this
@@ -433,7 +462,7 @@ public static class Program
             Console.Error.WriteLine(
                 "[WARN] a dotnet restore for this solution is already running — serve reload " +
                 "keeps answering from the existing workspace until it finishes.");
-            return;
+            return [];
         }
         try
         {
@@ -450,7 +479,7 @@ public static class Program
             using var process = Process.Start(psi);
             if (process is null)
             {
-                return;
+                return [];
             }
             // Drain both pipes in the background: the child inherits these
             // handles, so without readers a chatty restore could block on a
@@ -483,21 +512,48 @@ public static class Program
                     throw new RestorePendingException();
                 }
                 Console.Error.WriteLine(RestorePolicy.StillRunningWarning(timeoutSeconds));
-                return;
+                return [];
             }
-            if (process.ExitCode != 0)
+            if (process.ExitCode == 0)
             {
-                // A restore that itself failed is NOT pending: the gate must
-                // not wait on a restore that will never succeed — today's
-                // degraded-with-warning behaviour stays. The restore's own
-                // error lines ride along, or the operator sees only the
-                // symptom (unresolved packages) without the cause.
-                var stderr = stderrDrain.GetAwaiter().GetResult();
-                Console.Error.WriteLine(
-                    $"[WARN] dotnet restore itself failed (exit {process.ExitCode}) for '{solutionPath}' — " +
-                    "continuing with a degraded index; package references may be unresolved." +
-                    RestorePolicy.ExtractRestoreErrors(stderr));
+                return [];
             }
+            var stderr = stderrDrain.GetAwaiter().GetResult();
+            var nuDetail = RestorePolicy.ExtractRestoreErrors(stderr);
+            var fallback = RestorePerProjectFallback(
+                solutionPath, solutionDir: Path.GetDirectoryName(solutionPath) ?? ".",
+                loadable, timeoutSeconds, gateRestorePending);
+            var restoredCount = loadable.Count - fallback.Count;
+            var header =
+                $"dotnet restore failed (exit {process.ExitCode}) for '{solutionPath}' — " +
+                $"per-project restore recovered {restoredCount}/{loadable.Count} project(s)." +
+                nuDetail;
+            if (fallback.Count == 0)
+            {
+                Console.Error.WriteLine($"[INFO] {header}");
+            }
+            else if (restoredCount == 0)
+            {
+                // Nothing recovered: this is a real, solution-wide problem
+                // the operator must see as a warning, not a caveat.
+                Console.Error.WriteLine(
+                    "[WARN] " + header +
+                    " Every project failed its own restore; continuing with a degraded index.");
+            }
+            else
+            {
+                // At least part of the solution recovered: the remaining
+                // failures are confined to their projects and are reported
+                // per project below — not as a solution-wide warning.
+                Console.Error.WriteLine($"[INFO] {header}");
+                foreach (var failure in fallback)
+                {
+                    Console.Error.WriteLine(
+                        $"[INFO] {failure.ProjectName}: restore failed — indexed from existing " +
+                        $"assets; its compile diagnostics are restore-caused. {failure.FirstError}");
+                }
+            }
+            return fallback;
         }
         catch (RestorePendingException)
         {
@@ -507,7 +563,114 @@ public static class Program
         {
             Console.Error.WriteLine(
                 $"[WARN] dotnet restore could not start ({ex.GetType().Name}: {ex.Message}) — continuing without it.");
+            return [];
         }
+    }
+
+    /// <summary>
+    /// The per-project fallback after a failed solution restore: NuGet is
+    /// all-or-nothing per restore, so one dead package fails every project —
+    /// but most projects restore fine on their own. Same bounded-wait rules
+    /// as the solution restore: a project restore that outlives the remaining
+    /// deadline is recorded as pending (gated commands refuse) and never
+    /// killed; the overall deadline keeps the fallback from multiplying the
+    /// solution timeout by the project count.
+    /// </summary>
+    private static List<ProjectRestoreFailure> RestorePerProjectFallback(
+        string solutionPath,
+        string solutionDir,
+        List<(int LineIndex, string RelativePath)> loadable,
+        int timeoutSeconds,
+        bool gateRestorePending)
+    {
+        var failures = new List<ProjectRestoreFailure>();
+        var deadline = DateTime.UtcNow.AddSeconds(timeoutSeconds);
+        for (var i = 0; i < loadable.Count; i++)
+        {
+            var entry = loadable[i];
+            var remainingMs = (int)(deadline - DateTime.UtcNow).TotalMilliseconds;
+            if (remainingMs <= 0)
+            {
+                // Budget spent: never-attempted projects must be classified
+                // as failures too — their stale-asset diagnostics are exactly
+                // as restore-caused as an explicit NU1101, and counting them
+                // as "recovered" would re-apply the warning icon to noise.
+                // They are retried on the next reindex.
+                Console.Error.WriteLine(
+                    "[INFO] per-project restore budget exhausted; remaining project(s) keep their " +
+                    "existing assets and are retried on the next reindex.");
+                failures.AddRange(loadable.Skip(i).Select(e => new ProjectRestoreFailure(
+                    Path.GetFileNameWithoutExtension(e.RelativePath),
+                    e.RelativePath,
+                    "not attempted — per-project restore budget exhausted")));
+                break;
+            }
+            var projectPath = Path.GetFullPath(Path.Combine(solutionDir, entry.RelativePath));
+            try
+            {
+                var psi = new ProcessStartInfo
+                {
+                    FileName = "dotnet",
+                    Arguments = $"restore \"{projectPath}\" --nologo -v q --ignore-failed-sources",
+                    RedirectStandardError = true,
+                    RedirectStandardOutput = true,
+                    UseShellExecute = false,
+                };
+                using var process = Process.Start(psi);
+                if (process is null)
+                {
+                    failures.Add(new ProjectRestoreFailure(
+                        Path.GetFileNameWithoutExtension(entry.RelativePath),
+                        entry.RelativePath,
+                        "dotnet could not be started"));
+                    continue;
+                }
+                _ = process.StandardOutput.ReadToEndAsync();
+                var stderrDrain = process.StandardError.ReadToEndAsync();
+                if (!process.WaitForExit(remainingMs))
+                {
+                    RestorePendingMarker.Write(
+                        solutionPath, process.Id, process.StartTime.ToUniversalTime());
+                    if (gateRestorePending)
+                    {
+                        Console.Error.WriteLine(
+                            $"[RESTORE-PENDING] per-project restore of '{entry.RelativePath}' is still " +
+                            $"running — exiting {ExitCodes.RestorePending} without building an index; " +
+                            "retry when it finishes.");
+                        throw new RestorePendingException();
+                    }
+                    Console.Error.WriteLine(RestorePolicy.StillRunningWarning(timeoutSeconds));
+                    failures.AddRange(loadable.Skip(i).Select(e => new ProjectRestoreFailure(
+                        Path.GetFileNameWithoutExtension(e.RelativePath),
+                        e.RelativePath,
+                        "not attempted — a per-project restore is still running (budget exhausted)")));
+                    break;
+                }
+                if (process.ExitCode != 0)
+                {
+                    failures.Add(new ProjectRestoreFailure(
+                        Path.GetFileNameWithoutExtension(entry.RelativePath),
+                        entry.RelativePath,
+                        RestorePolicy.ExtractRestoreErrors(stderrDrain.GetAwaiter().GetResult())
+                            .Replace(" Restore output: ", "").Trim()));
+                }
+            }
+            catch (RestorePendingException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine(
+                    $"[INFO] per-project restore could not start for '{entry.RelativePath}' " +
+                    $"({ex.GetType().Name}: {ex.Message}).");
+                failures.Add(new ProjectRestoreFailure(
+                    Path.GetFileNameWithoutExtension(entry.RelativePath),
+                    entry.RelativePath,
+                    $"could not start ({ex.GetType().Name})"));
+            }
+        }
+        return failures;
     }
 
     // ── Solution filtering ───────────────────────────────────────────
@@ -539,6 +702,45 @@ public static class Program
             .Where(p => UnsupportedProjectExtensions.Contains(Path.GetExtension(p.RelativePath)))
             .ToList();
 
+        // End-of-life frameworks (netcoreapp 1–3): a modern SDK builds them,
+        // but the design-time load cannot resolve their reference assemblies
+        // and every type use cascades into CS0518 — tool-side noise, not code
+        // health. Skipped with an [INFO] note; never restored (we will not
+        // compile them).
+        var loadable = new List<(int LineIndex, string RelativePath)>();
+        var eolSkipped = new List<(int LineIndex, string RelativePath, string Tfm)>();
+        foreach (var entry in supported)
+        {
+            var projectPath = Path.GetFullPath(Path.Combine(solutionDir, entry.RelativePath));
+            string? tfm = null;
+            try
+            {
+                if (File.Exists(projectPath))
+                {
+                    tfm = SkippedFrameworks.ExtractFromProjectText(File.ReadAllText(projectPath));
+                }
+            }
+            catch (Exception)
+            {
+                // Unreadable csproj: let the workspace load surface the real
+                // problem instead of guessing here.
+            }
+            if (tfm is not null && SkippedFrameworks.IsEndOfLife(tfm))
+            {
+                eolSkipped.Add((entry.LineIndex, entry.RelativePath, tfm));
+            }
+            else
+            {
+                loadable.Add(entry);
+            }
+        }
+        if (eolSkipped.Count > 0)
+        {
+            Console.Error.WriteLine(
+                $"[INFO] Skipping {eolSkipped.Count} project(s) with end-of-life frameworks " +
+                $"(not indexed): {string.Join(", ", eolSkipped.Select(e => $"{e.RelativePath} ({e.Tfm})"))}");
+        }
+
         // Restore only when the evidence says assets are missing or stale: the
         // design-time build below does not restore, and missing package assets
         // cascade into CS0246 noise that would otherwise pin the repo's index
@@ -554,9 +756,29 @@ public static class Program
         {
             RestoreGate.ThrowIfRestorePending(solutionPath);
         }
-        if (RestorePolicy.NeedsRestore(supported.Select(p => p.RelativePath), solutionDir))
+        RestoreFailedProjects = NoRestoreFailures;
+        var restoreFailures = new List<ProjectRestoreFailure>();
+        if (RestorePolicy.NeedsRestore(loadable.Select(p => p.RelativePath), solutionDir))
         {
-            RestoreSolution(solutionPath, gateRestorePending);
+            restoreFailures = RestoreSolution(solutionPath, gateRestorePending, loadable);
+        }
+
+        // Restore-failed projects fall in two classes: with usable existing
+        // assets they are indexed but their compile diagnostics are
+        // restore-caused ([INFO], never the warning icon); without any assets
+        // there is nothing to compile against and they are excluded outright.
+        var noAssets = restoreFailures
+            .Where(f => !RestorePolicy.HasUsableAssets(f.RelativePath, solutionDir))
+            .ToList();
+        RestoreFailedProjects = restoreFailures
+            .Except(noAssets)
+            .Select(f => f.ProjectName)
+            .ToArray();
+        if (noAssets.Count > 0)
+        {
+            Console.Error.WriteLine(
+                $"[INFO] Excluding {noAssets.Count} project(s) with no usable package assets " +
+                $"(not indexed): {string.Join(", ", noAssets.Select(f => f.RelativePath))}");
         }
 
         // Log skipped projects
@@ -565,15 +787,22 @@ public static class Program
             Console.Error.WriteLine($"[INFO] Skipping unsupported project type: {skip.RelativePath}");
         }
 
-        if (supported.Count == 0)
+        if (loadable.Count == noAssets.Count)
         {
             throw new InvalidOperationException(
-                $"Solution contains no supported project types " +
-                $"(found {unsupported.Count} unsupported: {string.Join(", ", unsupported.Select(u => u.RelativePath))})");
+                $"No project of the solution can be indexed " +
+                $"({noAssets.Count} failed restore with no existing assets, " +
+                $"{eolSkipped.Count} end-of-life frameworks, {unsupported.Count} unsupported types)");
         }
 
-        // Try opening the filtered solution first
-        var skipIndices = unsupported.Select(u => u.LineIndex).ToHashSet();
+        // Try opening the filtered solution first: unsupported types,
+        // end-of-life frameworks and restore-failed projects without assets
+        // are all excluded — the workspace must never see them.
+        var excludedPaths = noAssets.Select(f => f.RelativePath).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var skipIndices = unsupported.Select(u => u.LineIndex)
+            .Concat(eolSkipped.Select(e => e.LineIndex))
+            .Concat(loadable.Where(l => excludedPaths.Contains(l.RelativePath)).Select(l => l.LineIndex))
+            .ToHashSet();
         var filteredContent = BuildFilteredSolution(lines, skipIndices);
         var tempSlnName = $"{Path.GetFileNameWithoutExtension(solutionPath)}-filtered-{Guid.NewGuid():N}.sln";
         var tempSlnPath = Path.Combine(solutionDir, tempSlnName);
@@ -589,20 +818,26 @@ public static class Program
         {
             Console.Error.WriteLine(
                 $"[WARN] Filtered solution still failed ({ex.GetType().Name}: {ex.Message}); " +
-                $"falling back to loading {supported.Count} individual .csproj files.");
+                $"falling back to loading {loadable.Count - noAssets.Count} individual .csproj files.");
         }
         finally
         {
             try { File.Delete(tempSlnPath); } catch { /* best effort */ }
         }
 
-        // Fallback: open each supported .csproj individually.
+        // Fallback: open each loadable .csproj individually (never the EOL or
+        // no-assets exclusions — the workspace must not see them here either).
         // CloseSolution() clears any partially-loaded projects from the failed solution attempt.
         workspace.CloseSolution();
         var loaded = 0;
-        foreach (var entry in supported)
+        foreach (var entry in loadable)
         {
             var csprojPath = Path.GetFullPath(Path.Combine(solutionDir, entry.RelativePath));
+
+            if (excludedPaths.Contains(entry.RelativePath))
+            {
+                continue;
+            }
 
             // Defense-in-depth: verify containment even though parsing already validates.
             if (!IsPathWithinRoot(csprojPath, solutionDir))

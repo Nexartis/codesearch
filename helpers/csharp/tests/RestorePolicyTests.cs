@@ -187,6 +187,47 @@ public class RestorePolicyTests : IDisposable
         Assert.Equal(string.Empty, RestorePolicy.ExtractRestoreErrors("only warnings\nand info"));
     }
 
+    /// <summary>
+    /// The skip-guard must hit exactly the dead netcoreapp line: a legacy
+    /// 2.2 project design-time-loads into a CS0518 cascade on a modern SDK
+    /// (tool-side gap, not code health), while netstandard libraries and the
+    /// supported net line stay untouched.
+    /// </summary>
+    [Fact]
+    public void EndOfLifeFrameworkClassificationTable()
+    {
+        Assert.True(SkippedFrameworks.IsEndOfLife("netcoreapp2.2"));
+        Assert.True(SkippedFrameworks.IsEndOfLife("netcoreapp2.0"));
+        Assert.True(SkippedFrameworks.IsEndOfLife("netcoreapp3.1"));
+        Assert.True(SkippedFrameworks.IsEndOfLife(" NetCoreApp2.2 "));
+
+        Assert.False(SkippedFrameworks.IsEndOfLife("net10.0"));
+        Assert.False(SkippedFrameworks.IsEndOfLife("net48"));
+        Assert.False(SkippedFrameworks.IsEndOfLife("netstandard2.0"));
+        Assert.False(SkippedFrameworks.IsEndOfLife("netcoreapp"));
+    }
+
+    [Fact]
+    public void TargetFrameworkExtractionFromProjectText()
+    {
+        Assert.Equal("netcoreapp2.2", SkippedFrameworks.ExtractFromProjectText(
+            "<Project><PropertyGroup><TargetFramework>netcoreapp2.2</TargetFramework></PropertyGroup></Project>"));
+        // Multi-target: the FIRST target decides (the one design-time uses).
+        Assert.Equal("net10.0", SkippedFrameworks.ExtractFromProjectText(
+            "<TargetFrameworks>net10.0;netstandard2.0</TargetFrameworks>"));
+        Assert.Null(SkippedFrameworks.ExtractFromProjectText("<Project></Project>"));
+    }
+
+    [Fact]
+    public void HasUsableAssetsFollowsTheAssetsFile()
+    {
+        AddProject(@"src\Acme.Core\Acme.Core.csproj", withAssets: true);
+        Assert.True(RestorePolicy.HasUsableAssets(@"src\Acme.Core\Acme.Core.csproj", _solutionDir));
+
+        AddProject(@"src\Acme.Bare\Acme.Bare.csproj", withAssets: false);
+        Assert.False(RestorePolicy.HasUsableAssets(@"src\Acme.Bare\Acme.Bare.csproj", _solutionDir));
+    }
+
     [Fact]
     public void UntouchedPackagesPropsKeepsRestoreSkipped()
     {
