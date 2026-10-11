@@ -129,6 +129,30 @@ internal static class RestorePolicy
             StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
+    /// The diagnostic kernel of a failed restore — up to three "error" lines
+    /// (NU11xx feed/resolution failures tell the operator WHAT to fix, e.g.
+    /// an unreachable private feed), each capped at 160 chars, joined for the
+    /// single [WARN] line. The restore's own output is otherwise discarded.
+    /// </summary>
+    public static string ExtractRestoreErrors(string restoreOutput)
+    {
+        if (string.IsNullOrWhiteSpace(restoreOutput))
+        {
+            return string.Empty;
+        }
+        var errors = restoreOutput
+            .Split('\n')
+            .Select(l => l.TrimEnd('\r'))
+            .Where(l => l.Contains("error", StringComparison.OrdinalIgnoreCase))
+            .Select(l => l.Length > 160 ? l[..157] + "..." : l)
+            .Take(3)
+            .ToList();
+        return errors.Count == 0
+            ? string.Empty
+            : " Restore output: " + string.Join(" | ", errors);
+    }
+
+    /// <summary>
     /// Restore wait timeout in seconds: <c>CODESEARCH_RESTORE_TIMEOUT_SECS</c>
     /// when set to a positive integer, otherwise 300. Unparseable values fall
     /// back to the default rather than failing the load.

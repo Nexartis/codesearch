@@ -61,6 +61,19 @@ pub(crate) fn is_helper_warning_line(line: &str) -> bool {
     line.contains("[WARN]") || line.contains("[Failure]")
 }
 
+/// The version token out of the helper's `--version` line
+/// ("scip-csharp 1.5.4" → "1.5.4"); anything unparseable → "unknown", which
+/// still logs (as a mismatch against the host version) instead of silently
+/// skipping the startup entry.
+pub(super) fn parse_helper_version(version_line: &str) -> String {
+    version_line
+        .split_whitespace()
+        .last()
+        .filter(|tok| tok.chars().next().is_some_and(|c| c.is_ascii_digit()))
+        .unwrap_or("unknown")
+        .to_string()
+}
+
 /// Cap a line at `max` chars, cutting at the last whitespace inside the
 /// budget when there is one: a mid-word cut makes compilation-error
 /// specimens (the quoted CS0103 name) unreadable. A single token longer
@@ -548,7 +561,49 @@ impl CSharpSymbolIndexer {
         let resolved = self.resolve_helper_path();
         let mut lock = self.helper_path.lock().unwrap();
         *lock = Some(resolved.clone()); // cache both Some and None
+        if let Some(ref path) = resolved {
+            self.log_helper_version_once(path);
+        }
         resolved
+    }
+
+    /// Logs the resolved helper's self-reported version exactly once per
+    /// process. The mismatch class — a deployed helper older than the host
+    /// that spawns it, answering with pre-gate behaviour — is otherwise
+    /// invisible: the paths look right and every warning reads as a repo
+    /// problem. A mismatch is a WARNING, not a refusal: an old helper still
+    /// indexes, just without the current guarantees.
+    fn log_helper_version_once(&self, helper: &Path) {
+        static LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        if LOGGED.set(()).is_err() {
+            return;
+        }
+        let version = std::process::Command::new(helper)
+            .arg("--version")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| parse_helper_version(&String::from_utf8_lossy(&o.stdout)))
+            .unwrap_or_else(|| "unknown".to_string());
+        let host = env!("CARGO_PKG_VERSION");
+        if version == host {
+            tracing::info!(
+                "scip-csharp helper v{} at {} (matches codesearch v{})",
+                version,
+                helper.display(),
+                host
+            );
+        } else {
+            tracing::warn!(
+                "scip-csharp helper reports v{} at {} but codesearch is v{} — \
+                 redeploy (copy-to-common.ps1) or point {} at the matching helper; \
+                 behaviour may predate the current restore gate",
+                version,
+                helper.display(),
+                host,
+                HELPER_ENV_VAR
+            );
+        }
     }
 
     /// Writes the rebuild bookkeeping shared by every scope (full and
@@ -2757,6 +2812,10 @@ mod tests {
         std::process::exit(75);
     }
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--version") {
+        println!("scip-csharp 0.0.0-fake");
+        return;
+    }
     if args.get(1).map(String::as_str) == Some("serve") {
         return;
     }

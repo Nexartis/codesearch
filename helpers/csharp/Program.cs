@@ -45,6 +45,14 @@ public static class Program
             return 0;
         }
 
+        if (args[0] is "--version" or "version")
+        {
+            // The deployed helper's identity: the host logs it at startup so
+            // a stale helper (deployed before its host) is visible.
+            Console.WriteLine($"scip-csharp {GetHelperVersion()}");
+            return 0;
+        }
+
         return args[0] switch
         {
             "index" => await RunIndexAsync(args[1..]).ConfigureAwait(false),
@@ -53,6 +61,14 @@ public static class Program
             "serve" => await RunServeAsync(args[1..]).ConfigureAwait(false),
             _ => await UnknownCommand(args[0]).ConfigureAwait(false),
         };
+    }
+
+    /// <summary>Major.Minor.Build from the assembly — the csproj Version,
+    /// kept in sync with the crate by scripts/bump-version.sh.</summary>
+    internal static string GetHelperVersion()
+    {
+        var version = System.Reflection.Assembly.GetEntryAssembly()?.GetName().Version;
+        return version is null ? "unknown" : $"{version.Major}.{version.Minor}.{version.Build}";
     }
 
     /// <summary>
@@ -438,9 +454,12 @@ public static class Program
             }
             // Drain both pipes in the background: the child inherits these
             // handles, so without readers a chatty restore could block on a
-            // full pipe, and the serve process reads stderr until EOF.
-            _ = process.StandardOutput.ReadToEndAsync();
-            _ = process.StandardError.ReadToEndAsync();
+            // full pipe, and the serve process reads stderr until EOF. The
+            // captured stderr feeds the failure diagnostic below — a failed
+            // restore without its NU11xx reason (unreachable private feed)
+            // just reads as unexplained CS0518/CS0246 noise downstream.
+            var stdoutDrain = process.StandardOutput.ReadToEndAsync();
+            var stderrDrain = process.StandardError.ReadToEndAsync();
             // Bounded WAIT, never a kill: a killed restore wastes all of its
             // work and leaves assets missing, so every reindex would pay the
             // same wait and stay degraded. On timeout the restore keeps
@@ -470,10 +489,14 @@ public static class Program
             {
                 // A restore that itself failed is NOT pending: the gate must
                 // not wait on a restore that will never succeed — today's
-                // degraded-with-warning behaviour stays.
+                // degraded-with-warning behaviour stays. The restore's own
+                // error lines ride along, or the operator sees only the
+                // symptom (unresolved packages) without the cause.
+                var stderr = stderrDrain.GetAwaiter().GetResult();
                 Console.Error.WriteLine(
                     $"[WARN] dotnet restore itself failed (exit {process.ExitCode}) for '{solutionPath}' — " +
-                    "continuing with a degraded index; package references may be unresolved.");
+                    "continuing with a degraded index; package references may be unresolved." +
+                    RestorePolicy.ExtractRestoreErrors(stderr));
             }
         }
         catch (RestorePendingException)

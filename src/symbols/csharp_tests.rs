@@ -417,6 +417,25 @@ fn extract_simple_name_strips_fqn_parameters_before_segmenting() {
 // ── Restore-pending gate (issue #225) ────────────────────────────────
 
 #[test]
+fn helper_version_line_parses_to_the_version_token() {
+    use super::csharp::parse_helper_version;
+
+    let cases = [
+        ("scip-csharp 1.5.4", "1.5.4"),
+        ("scip-csharp 0.0.0-fake", "0.0.0-fake"),
+        ("scip-csharp 1.5.4+1352", "1.5.4+1352"),
+        // Unparseable → "unknown": the startup entry still logs (as a
+        // mismatch) instead of silently skipping.
+        ("", "unknown"),
+        ("garbage", "unknown"),
+        ("scip-csharp", "unknown"),
+    ];
+    for (line, expected) in cases {
+        assert_eq!(parse_helper_version(line), expected, "line: {line:?}");
+    }
+}
+
+#[test]
 fn restore_pending_error_downcasts_from_anyhow() {
     let pending = anyhow::Error::new(RestorePendingError);
     assert!(is_restore_pending(&pending));

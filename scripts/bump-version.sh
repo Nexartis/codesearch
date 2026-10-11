@@ -89,6 +89,15 @@ sed -i "0,/^version = \"$CURRENT\"/s//version = \"$NEW_VERSION\"/" "$CARGO_TOML"
 # Keep Cargo.lock in sync
 cargo update --workspace --quiet 2>/dev/null || true
 
+# ── Update scip-csharp csproj ────────────────────────────────────────────────
+# The helper's <Version> feeds its `--version` line — the identity the host
+# logs at startup and copy-to-common compares, so it must move with the crate.
+CSPROJ="helpers/csharp/scip-csharp.csproj"
+if [[ -f "$CSPROJ" ]]; then
+    echo -e "${CYAN}→ Updating $CSPROJ...${NC}"
+    sed -i "0,/<Version>$CURRENT<\/Version>/s//<Version>$NEW_VERSION<\/Version>/" "$CSPROJ"
+fi
+
 # ── Update AGENTS.md ─────────────────────────────────────────────────────────
 echo -e "${CYAN}→ Updating AGENTS.md...${NC}"
 TODAY=$(date +%Y-%m-%d)
