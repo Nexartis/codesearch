@@ -18,4 +18,17 @@ internal static class WorkspaceNoise
         message is not null
         && message.Contains("has a known", StringComparison.OrdinalIgnoreCase)
         && message.Contains("vulnerability", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// True when a workspace-failure diagnostic is a NuGet package-version
+    /// mismatch ("Dependency specified was 'X (&gt;= A)' but ended up with
+    /// 'X B'"): the affected project still loads and its symbol tree is
+    /// complete, so nothing here means "find-impact may miss symbols" — the
+    /// build owner settles the pin, and the index must not carry the noise.
+    /// Pure and null-tolerant so it is unit-testable.
+    /// </summary>
+    public static bool IsPackageVersionConflict(string? message) =>
+        message is not null
+        && message.Contains("Dependency specified was", StringComparison.OrdinalIgnoreCase)
+        && message.Contains("ended up with", StringComparison.OrdinalIgnoreCase);
 }

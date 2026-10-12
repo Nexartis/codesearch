@@ -219,7 +219,7 @@ public static class Program
         }
 
         var indexer = new SymbolIndexer();
-        var index = await indexer.IndexAsync(workspace, parsed.Value.ProjectFilter, RestoreFailedProjects).ConfigureAwait(false);
+        var index = await indexer.IndexAsync(workspace, parsed.Value.ProjectFilter).ConfigureAwait(false);
 
         await OutputWriter.WriteAsync(index, parsed.Value.OutputPath).ConfigureAwait(false);
 
@@ -398,6 +398,16 @@ public static class Program
             {
                 return;
             }
+            // A NuGet package-version mismatch ("Dependency specified was X
+            // (>= A) but ended up with X B") also surfaces as an Msbuild
+            // "failure", but the affected project still loads and its symbol
+            // tree is complete — build engineering settles the pin; the
+            // index must not carry the noise as a warning.
+            if (WorkspaceNoise.IsPackageVersionConflict(e.Diagnostic?.Message))
+            {
+                Console.Error.WriteLine($"[INFO] Workspace note: {e.Diagnostic}");
+                return;
+            }
             Console.Error.WriteLine($"[WARN] Workspace error: {e.Diagnostic}");
         };
         return workspace;
@@ -408,17 +418,6 @@ public static class Program
     /// diagnostics are restore-caused (reported as [INFO], never driving the
     /// warning icon); without assets it is excluded from the load entirely.
     private sealed record ProjectRestoreFailure(string ProjectName, string RelativePath, string FirstError);
-
-    private static readonly IReadOnlyCollection<string> NoRestoreFailures = Array.Empty<string>();
-
-    /// <summary>
-    /// Restore-failed project NAMES of the most recent workspace load: the
-    /// command runner hands them to <see cref="SymbolIndexer.IndexAsync"/> so
-    /// their compilation diagnostics are classified restore-caused ([INFO])
-    /// instead of code-health warnings. Reset on every load (including serve
-    /// reloads).
-    /// </summary>
-    internal static IReadOnlyCollection<string> RestoreFailedProjects { get; private set; } = NoRestoreFailures;
 
     /// <summary>
     /// Restores the solution before the design-time load. MSBuildWorkspace
@@ -764,16 +763,12 @@ public static class Program
         }
 
         // Restore-failed projects fall in two classes: with usable existing
-        // assets they are indexed but their compile diagnostics are
-        // restore-caused ([INFO], never the warning icon); without any assets
+        // assets they are indexed as usual — their compile diagnostics are
+        // code-health ([INFO], never the warning icon); without any assets
         // there is nothing to compile against and they are excluded outright.
         var noAssets = restoreFailures
             .Where(f => !RestorePolicy.HasUsableAssets(f.RelativePath, solutionDir))
             .ToList();
-        RestoreFailedProjects = restoreFailures
-            .Except(noAssets)
-            .Select(f => f.ProjectName)
-            .ToArray();
         if (noAssets.Count > 0)
         {
             Console.Error.WriteLine(
