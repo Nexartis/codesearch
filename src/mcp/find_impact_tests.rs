@@ -953,6 +953,75 @@ async fn never_built_index_warns_on_the_empty_answer() {
     );
 }
 
+/// A POSITION query that misses the index must answer a loud typed failure,
+/// never the empty-references shape: an agent copying (file, line) from a
+/// `find` result on a stale index read the silent empty answer as "zero
+/// callers" (observed live: a method with 8 call sites "had" 0 because the
+/// position query missed by a line convention drift). Name queries keep the
+/// historical empty answer.
+#[tokio::test]
+#[serial_test::serial]
+async fn position_miss_answers_loud_failure_not_empty_references() {
+    let helper_root = tempfile::tempdir().unwrap();
+    let _guard = make_helper_available(&helper_root);
+    let (service, project) = build_service();
+    let db = project.path().join(".codesearch.db");
+    let (_warned_key, clean_key) = populate_warnings_fixture(&db);
+    // Index-level warnings must ride on the FAILURE shape too — a position
+    // miss from a partially loaded index must not hide that the whole
+    // index's answers may be incomplete.
+    write_index_warnings_meta(
+        &db,
+        &["The symbol index was built while the C# workspace reported 2 distinct failure(s) — cross-project references may be missing from every answer."
+            .to_string()],
+    );
+
+    // A real position index with one entry: a miss below is genuinely
+    // "nothing at that position", not a missing DB.
+    {
+        let env = crate::symbols::get_shared_scip_env(&db).expect("shared env");
+        let mut wtxn = env.write_txn().expect("wtxn");
+        let positions: heed::Database<heed::types::Str, heed::types::Bytes> = env
+            .create_database(&mut wtxn, Some(crate::constants::SCIP_POSITION_DB_NAME))
+            .unwrap();
+        let mut entry = vec![1u8];
+        entry.extend_from_slice(&bincode::serialize(&vec![clean_key]).unwrap());
+        positions.put(&mut wtxn, "src/w.cs:5", &entry).unwrap();
+        wtxn.commit().unwrap();
+    }
+
+    let out = tool_text(
+        &service,
+        FindImpactRequest {
+            file: Some("src/w.cs".to_string()),
+            line: Some(999),
+            ..find_impact_request()
+        },
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(
+        v.get("references").is_none(),
+        "a position miss must not answer the empty-references shape, got: {out}"
+    );
+    assert_eq!(v["class"], "failed", "typed failure, got: {out}");
+    assert!(
+        v["hint_for_agent"]
+            .as_str()
+            .is_some_and(|h| h.contains("1-based")),
+        "the hint must explain the line convention, got: {out}"
+    );
+    let failure_warnings = v["warnings"]
+        .as_array()
+        .expect("index-level warnings ride the failure");
+    assert!(
+        failure_warnings.iter().any(|w| w
+            .as_str()
+            .is_some_and(|w| w.contains("cross-project references"))),
+        "the partial-index warning must not be hidden by the failure, got: {out}"
+    );
+}
+
 /// Index-level rebuild warnings must ride on EVERY answer from an index
 /// built out of a partially loaded solution — resolved answers AND empty
 /// NotFound answers. This pins the live defect reported on a customer

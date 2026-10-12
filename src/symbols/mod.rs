@@ -256,6 +256,11 @@ pub struct SymbolLookupFailure {
     pub class: SymbolLookupFailureClass,
     /// Actionable hint for the agent.
     pub hint_for_agent: String,
+    /// Index-level context (heal running, partially loaded index): without
+    /// it the failure would advise an action that is already in progress.
+    /// Absent from the wire when empty — the historical failure shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 impl SymbolLookupFailure {
@@ -268,6 +273,7 @@ impl SymbolLookupFailure {
                              immediately; fall back to `find` with kind=\"usages\" (text-based) \
                              and/or reindex the project to rebuild the symbol index."
                 .to_string(),
+            warnings: Vec::new(),
         }
     }
 
@@ -280,6 +286,7 @@ impl SymbolLookupFailure {
                              first (`codesearch index` / `index reindex`), then retry the \
                              same call."
                 .to_string(),
+            warnings: Vec::new(),
         }
     }
 

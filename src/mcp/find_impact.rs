@@ -1,3 +1,4 @@
+use super::helpers::strip_alias_prefix;
 use super::types::FindImpactRequest;
 use super::CodesearchService;
 use crate::symbols::SymbolReference;
@@ -349,9 +350,16 @@ impl CodesearchService {
             )
         } else {
             crate::symbols::ImpactQuery::Position {
+                // `find`/`search` report alias-prefixed paths in serve
+                // mode ("ALIAS/src/foo.cs"); the position index keys are
+                // repo-relative. Strip the prefix before normalizing, or
+                // every position query copied from a find result misses.
                 file: self.normalize_symbol_query_path(
                     &project_root,
-                    Path::new(request.file.as_ref().expect("has_position checked")),
+                    Path::new(&strip_alias_prefix(
+                        request.file.as_ref().expect("has_position checked"),
+                        ctx.project_alias.as_ref(),
+                    )),
                 ),
                 line: request.line.expect("has_position checked"),
             }
@@ -500,6 +508,8 @@ impl CodesearchService {
                 // empty answer: the caller selected that key deliberately,
                 // so a miss means the answer it came from and the index
                 // have drifted apart.
+                let mut failure_warnings = answer_warnings(Vec::new());
+                failure_warnings.extend(heal_warning.iter().cloned());
                 let failure = crate::symbols::SymbolLookupFailure {
                     error: format!(
                         "symbol_key '{}' is not in the {} index",
@@ -508,20 +518,45 @@ impl CodesearchService {
                     class: crate::symbols::SymbolLookupFailureClass::Failed,
                     hint_for_agent: "The index was likely rebuilt since the ambiguous answer. Re-run the original name or position query to list the current candidates instead of retrying the key."
                         .to_string(),
+                    warnings: failure_warnings,
                 };
                 let json =
                     serde_json::to_string(&failure).unwrap_or_else(|_| failure.error.clone());
                 return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
             }
             Ok(crate::symbols::KeyMatch::NotFound) => {
-                // Preserve the historical contract for fuzzy queries: an
-                // unresolvable name/position answers empty references. With
-                // a missing index that answer also carries the self-heal
-                // warning — empty must not pass for "no callers".
-                let mut warnings = answer_warnings(Vec::new());
-                warnings.extend(heal_warning.iter().cloned());
-                let impact = build_impact(Vec::new(), None, warnings);
-                let json = serde_json::to_string(&impact).unwrap_or_else(|_| "{}".to_string());
+                // Preserve the historical contract for fuzzy NAME queries:
+                // an unresolvable name answers empty references. A POSITION
+                // query is exact input — NotFound means the (file, line)
+                // pair maps to nothing in this index (wrong line
+                // convention, lines from a stale chunker, a file the
+                // indexer never saw), and an empty-references answer
+                // reads as "no callers" (observed live: an agent concluded
+                // a heavily-called method had zero call sites because the
+                // position query missed). Loud failure, not silence.
+                if !has_position {
+                    let mut warnings = answer_warnings(Vec::new());
+                    warnings.extend(heal_warning.iter().cloned());
+                    let impact = build_impact(Vec::new(), None, warnings);
+                    let json = serde_json::to_string(&impact).unwrap_or_else(|_| "{}".to_string());
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
+                }
+                // Warnings ride on EVERY answer shape — the failure must
+                // not advise an action that is already running (heal) or
+                // hide that the index is known-incomplete.
+                let mut failure_warnings = answer_warnings(Vec::new());
+                failure_warnings.extend(heal_warning.iter().cloned());
+                let failure = crate::symbols::SymbolLookupFailure {
+                    error: format!(
+                        "no indexed symbol at {} in the {} index",
+                        echo, language_for_lookup
+                    ),
+                    class: crate::symbols::SymbolLookupFailureClass::Failed,
+                    hint_for_agent: "Position lines are 1-based (editor lines). If the line came from `find` on an index that has not been reindexed since the 1-based chunk-line fix, it may be off by one — reindex the repo, or resolve by `symbol_name` and pass `symbol_key` from the candidates instead.".to_string(),
+                    warnings: failure_warnings,
+                };
+                let json =
+                    serde_json::to_string(&failure).unwrap_or_else(|_| failure.error.clone());
                 return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
             }
             Ok(crate::symbols::KeyMatch::Resolved(canonical)) => canonical,

@@ -506,6 +506,25 @@ fn test_path_prefix_no_alias() {
 }
 
 #[test]
+fn test_strip_alias_prefix_variants() {
+    // The inbound counterpart of prefix_path_with_alias: find_impact
+    // position queries arrive as find reports them — alias-prefixed.
+    let alias = "myrepo".to_string();
+    assert_eq!(
+        super::strip_alias_prefix("myrepo/src/main.rs", Some(&alias)),
+        "src/main.rs"
+    );
+    assert_eq!(
+        super::strip_alias_prefix("other/src/main.rs", Some(&alias)),
+        "other/src/main.rs"
+    );
+    assert_eq!(
+        super::strip_alias_prefix("src/main.rs", None),
+        "src/main.rs"
+    );
+}
+
+#[test]
 fn test_path_prefix_empty_alias() {
     let result = super::prefix_path_with_alias("C:/repo/src/main.rs", Some(""), "C:/repo");
     assert_eq!(result, "src/main.rs");
