@@ -282,6 +282,11 @@ async fn run_tui_loop(
                     if let Some(action) = tui_common::handle_overlay_key(key, ov) {
                         match action {
                             OverlayKeyAction::Dismiss => overlay = None,
+                            OverlayKeyAction::CopyWarnings => {
+                                if let Some(ov) = overlay.as_mut() {
+                                    tui_common::apply_copy_warnings(ov);
+                                }
+                            }
                             OverlayKeyAction::ConfirmRemove => {
                                 if let Some(OverlayState::ConfirmRemove { alias }) = overlay.take()
                                 {
@@ -827,6 +832,7 @@ pub(crate) fn build_info_overlay(
         lock,
         index_age,
         symbol_warnings,
+        copy_feedback: None,
     })
 }
 

@@ -3650,6 +3650,196 @@ fn build_info_overlay_reads_symbol_warnings_from_meta() {
     }
 }
 
+/// `c` copies the warnings of an Info overlay — and nothing else: other
+/// overlays ignore the key, Esc still dismisses everywhere.
+#[test]
+fn overlay_copy_key_only_fires_on_info_overlays() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let info = crate::serve::tui_common::OverlayState::Info {
+        alias: "BRU.Aprimo".to_string(),
+        path: String::new(),
+        chunks: 0,
+        files: 0,
+        max_chunk_id: 0,
+        db_size_human: String::new(),
+        model: String::new(),
+        dims: 0,
+        lock: "write".to_string(),
+        index_age: String::new(),
+        symbol_warnings: vec!["w1".to_string()],
+        copy_feedback: None,
+    };
+    let copy_key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
+    assert!(matches!(
+        crate::serve::tui_common::handle_overlay_key(copy_key, &info),
+        Some(crate::serve::tui_common::OverlayKeyAction::CopyWarnings)
+    ));
+
+    let doctor = crate::serve::tui_common::OverlayState::Doctor {
+        alias: "x".to_string(),
+        results: vec![],
+    };
+    assert!(
+        crate::serve::tui_common::handle_overlay_key(copy_key, &doctor).is_none(),
+        "'c' must not fire outside the Info overlay"
+    );
+    let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    assert!(matches!(
+        crate::serve::tui_common::handle_overlay_key(esc, &doctor),
+        Some(crate::serve::tui_common::OverlayKeyAction::Dismiss)
+    ));
+}
+
+/// The clipboard text is the full record: alias header naming the subject,
+/// then every stored warning line verbatim.
+#[test]
+fn symbol_warnings_copy_text_heads_with_alias_and_carries_every_line() {
+    let text = crate::serve::tui_common::symbol_warnings_copy_text(
+        "BRU.Aprimo",
+        &["summary line".to_string(), "A.csproj: boom".to_string()],
+    );
+    assert!(text.starts_with("BRU.Aprimo — symbol index warnings (2):"));
+    assert!(text.contains("\nsummary line\nA.csproj: boom"));
+}
+
+/// An empty warnings list must report honestly instead of copying a bare
+/// header — a silent "success" would read as copied content.
+#[test]
+fn apply_copy_warnings_reports_when_nothing_is_recorded() {
+    let mut info = crate::serve::tui_common::OverlayState::Info {
+        alias: "BRU.Aprimo".to_string(),
+        path: String::new(),
+        chunks: 0,
+        files: 0,
+        max_chunk_id: 0,
+        db_size_human: String::new(),
+        model: String::new(),
+        dims: 0,
+        lock: "write".to_string(),
+        index_age: String::new(),
+        symbol_warnings: vec![],
+        copy_feedback: None,
+    };
+    crate::serve::tui_common::apply_copy_warnings(&mut info);
+    match info {
+        crate::serve::tui_common::OverlayState::Info { copy_feedback, .. } => {
+            assert_eq!(
+                copy_feedback.as_deref(),
+                Some("no symbol warnings recorded")
+            );
+        }
+        other => panic!("expected Info overlay, got {other:?}"),
+    }
+}
+
+/// Greedy word-wrap row estimate: words that do not fit start a new row, a
+/// word longer than the row hard-splits, every line takes at least one row.
+/// A char-based ceiling would undershoot the URL case (break lands just
+/// before the row end) and clip the modal's last content row.
+#[test]
+fn estimate_wrapped_height_counts_multi_row_lines() {
+    use ratatui::text::Line;
+    let lines = vec![Line::raw("short"), Line::raw("x".repeat(120))];
+    assert_eq!(
+        crate::serve::tui_common::estimate_wrapped_height(&lines, 56),
+        4
+    );
+    assert_eq!(
+        crate::serve::tui_common::estimate_wrapped_height(&lines, 200),
+        2
+    );
+    // Word wrap: "aaa" + "bbb" does not fit side by side in 5 columns.
+    assert_eq!(
+        crate::serve::tui_common::estimate_wrapped_height(&[Line::raw("aaa bbb")], 5),
+        2
+    );
+    // Hard split: a 60-char URL word across 58 columns takes 2 rows on its
+    // own even though ceil(60/58) would also say 2 — the pinned case is the
+    // prose line that leaves the URL to start a fresh row.
+    assert_eq!(
+        crate::serve::tui_common::estimate_wrapped_height(
+            &[Line::raw(
+                "src index for source https://pkgs/nuget/v3/index.json"
+            )],
+            50
+        ),
+        2
+    );
+    // trim: false keeps the warning line's 4-space indent on the first row,
+    // so an indent-width word that would fit on its own needs two rows.
+    assert_eq!(
+        crate::serve::tui_common::estimate_wrapped_height(
+            &[Line::raw(format!("    {}", "a".repeat(58)))],
+            58
+        ),
+        2
+    );
+    // A mid-line separator run is real columns: "a  b" fits exactly in 4,
+    // wraps in 3.
+    assert_eq!(
+        crate::serve::tui_common::estimate_wrapped_height(&[Line::raw("a  b")], 4),
+        1
+    );
+    assert_eq!(
+        crate::serve::tui_common::estimate_wrapped_height(&[Line::raw("a  b")], 3),
+        2
+    );
+}
+
+/// Long warning lines must WRAP inside the modal, not clip at the border:
+/// the tail of the failure text (the feed URL) stays readable, and the
+/// key-hint footer survives on the border's bottom title.
+#[test]
+fn modal_wraps_long_warning_lines_instead_of_clipping() {
+    use ratatui::backend::TestBackend;
+    use ratatui::text::{Line, Span};
+    use ratatui::Terminal;
+
+    let warning = "Dlw.Aprimo.Dam.csproj: Unable to load the service index for source https://pkgs.dev.azure.com/platina-dlwr/nuget/v3/index.json";
+    let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+    terminal
+        .draw(|f| {
+            let lines = vec![Line::from(Span::raw(format!("    {warning}")))];
+            crate::serve::tui_common::render_centered_modal_with_footer(
+                f,
+                f.area(),
+                " BRU.Aprimo — Index Info ",
+                Some(" [Esc] close · [c] copy warnings "),
+                lines,
+                ratatui::style::Color::Cyan,
+            );
+        })
+        .unwrap();
+
+    let buffer = terminal.backend().buffer().clone();
+    let mut rendered = String::new();
+    for y in 0..buffer.area.height {
+        for x in 0..buffer.area.width {
+            rendered.push_str(buffer[(x, y)].symbol());
+        }
+        rendered.push('\n');
+    }
+    // Wrapping splits the text at arbitrary columns and the modal border
+    // characters sit between the wrapped segments, so compare with all
+    // whitespace and box-drawing characters stripped: every character of
+    // the warning must be rendered somewhere in order — with clipping (the
+    // old behaviour) the tail past the modal edge is simply gone.
+    let flat: String = rendered
+        .chars()
+        .filter(|c| !c.is_whitespace() && !matches!(c, '│' | '┌' | '┐' | '└' | '┘' | '─'))
+        .collect();
+    let want: String = warning.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains(&want),
+        "the full warning must wrap inside the modal, got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("[c] copy warnings"),
+        "the copy-hint footer must stay visible, got:\n{rendered}"
+    );
+}
+
 /// The serve-mode find_impact self-heal spawn must reach
 /// `trigger_symbol_rebuild` for a registered, applicable repo: after the
 /// warned empty answer, the C# status eventually flips to Error (dummy

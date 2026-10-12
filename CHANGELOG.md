@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.5.5]
+
+### Fixed
+
+- **Serve TUI: symbol-index warnings are fully readable and copyable.** The Info overlay (`i`) clipped long warning lines at the modal border — the exact feed URLs that explain a degraded C# index were cut off mid-address. Modal content now wraps instead of clipping (the modal grows with the wrapped rows, capped at the terminal), and the key-hint footer moved to the border's bottom title so it stays visible even when wrapped content fills the screen. A new `c` key on the Info overlay copies the repo alias plus every stored warning line to the OS clipboard (PowerShell `Set-Clipboard` with explicit UTF-8 stdin on Windows, `pbcopy`/`wl-copy`/`xclip`/`xsel` elsewhere — no new dependency), with the outcome shown as a feedback line in the overlay. Works in both the embedded serve TUI and the standalone remote TUI.
+
 ## [1.5.4]
 
 ### Fixed

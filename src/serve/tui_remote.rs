@@ -264,6 +264,11 @@ async fn run_remote_tui_loop(
                     if let Some(action) = tui_common::handle_overlay_key(key, ov) {
                         match action {
                             OverlayKeyAction::Dismiss => overlay = None,
+                            OverlayKeyAction::CopyWarnings => {
+                                if let Some(ov) = overlay.as_mut() {
+                                    tui_common::apply_copy_warnings(ov);
+                                }
+                            }
                             OverlayKeyAction::ConfirmRemove => {
                                 if let Some(OverlayState::ConfirmRemove { alias }) = overlay.take()
                                 {
@@ -359,6 +364,7 @@ async fn run_remote_tui_loop(
                                                 lock: info.lock,
                                                 index_age: info.index_age,
                                                 symbol_warnings: info.symbol_warnings,
+                                                copy_feedback: None,
                                             },
                                             Err(e) => OverlayState::Doctor {
                                                 alias,
