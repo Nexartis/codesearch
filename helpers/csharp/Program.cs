@@ -864,6 +864,15 @@ public static class Program
                 continue;
             }
 
+            // OpenProjectAsync also loads the project's ProjectReferences; re-opening
+            // one of them throws "already part of the workspace".
+            if (workspace.CurrentSolution.Projects.Any(p =>
+                    string.Equals(p.FilePath, csprojPath, StringComparison.OrdinalIgnoreCase)))
+            {
+                loaded++;
+                continue;
+            }
+
             try
             {
                 await workspace.OpenProjectAsync(csprojPath).ConfigureAwait(false);
