@@ -3733,6 +3733,63 @@ fn apply_copy_warnings_reports_when_nothing_is_recorded() {
     }
 }
 
+/// Both clipboard outcomes surface as the overlay's feedback line: success
+/// confirms the copy, failure names the reason. The clipboard write is
+/// injected so the test pins the feedback contract, not the OS clipboard.
+#[test]
+fn apply_copy_warnings_feedback_covers_success_and_failure() {
+    fn info() -> crate::serve::tui_common::OverlayState {
+        crate::serve::tui_common::OverlayState::Info {
+            alias: "BRU.Aprimo".to_string(),
+            path: String::new(),
+            chunks: 0,
+            files: 0,
+            max_chunk_id: 0,
+            db_size_human: String::new(),
+            model: String::new(),
+            dims: 0,
+            lock: "write".to_string(),
+            index_age: String::new(),
+            symbol_warnings: vec!["summary".to_string()],
+            copy_feedback: None,
+        }
+    }
+
+    let mut overlay = info();
+    let seen_text = std::cell::RefCell::new(String::new());
+    crate::serve::tui_common::apply_copy_warnings_with(&mut overlay, |text| {
+        *seen_text.borrow_mut() = text.to_string();
+        Ok(())
+    });
+    match &overlay {
+        crate::serve::tui_common::OverlayState::Info { copy_feedback, .. } => {
+            assert_eq!(
+                copy_feedback.as_deref(),
+                Some("✓ symbol warnings copied to clipboard")
+            );
+        }
+        other => panic!("expected Info overlay, got {other:?}"),
+    }
+    assert_eq!(
+        seen_text.into_inner(),
+        "BRU.Aprimo — symbol index warnings (1):\nsummary"
+    );
+
+    let mut overlay = info();
+    crate::serve::tui_common::apply_copy_warnings_with(&mut overlay, |_| {
+        Err("powershell: not found".to_string())
+    });
+    match overlay {
+        crate::serve::tui_common::OverlayState::Info { copy_feedback, .. } => {
+            assert_eq!(
+                copy_feedback.as_deref(),
+                Some("copy failed: powershell: not found")
+            );
+        }
+        other => panic!("expected Info overlay, got {other:?}"),
+    }
+}
+
 /// Greedy word-wrap row estimate: words that do not fit start a new row, a
 /// word longer than the row hard-splits, every line takes at least one row.
 /// A char-based ceiling would undershoot the URL case (break lands just

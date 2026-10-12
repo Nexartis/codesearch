@@ -372,6 +372,16 @@ pub fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
 /// warnings to the OS clipboard and record the outcome as the overlay's
 /// feedback line. Shared by both TUI event loops.
 pub fn apply_copy_warnings(overlay: &mut OverlayState) {
+    apply_copy_warnings_with(overlay, copy_text_to_clipboard);
+}
+
+/// The [`apply_copy_warnings`] logic with the clipboard write injected, so
+/// tests can pin both outcome feedback lines without touching the real OS
+/// clipboard (which would be a machine side effect, not an assertion).
+pub(crate) fn apply_copy_warnings_with(
+    overlay: &mut OverlayState,
+    clipboard: impl Fn(&str) -> Result<(), String>,
+) {
     if let OverlayState::Info {
         alias,
         symbol_warnings,
@@ -383,7 +393,7 @@ pub fn apply_copy_warnings(overlay: &mut OverlayState) {
             Some("no symbol warnings recorded".to_string())
         } else {
             let text = symbol_warnings_copy_text(alias, symbol_warnings);
-            match copy_text_to_clipboard(&text) {
+            match clipboard(&text) {
                 Ok(()) => Some("✓ symbol warnings copied to clipboard".to_string()),
                 Err(e) => Some(format!("copy failed: {e}")),
             }
