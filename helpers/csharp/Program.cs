@@ -403,9 +403,30 @@ public static class Program
             // "failure", but the affected project still loads and its symbol
             // tree is complete — build engineering settles the pin; the
             // index must not carry the noise as a warning.
+            // A NuGet package-version mismatch ("Dependency specified was X
+            // (>= A) but ended up with X B") also surfaces as an Msbuild
+            // "failure", but the affected project still loads and its symbol
+            // tree is complete — build engineering settles the pin; the
+            // index must not carry the noise as a warning.
             if (WorkspaceNoise.IsPackageVersionConflict(e.Diagnostic?.Message))
             {
-                Console.Error.WriteLine($"[INFO] Workspace note: {e.Diagnostic}");
+                Console.Error.WriteLine(WorkspaceNoise.DemotedNote(e.Diagnostic!));
+                return;
+            }
+            // MSBuild check advisories (package compatibility, e.g. the
+            // Grpc.Net.ClientFactory version check) also escalate to
+            // "failures": product guidance, not load failures — demote.
+            if (WorkspaceNoise.IsMsbuildCheckAdvisory(e.Diagnostic?.Message))
+            {
+                Console.Error.WriteLine(WorkspaceNoise.DemotedNote(e.Diagnostic!));
+                return;
+            }
+            // BuildHost shutdown chatter ("[BuildHost PID N] ... not
+            // responding") trails a crash the load failure already reports;
+            // keeping it would double-count one failure.
+            if (WorkspaceNoise.IsBuildHostShutdownChatter(e.Diagnostic?.Message))
+            {
+                Console.Error.WriteLine(WorkspaceNoise.DemotedNote(e.Diagnostic!));
                 return;
             }
             Console.Error.WriteLine($"[WARN] Workspace error: {e.Diagnostic}");

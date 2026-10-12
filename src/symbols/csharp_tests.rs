@@ -86,7 +86,7 @@ fn drain_retries_after_transient_interrupted_read() {
 
 #[test]
 fn helper_warning_classification_table() {
-    let cases: [(&str, bool); 10] = [
+    let cases: [(&str, bool); 12] = [
         // Helper's own workspace-failure warnings (WorkspaceFailed handler).
         (
             "[WARN] Workspace error: [Failure] Msbuild failed when processing the file 'C:\\r\\p.csproj' with message: Dependency specified was X but ended up with X 1.2.3",
@@ -110,6 +110,19 @@ fn helper_warning_classification_table() {
         (
             "[INFO] Skipping unsupported project type: C:\\r\\x.shproj",
             false,
+        ),
+        // A helper-demoted note renders the bare diagnostic MESSAGE: it must
+        // not be captured. The trap this pins: a demotion that renders the
+        // full diagnostic re-embeds "[Failure]" and re-enters this channel.
+        (
+            "[INFO] Workspace note: Msbuild failed when processing the file 'C:\\r\\p.csproj' with message: Grpc.Net.ClientFactory 2.63.0 or earlier could cause issues when used together with Microsoft.Extensions.Http.Resilience.",
+            false,
+        ),
+        // The buggy shape, documented: the tag alone keeps the line captured
+        // regardless of the [INFO] prefix.
+        (
+            "[INFO] Workspace note: [Failure] Msbuild failed when processing the file 'C:\\r\\p.csproj'",
+            true,
         ),
         ("Loading solution: C:\\r\\x.sln", false),
         ("Loaded 13 project(s) from filtered solution", false),
