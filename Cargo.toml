@@ -115,6 +115,15 @@ schemars = { version = "1.1.0", features = ["derive"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 sysinfo = { version = "0.39", default-features = true }
 
+[patch.crates-io]
+# Vendored copy of rmcp 3.5.0 with the [codesearch bridge] change in
+# vendor/rmcp/src/service/server.rs (`negotiate_protocol_version`): it lets a
+# session run at 2026-07-28 when the client offers that revision over the
+# initialize handshake, so rmcp keeps the SEP-2322 `resultType` discriminator
+# that Claude Code >= 2.1.296 requires. Re-apply the marked change when
+# bumping rmcp.
+rmcp = { path = "vendor/rmcp" }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
