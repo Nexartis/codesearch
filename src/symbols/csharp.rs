@@ -264,6 +264,9 @@ pub(crate) const HELPER_RESTORE_PENDING_EXIT: i32 = 75;
 /// Seconds between restore-pending retries of the same rebuild scope.
 const RESTORE_PENDING_RETRY_INTERVAL_SECS: u64 = 60;
 
+/// Granularity of the restore wait's shutdown check.
+const RESTORE_PENDING_POLL_MS: u64 = 500;
+
 /// Restore-pending retries before a rebuild gives up with LMDB untouched.
 /// 60s × 20 = 20 min of restore patience, deliberately below the
 /// MAX_INDEXING_SECS (30 min) claim-takeover in serve so a still-running
@@ -279,6 +282,23 @@ fn restore_pending_retry_interval_secs() -> u64 {
     raw.and_then(|v| v.parse::<u64>().ok())
         .filter(|&secs| secs > 0)
         .unwrap_or(RESTORE_PENDING_RETRY_INTERVAL_SECS)
+}
+
+/// Sleeps `total` in poll steps; returns `false` as soon as shutdown is
+/// requested. A rebuild parked here must not outlive quit: the runtime joins
+/// its blocking pool at teardown.
+fn sleep_unless_shutdown(total: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + total;
+    loop {
+        if crate::constants::is_shutdown_requested() {
+            return false;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return true;
+        }
+        thread::sleep(remaining.min(std::time::Duration::from_millis(RESTORE_PENDING_POLL_MS)));
+    }
 }
 
 /// Typed marker for the helper's RESTORE-PENDING exit: distinct from a
@@ -1755,9 +1775,15 @@ impl SymbolIndexer for CSharpSymbolIndexer {
                         attempts,
                         RESTORE_PENDING_RETRY_MAX_ATTEMPTS
                     );
-                    thread::sleep(std::time::Duration::from_secs(
+                    if !sleep_unless_shutdown(std::time::Duration::from_secs(
                         restore_pending_retry_interval_secs(),
-                    ));
+                    )) {
+                        restore_pending_flag_clear(db_path);
+                        bail!(
+                            "rebuild cancelled while waiting for dotnet restore — shutdown \
+                             requested, previous index stays live"
+                        );
+                    }
                 }
                 Err(e) => {
                     // A non-pending failure ends the retry loop: the flag
@@ -3080,6 +3106,43 @@ mod tests {
             !indexer.restore_pending(&db),
             "the pending flag must be cleared when the retry loop gives up"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rebuild_waiting_on_restore_returns_promptly_once_shutdown_is_requested() {
+        use super::SymbolIndexer as _;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("db");
+        std::fs::write(dir.path().join("FakeSolution.sln"), "").unwrap();
+        let helper_dir = dir.path().join("helper");
+        std::fs::create_dir(&helper_dir).unwrap();
+        let helper = build_fake_csharp_helper(&helper_dir);
+        let _guard = crate::testing::EnvRestore::set(&[
+            (HELPER_ENV_VAR, helper.to_string_lossy().as_ref()),
+            ("CS_FAKE_HELPER_MODE", "exit75"),
+        ]);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let repo = dir.path().to_path_buf();
+        std::thread::spawn(move || {
+            let res = CSharpSymbolIndexer::new().rebuild(&repo, &db, RebuildScope::Full);
+            let _ = tx.send(res.map(|_| ()).map_err(|e| format!("{e:#}")));
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        crate::constants::SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+        let outcome = rx.recv_timeout(std::time::Duration::from_secs(10));
+        crate::constants::SHUTDOWN_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        match outcome {
+            Ok(Err(msg)) => assert!(msg.contains("shutdown"), "unexpected error: {msg}"),
+            Ok(Ok(())) => panic!("a rebuild waiting on restore must not succeed"),
+            Err(_) => {
+                panic!("rebuild still parked in the restore wait 10s after shutdown was requested")
+            }
+        }
     }
 
     #[test]

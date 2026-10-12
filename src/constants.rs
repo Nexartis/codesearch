@@ -16,6 +16,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// is honoured within a few seconds even during heavy CPU work.
 pub static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// Grace for blocking tasks after serve returns; anything still running is
+/// abandoned with the process.
+pub const RUNTIME_SHUTDOWN_GRACE_SECS: u64 = 5;
+
 /// Check whether a graceful shutdown has been requested (CTRL-C).
 #[inline]
 pub fn is_shutdown_requested() -> bool {
