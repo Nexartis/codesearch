@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.5.4]
+
+### Fixed
+
+- **C# indexes are never built while a NuGet restore is still running, and restore freshness now honours central package management.** Under CPM a version bump in `Directory.Packages.props` left `obj/project.assets.json` looking fresh, Roslyn missed the package assemblies, and the degraded index stored CS0246 cascades (seen live on `Azure.Response` unresolved). `NeedsRestore` now treats assets as stale when any `Directory.Packages.props`, `Directory.Build.props`, `Directory.Build.targets`, `NuGet.config` or `global.json` found walking up from the project to the repo root is newer than the assets. When the bounded restore wait expires, the helper no longer loads the workspace degraded: it records the still-running restore in an out-of-repo marker, prints one `[RESTORE-PENDING]` line, writes no output, and exits 75 — and the Rust host maps that to a distinct outcome that retries the same rebuild scope with a bounded backoff (interval tunable via `CODESEARCH_RESTORE_RETRY_INTERVAL_SECS`), leaving the previous good index live and LMDB untouched. `find_impact` answers from the previous index with one explicit "restore in progress" warning; lazy find-refs during a pending restore persists an INCOMPLETE warning and caches nothing; the serve file watcher now triggers a full C# rebuild when a restore input changes, and a resident workspace refuses to come up mid-restore so no answer from a workspace loaded during a restore can be cached. A restore that itself fails (non-zero exit) is not pending: the previous degraded-with-warning behaviour stays.
+
 ## [1.5.3]
 
 ### Fixed

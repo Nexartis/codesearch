@@ -10,7 +10,9 @@ namespace ScipCsharp;
 /// </summary>
 public sealed class SymbolIndexer
 {
-    public async Task<ScipIndex> IndexAsync(MSBuildWorkspace workspace, string? projectFilter)
+    public async Task<ScipIndex> IndexAsync(
+        MSBuildWorkspace workspace,
+        string? projectFilter)
     {
         var index = new ScipIndex();
         var solution = workspace.CurrentSolution;
@@ -56,7 +58,7 @@ public sealed class SymbolIndexer
         {
             var project = projectList[i];
             Console.Error.WriteLine($"  [{i + 1}/{totalProjects}] Compiling: {project.Name}");
-            var (compilation, generatorOutcome) =
+            var (compilation, _) =
                 await GeneratorSupport.GetCompilationWithGeneratorsAsync(project).ConfigureAwait(false);
             if (compilation is null)
             {
@@ -68,23 +70,24 @@ public sealed class SymbolIndexer
             // resolution cascades into tens of thousands of errors per
             // project (CS0518 "System.Object not defined" turns every type
             // use into CS0246) — that is ONE root cause, not N problems, so
-            // the warnings channel carries ONE aggregated line per project
-            // (count + dominant code + first specimen). Symbols below are
-            // still collected: a Roslyn compilation with errors yields a
-            // complete symbol tree — the same reason IntelliSense works
-            // while the build is red.
+            // the log carries ONE aggregated line per project (count +
+            // dominant code + first specimen). Symbols below are still
+            // collected: a Roslyn compilation with errors yields a complete
+            // symbol tree — the same reason IntelliSense works while the
+            // build is red.
             var diagnostics = compilation.GetDiagnostics()
                 .Where(d => d.Severity == DiagnosticSeverity.Error)
                 .ToList();
             if (diagnostics.Count > 0)
             {
-                // A failed generator run is a tool-side gap the user cannot
-                // fix, so its leftover errors (the CS0103/CS0115 Razor
-                // cascades) are downgraded to [INFO] — they must not land in
-                // the index warnings as a "fix your build" claim.
-                var marker = generatorOutcome == GeneratorRunOutcome.Failed ? "[INFO] " : "[WARN] ";
+                // Compile diagnostics are ALWAYS [INFO]: the project loaded
+                // and its symbol tree is complete, so nothing here means
+                // "find_impact may miss symbols" — they are code-health, and
+                // the index-warning channel is index-health only. Generator
+                // failures and restore-caused diagnostics were already
+                // [INFO]; by this rule every compile summary is.
                 erroringProjects.Add((diagnostics.Count,
-                    WarningLineFor(project.Name, diagnostics, marker)));
+                    WarningLineFor(project.Name, diagnostics)));
             }
 
             CollectSymbols(compilation.GlobalNamespace, symbolMap);
@@ -183,18 +186,15 @@ public sealed class SymbolIndexer
             $"{byCode[0].Key} x{byCode[0].Count()}; first: {first}";
     }
 
-    /// The channel-emittable form. The `[WARN] ` prefix is LOAD-BEARING:
-    /// the Rust capture (`is_helper_warning_line`) keys on it, so a dropped
-    /// prefix does not flood the channel — it silently empties it. The
-    /// `[INFO] ` variant is for tool-side gaps (generator pipeline failed)
-    /// that must NOT enter the warnings channel.
+    /// The channel-emittable form. The prefix is `[INFO] ` BY DESIGN: the
+    /// Rust capture (`is_helper_warning_line`) keys on `[WARN] `/`[Failure]`,
+    /// so compile summaries never enter the index-warnings channel — they
+    /// are code-health, and the index-warning channel is index-health only
+    /// (restore state, load failures). An accidentally-dropped prefix cannot
+    /// flood the channel; it would only vanish from the serve log.
     /// </summary>
     internal static string WarningLineFor(string project, IReadOnlyList<Diagnostic> errors) =>
-        "[WARN] " + CompilationErrorSummaryLine(project, errors);
-
-    internal static string WarningLineFor(
-        string project, IReadOnlyList<Diagnostic> errors, string marker) =>
-        marker + CompilationErrorSummaryLine(project, errors);
+        "[INFO] " + CompilationErrorSummaryLine(project, errors);
 
     internal static void CollectSymbols(INamespaceSymbol ns, Dictionary<ISymbol, string> map)
     {

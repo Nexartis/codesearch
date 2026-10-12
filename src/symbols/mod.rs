@@ -483,6 +483,15 @@ pub trait SymbolIndexer: Send + Sync {
         Vec::new()
     }
 
+    /// True while this index's rebuild is waiting out a still-running NuGet
+    /// restore (C# restore gate, issue #225). Callers attach one
+    /// caller-facing warning to answers served from the previous index;
+    /// the flag lifts when the retry loop ends either way. Default false —
+    /// adapters without a restore gate are never pending.
+    fn restore_pending(&self, _db_path: &Path) -> bool {
+        false
+    }
+
     /// Which codesearch build produced the current symbol index
     /// (`scip_meta[index_builder_version]`). `None` means absent or
     /// unreadable — the C# rebuild gate treats that as stale, so a newly

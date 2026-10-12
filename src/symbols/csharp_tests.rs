@@ -1,8 +1,12 @@
 //! Helper stderr routing tests (`csharp.rs`). Sibling `_tests.rs` file
 //! per repo convention.
 
-use super::csharp::{drain_pipe_to_tracing, is_helper_warning_line};
+use super::csharp::{
+    drain_pipe_to_tracing, is_helper_warning_line, is_restore_pending, restore_pending_flag_clear,
+    restore_pending_flag_set, RestorePendingError,
+};
 use std::io::Cursor;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 fn drained(input: &[u8]) -> Vec<String> {
@@ -408,4 +412,54 @@ fn extract_simple_name_strips_fqn_parameters_before_segmenting() {
             "key: {key}"
         );
     }
+}
+
+// ── Restore-pending gate (issue #225) ────────────────────────────────
+
+#[test]
+fn helper_version_line_parses_to_the_version_token() {
+    use super::csharp::parse_helper_version;
+
+    let cases = [
+        ("scip-csharp 1.5.4", "1.5.4"),
+        ("scip-csharp 0.0.0-fake", "0.0.0-fake"),
+        ("scip-csharp 1.5.4+1352", "1.5.4+1352"),
+        // Unparseable → "unknown": the startup entry still logs (as a
+        // mismatch) instead of silently skipping.
+        ("", "unknown"),
+        ("garbage", "unknown"),
+        ("scip-csharp", "unknown"),
+    ];
+    for (line, expected) in cases {
+        assert_eq!(parse_helper_version(line), expected, "line: {line:?}");
+    }
+}
+
+#[test]
+fn restore_pending_error_downcasts_from_anyhow() {
+    let pending = anyhow::Error::new(RestorePendingError);
+    assert!(is_restore_pending(&pending));
+
+    let generic = anyhow::anyhow!("Failed to read symbol index at /tmp/x.json");
+    assert!(!is_restore_pending(&generic));
+}
+
+#[test]
+fn restore_pending_flag_round_trips_through_the_trait_method() {
+    use super::SymbolIndexer as _;
+
+    let db_path = PathBuf::from(format!(
+        "{}cs-restore-flag-test-{}",
+        std::env::temp_dir().display(),
+        std::process::id()
+    ));
+    let indexer = super::csharp::CSharpSymbolIndexer::new();
+    restore_pending_flag_clear(&db_path); // isolate from concurrent tests
+    assert!(!indexer.restore_pending(&db_path));
+
+    restore_pending_flag_set(&db_path);
+    assert!(indexer.restore_pending(&db_path));
+
+    restore_pending_flag_clear(&db_path);
+    assert!(!indexer.restore_pending(&db_path));
 }

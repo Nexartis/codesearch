@@ -247,11 +247,13 @@ public class ScipModelTests
         Assert.Contains("dominant CS0518 x2", line);
         Assert.Contains("first:", line);
 
-        // The channel-emittable form carries the [WARN] marker the Rust
-        // capture keys on — a dropped prefix would silently EMPTY the
-        // index-warnings channel instead of flooding it.
+        // The channel-emittable form carries the [INFO] marker BY DESIGN:
+        // compile diagnostics are code-health (the symbol tree of a loaded
+        // project is complete) — the index-warning channel is index-health
+        // only, so the Rust capture must never see [WARN] here.
         var warning = SymbolIndexer.WarningLineFor("Acme.Catalog", errors);
-        Assert.StartsWith("[WARN] Compilation errors in", warning);
+        Assert.StartsWith("[INFO] Compilation errors in", warning);
+        Assert.False(warning.StartsWith("[WARN]", StringComparison.Ordinal));
     }
 
     /// The specimen is capped: a full Roslyn diagnostic string can run
@@ -292,13 +294,12 @@ public class ScipModelTests
         Assert.True(line.Length < 300, $"summary must stay capped, got {line.Length} chars");
     }
 
-    /// The generator-fallback contract: when the generator pipeline fails,
-    /// the resulting diagnostics carry the [INFO] marker — a tool-side gap
-    /// the user cannot fix — which the Rust capture does not file as an
-    /// index warning. Pins the marker overload's prefix shape; the consumer
-    /// half (is_helper_warning_line) is pinned on the Rust side.
+    /// The compile-summary contract: the summaries ALWAYS carry the [INFO]
+    /// marker — the Rust capture (`is_helper_warning_line`) files only
+    /// [WARN]/[Failure] as index warnings, so a compile summary can never
+    /// drive the warning icon, whatever the diagnostics are.
     [Fact]
-    public void WarningLineFor_InfoMarkerCarriesNoWarnPrefix()
+    public void WarningLineFor_CarriesInfoPrefixNeverWarn()
     {
         static Diagnostic Err(string id, string message)
         {
@@ -310,11 +311,9 @@ public class ScipModelTests
 
         var errors = new List<Diagnostic> { Err("CS0103", "The name 'count' does not exist") };
 
-        var info = SymbolIndexer.WarningLineFor("Proj", errors, "[INFO] ");
-        var warn = SymbolIndexer.WarningLineFor("Proj", errors);
+        var line = SymbolIndexer.WarningLineFor("Proj", errors);
 
-        Assert.StartsWith("[INFO] ", info);
-        Assert.DoesNotContain("[WARN]", info);
-        Assert.StartsWith("[WARN] ", warn);
+        Assert.StartsWith("[INFO] ", line);
+        Assert.DoesNotContain("[WARN]", line);
     }
 }

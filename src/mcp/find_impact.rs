@@ -435,7 +435,14 @@ impl CodesearchService {
                     )
                 })?;
             let resolution = indexer.resolve_query(&db_path_for_resolve, &query_for_resolve)?;
-            let index_warnings = indexer.index_warnings(&db_path_for_resolve);
+            let mut index_warnings = indexer.index_warnings(&db_path_for_resolve);
+            // A rebuild waiting out a restore (issue #225) refreshes nothing:
+            // every answer from this index comes from the previous one and
+            // must say so, on every path that carries warnings.
+            if indexer.restore_pending(&db_path_for_resolve) {
+                index_warnings
+                    .push(crate::symbols::csharp::RESTORE_PENDING_INDEX_WARNING.to_string());
+            }
             Ok((resolution, index_warnings))
         })
         .await

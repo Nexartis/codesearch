@@ -44,4 +44,37 @@ public class WorkspaceNoiseTests
     {
         Assert.True(WorkspaceNoise.IsNuGetAuditNoise(message));
     }
+
+    /// The real-world shape this filter exists for: a NuGet package-version
+    /// mismatch surfaces as an Msbuild "failure", but the project still loads
+    /// and its symbol tree is complete — the index must not carry it as a
+    /// warning.
+    [Fact]
+    public void PackageVersionConflictIsFiltered()
+    {
+        var message =
+            "Msbuild failed when processing the file 'Acme.Publishing.Core.csproj' with message: " +
+            "Dependency specified was SonarAnalyzer.CSharp (>= 10.18.0.128626) but ended up with " +
+            "SonarAnalyzer.CSharp 10.18.0.131500.";
+        Assert.True(WorkspaceNoise.IsPackageVersionConflict(message));
+    }
+
+    [Fact]
+    public void GenuineLoadFailureIsNotAVersionConflict()
+    {
+        var message =
+            "Msbuild failed when processing the file 'Acme.Core.csproj' with message: " +
+            "The type or namespace name 'Catalog' does not exist in the namespace 'Acme'";
+        Assert.False(WorkspaceNoise.IsPackageVersionConflict(message));
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("Dependency specified was never met")]           // one half only
+    [InlineData("ended up with nothing")]                        // the other half only
+    public void IncompleteOrMissingVersionConflictTextIsKept(string? message)
+    {
+        Assert.False(WorkspaceNoise.IsPackageVersionConflict(message));
+    }
 }
