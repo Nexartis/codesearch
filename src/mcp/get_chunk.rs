@@ -284,8 +284,11 @@ impl CodesearchService {
                 Ok(src) => {
                     let lines: Vec<&str> = src.lines().collect();
                     if !lines.is_empty() {
-                        let before_start = chunk.start_line.saturating_sub(context_lines);
-                        let before_end = chunk.start_line.min(lines.len());
+                        // Chunk lines are 1-based; slices need the 0-based
+                        // row before the chunk's first line.
+                        let before_end = chunk.start_line.saturating_sub(1);
+                        let before_start = before_end.saturating_sub(context_lines);
+                        let before_end = before_end.min(lines.len());
                         if before_start < before_end {
                             context_before = Some(lines[before_start..before_end].join("\n"));
                         }
