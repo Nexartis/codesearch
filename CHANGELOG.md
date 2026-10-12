@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.5.6]
+
+### Fixed
+
+- **scip-csharp: MSBuild check advisories and BuildHost shutdown chatter no longer surface as index warnings.** Two more noise classes were observed pinning the serve TUI's ⚠ on healthy-but-advised repos: MSBuild check advisories escalated to load "failures" (live: the Grpc.Net.ClientFactory 2.63 version check — product guidance, the project loads fine and the index is unaffected) and BuildHost crash aftermath (`[BuildHost PID N] Exception while shutting down…` / `…not responding`, which trail the failure the load exception already reports and double-count it). Both demote to `[INFO]` in the WorkspaceFailed handler, extending the audit-advisory policy: the index-warning channel carries index health only. The live shapes are pinned verbatim in WorkspaceNoiseTests.
+
 ## [1.5.5]
 
 ### Fixed
