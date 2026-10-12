@@ -3657,7 +3657,7 @@ fn overlay_copy_key_only_fires_on_info_overlays() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     let info = crate::serve::tui_common::OverlayState::Info {
-        alias: "BRU.Aprimo".to_string(),
+        alias: "acme-web".to_string(),
         path: String::new(),
         chunks: 0,
         files: 0,
@@ -3696,10 +3696,10 @@ fn overlay_copy_key_only_fires_on_info_overlays() {
 #[test]
 fn symbol_warnings_copy_text_heads_with_alias_and_carries_every_line() {
     let text = crate::serve::tui_common::symbol_warnings_copy_text(
-        "BRU.Aprimo",
+        "acme-web",
         &["summary line".to_string(), "A.csproj: boom".to_string()],
     );
-    assert!(text.starts_with("BRU.Aprimo — symbol index warnings (2):"));
+    assert!(text.starts_with("acme-web — symbol index warnings (2):"));
     assert!(text.contains("\nsummary line\nA.csproj: boom"));
 }
 
@@ -3708,7 +3708,7 @@ fn symbol_warnings_copy_text_heads_with_alias_and_carries_every_line() {
 #[test]
 fn apply_copy_warnings_reports_when_nothing_is_recorded() {
     let mut info = crate::serve::tui_common::OverlayState::Info {
-        alias: "BRU.Aprimo".to_string(),
+        alias: "acme-web".to_string(),
         path: String::new(),
         chunks: 0,
         files: 0,
@@ -3740,7 +3740,7 @@ fn apply_copy_warnings_reports_when_nothing_is_recorded() {
 fn apply_copy_warnings_feedback_covers_success_and_failure() {
     fn info() -> crate::serve::tui_common::OverlayState {
         crate::serve::tui_common::OverlayState::Info {
-            alias: "BRU.Aprimo".to_string(),
+            alias: "acme-web".to_string(),
             path: String::new(),
             chunks: 0,
             files: 0,
@@ -3772,7 +3772,7 @@ fn apply_copy_warnings_feedback_covers_success_and_failure() {
     }
     assert_eq!(
         seen_text.into_inner(),
-        "BRU.Aprimo — symbol index warnings (1):\nsummary"
+        "acme-web — symbol index warnings (1):\nsummary"
     );
 
     let mut overlay = info();
@@ -3853,7 +3853,7 @@ fn modal_wraps_long_warning_lines_instead_of_clipping() {
     use ratatui::text::{Line, Span};
     use ratatui::Terminal;
 
-    let warning = "Dlw.Aprimo.Dam.csproj: Unable to load the service index for source https://pkgs.dev.azure.com/platina-dlwr/nuget/v3/index.json";
+    let warning = "Sample.Web.csproj: Unable to load the service index for source https://pkgs.example.com/private-feed/nuget/v3/index.json";
     let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
     terminal
         .draw(|f| {
@@ -3861,7 +3861,7 @@ fn modal_wraps_long_warning_lines_instead_of_clipping() {
             crate::serve::tui_common::render_centered_modal_with_footer(
                 f,
                 f.area(),
-                " BRU.Aprimo — Index Info ",
+                " acme-web — Index Info ",
                 Some(" [Esc] close · [c] copy warnings "),
                 lines,
                 ratatui::style::Color::Cyan,
