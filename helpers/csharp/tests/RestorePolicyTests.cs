@@ -110,16 +110,24 @@ public class RestorePolicyTests : IDisposable
     /// killed one — a kill would waste all of the restore's work — and name
     /// the gating that index/find-refs runs apply while it finishes.
     /// </summary>
+    /// <summary>
+    /// Pins the timeout contract for the serve path: the wait expiring must
+    /// announce a restore that is STILL RUNNING in the background, never a
+    /// killed one — a kill would waste all of the restore's work — and name
+    /// the gating that index/find-refs runs apply while it finishes.
+    /// Severity is [INFO]: restore state must not drive the warning icon.
+    /// </summary>
     [Fact]
     public void TimeoutWarningAnnouncesBackgroundContinuationNeverAKill()
     {
         var warning = RestorePolicy.StillRunningWarning(300);
 
-        Assert.StartsWith("[WARN]", warning);
+        Assert.StartsWith("[INFO]", warning);
         Assert.Contains("still running after 300s", warning);
         Assert.Contains("background", warning);
         Assert.Contains("gated", warning);
         Assert.Contains("fresh assets", warning);
+        Assert.DoesNotContain("[WARN]", warning);
         Assert.DoesNotContain("killed", warning, StringComparison.OrdinalIgnoreCase);
         Assert.Contains(RestorePolicy.TimeoutEnvName, warning);
     }

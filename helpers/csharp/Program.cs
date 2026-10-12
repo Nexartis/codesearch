@@ -459,7 +459,7 @@ public static class Program
                 throw new RestorePendingException();
             }
             Console.Error.WriteLine(
-                "[WARN] a dotnet restore for this solution is already running — serve reload " +
+                "[INFO] a dotnet restore for this solution is already running — serve reload " +
                 "keeps answering from the existing workspace until it finishes.");
             return [];
         }
@@ -531,20 +531,16 @@ public static class Program
             {
                 Console.Error.WriteLine($"[INFO] {header}");
             }
-            else if (restoredCount == 0)
-            {
-                // Nothing recovered: this is a real, solution-wide problem
-                // the operator must see as a warning, not a caveat.
-                Console.Error.WriteLine(
-                    "[WARN] " + header +
-                    " Every project failed its own restore; continuing with a degraded index.");
-            }
             else
             {
-                // At least part of the solution recovered: the remaining
-                // failures are confined to their projects and are reported
-                // per project below — not as a solution-wide warning.
-                Console.Error.WriteLine($"[INFO] {header}");
+                // INFO, never WARN — even when nothing recovered: a restore
+                // failure (a dead private feed, for one) is environment
+                // state, not a symbol-index defect, and must not drive the
+                // caller-facing warning icon. The cause rides in serve.log;
+                // per-project failures are reported below either way.
+                Console.Error.WriteLine(
+                    "[INFO] " + header +
+                    " Every project failed its own restore; continuing with a degraded index.");
                 foreach (var failure in fallback)
                 {
                     Console.Error.WriteLine(
@@ -561,7 +557,7 @@ public static class Program
         catch (Exception ex)
         {
             Console.Error.WriteLine(
-                $"[WARN] dotnet restore could not start ({ex.GetType().Name}: {ex.Message}) — continuing without it.");
+                $"[INFO] dotnet restore could not start ({ex.GetType().Name}: {ex.Message}) — continuing without it.");
             return [];
         }
     }
@@ -755,7 +751,6 @@ public static class Program
         {
             RestoreGate.ThrowIfRestorePending(solutionPath);
         }
-        RestoreFailedProjects = NoRestoreFailures;
         var restoreFailures = new List<ProjectRestoreFailure>();
         if (RestorePolicy.NeedsRestore(loadable.Select(p => p.RelativePath), solutionDir))
         {

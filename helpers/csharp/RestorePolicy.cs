@@ -229,17 +229,18 @@ internal static class RestorePolicy
     }
 
     /// <summary>
-    /// The <c>[WARN]</c> line emitted when the bounded wait expires while
+    /// The line emitted when the bounded wait expires while
     /// <c>dotnet restore</c> is still running — serve mode only: gated
     /// commands exit <see cref="ExitCodes.RestorePending"/> instead. The
     /// restore is NOT killed: it keeps running in the background (the child
     /// outlives the helper), serve keeps answering from the existing
     /// workspace, and any later index/find-refs run is gated by the restore
-    /// marker until the fresh assets land. Pinned by test so a "killed"
-    /// wording cannot sneak back in.
+    /// marker until the fresh assets land. INFO, never WARN: restore state
+    /// must not drive the caller-facing warning icon. Pinned by test so a
+    /// "killed" wording cannot sneak back in.
     /// </summary>
     public static string StillRunningWarning(int seconds) =>
-        $"[WARN] dotnet restore still running after {seconds}s — serve keeps answering from the " +
+        $"[INFO] dotnet restore still running after {seconds}s — serve keeps answering from the " +
         "existing workspace (degraded symbols) while restore continues in the background; " +
         "index and find-refs runs are gated until it finishes and the next reindex picks up " +
         $"the fresh assets. Raise with {TimeoutEnvName} if this solution legitimately needs longer.";
