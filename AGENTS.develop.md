@@ -236,13 +236,13 @@ Never `unwrap_or_default()` a store error on a search path — "no results" and 
 
 | Branch | Description |
 |---|---|
-| `fix/225-cpm-restore-gate` | scip-csharp: never build a C# index before restore completes; restore freshness honours central package management (issue #225) |
 
 ---
 
 ## Changelog highlights (recent)
 
-- **v1.5.4 (pending)** — restore gate: CPM-aware restore freshness (Directory.Packages.props etc.), restore-pending exit 75 with host-side bounded retry, previous index stays live during restore, watcher fires full C# rebuild on restore-input changes
+- **v1.5.5 (pending)** — serve TUI: symbol-index warnings wrap instead of clipping and `c` copies them to the clipboard
+- **v1.5.4** — restore gate: CPM-aware restore freshness (Directory.Packages.props etc.), restore-pending exit 75 with host-side bounded retry, previous index stays live during restore, watcher fires full C# rebuild on restore-input changes
 - **v1.4.4** — resident C# workspace pool no longer serves stale `find_impact` results after a rebuild: `WorkspacePool::evict` bumps a per-solution generation counter closing a spawn-in-flight race, and `scip_ref_cache` is now cleared unconditionally on both full and incremental rebuilds
 - **v1.3.37** — per-index embedding models end-to-end: serve queries, `POST /repos` and CLI index/stats/status honour the model each index records in its `metadata.json`; `serve --model` sets the default for newly created indexes; unrecorded indexes are queried with the built-in model plus a caller-facing warning; mid-rebuild indexes no longer report ready (PR #248)
 - **v1.3.23–v1.3.36** — dependency + platform wave: rmcp 3.3, fastembed 6.1 + ort rc.13, tantivy 0.26, axum 0.8, ratatui 0.30 + crossterm 0.29, thiserror 2, notify 8, tree-sitter 0.27, dirs/sha2/scip/sysinfo refresh + dependabot (weekly); clears the open Aikido/RUSTSEC advisories
