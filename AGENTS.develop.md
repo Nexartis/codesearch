@@ -236,7 +236,6 @@ Never `unwrap_or_default()` a store error on a search path — "no results" and 
 
 | Branch | Description |
 |---|---|
-| `fix/tui-warning-readability` | serve TUI: wrap Info-overlay warning lines + `c` copies them to the OS clipboard |
 
 ---
 
