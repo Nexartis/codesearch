@@ -178,7 +178,7 @@ internal static class RestorePolicy
     /// </summary>
     public static bool HasUsableAssets(string projectRelativePath, string solutionDir)
     {
-        var projectPath = Path.GetFullPath(Path.Combine(solutionDir, projectRelativePath));
+        var projectPath = Path.GetFullPath(Path.Combine(solutionDir, projectRelativePath.Replace('\\', Path.DirectorySeparatorChar)));
         var projectDir = Path.GetDirectoryName(projectPath) ?? solutionDir;
         return File.Exists(Path.Combine(projectDir, "obj", "project.assets.json"));
     }

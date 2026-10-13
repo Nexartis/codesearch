@@ -3147,6 +3147,29 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn runtime_teardown_finishes_a_restore_parked_blocking_task_within_grace() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.spawn_blocking(|| {
+            while super::sleep_unless_shutdown(std::time::Duration::from_secs(60)) {}
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        crate::constants::SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        runtime.shutdown_timeout(std::time::Duration::from_secs(
+            crate::constants::RUNTIME_SHUTDOWN_GRACE_SECS,
+        ));
+        let elapsed = started.elapsed();
+        crate::constants::SHUTDOWN_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(crate::constants::RUNTIME_SHUTDOWN_GRACE_SECS),
+            "teardown waited out the full grace ({elapsed:?}): the restore wait did not observe shutdown"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn lazy_find_refs_pending_persists_warning_and_caches_nothing() {
         use super::SymbolIndexer as _;
 

@@ -26,7 +26,7 @@ public class RestorePolicyTests : IDisposable
 
     private string AddProject(string relativePath, bool withAssets, bool staleAssets = false)
     {
-        var projectPath = Path.Combine(_solutionDir, relativePath);
+        var projectPath = Path.Combine(_solutionDir, relativePath.Replace('\\', Path.DirectorySeparatorChar));
         Directory.CreateDirectory(Path.GetDirectoryName(projectPath)!);
         File.WriteAllText(projectPath, "<Project Sdk=\"Microsoft.NET.Sdk\" />");
         if (withAssets)
@@ -133,7 +133,7 @@ public class RestorePolicyTests : IDisposable
     }
 
     private string AddRestoreInput(string relativePath, bool touched) =>
-        AddRestoreInputAt(Path.Combine(_solutionDir, relativePath), touched);
+        AddRestoreInputAt(Path.Combine(_solutionDir, relativePath.Replace('\\', Path.DirectorySeparatorChar)), touched);
 
     private string AddRestoreInputAt(string inputPath, bool touched)
     {
