@@ -3650,6 +3650,33 @@ fn build_info_overlay_reads_symbol_warnings_from_meta() {
     }
 }
 
+/// A failed first build must KEEP the registration and release the marker:
+/// the old rollback unregistered the alias and let self-cleanup delete the
+/// DB dir — the vanishing-repo defect (a 202 was the operator's last
+/// word). A registered half-built store heals via reindex.
+#[test]
+fn note_add_index_failure_keeps_the_repo_registered() {
+    let (_tmp, repo_path, state) = state_with_repo("addfail");
+    let alias = "addfail";
+    // The add handler begins indexing before spawning the build task.
+    assert!(state.begin_indexing(alias, IndexingOwner::Reindex));
+
+    state.note_add_index_failure(
+        alias,
+        &repo_path,
+        &anyhow::anyhow!("FTS commit failed: Access is denied. (os error 5)"),
+    );
+
+    assert!(
+        state.config_snapshot().resolve(alias).is_some(),
+        "the repo must stay registered after a failed first build"
+    );
+    assert!(
+        state.begin_indexing(alias, IndexingOwner::Reindex),
+        "the failed marker must be released so a retry can start immediately"
+    );
+}
+
 /// The symbol-index status collector reads plain meta (never a helper):
 /// stale without a current builder stamp, ready with one, degraded with
 /// warnings — and a repo without entrypoints reads not-applicable instead

@@ -1233,7 +1233,62 @@ impl IndexManager {
     /// 2. Reindexes every file from scratch using the existing store handles
     ///
     /// No files are deleted, so there is no OS error 32 (file in use).
+    ///
+    /// A failure of the transient Windows FTS commit race (an indexer holds
+    /// a freshly created Tantivy segment file while the commit opens it —
+    /// os error 5/32/33) redrives the WHOLE pass once after a 5s backoff:
+    /// a full pass is idempotent (clear + rebuild), while a commit retry on
+    /// the same writer is never safe (a half-joined pipeline must not be
+    /// recommitted — see `FtsStore::commit_once`). This is what killed the
+    /// field incidents: two worktree adds and one full reindex.
     pub async fn force_reindex_with_stores(
+        codebase_path: &Path,
+        db_path: &Path,
+        stores: &SharedStores,
+        model_override: Option<ModelType>,
+        cancel_token: &CancellationToken,
+        embedding_pool: Option<&Arc<EmbeddingServicePool>>,
+    ) -> Result<()> {
+        Self::retry_once_on_transient_fts(std::time::Duration::from_secs(5), || async {
+            Self::force_reindex_with_stores_once(
+                codebase_path,
+                db_path,
+                stores,
+                model_override,
+                cancel_token,
+                embedding_pool,
+            )
+            .await
+        })
+        .await
+    }
+
+    /// Redrive `attempt` once when its error is the transient Windows FTS
+    /// commit race. Any other error (and a second transient failure) is
+    /// returned untouched — bounded, never a loop.
+    pub(crate) async fn retry_once_on_transient_fts<T, Fut, F>(
+        backoff: std::time::Duration,
+        mut attempt: F,
+    ) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        match attempt().await {
+            Ok(v) => Ok(v),
+            Err(e) if crate::fts::FtsStore::is_transient_fts_commit_error(&format!("{e:#}")) => {
+                warn!(
+                    "Transient FTS commit failure ({e:#}) — retrying the full pass once in {}s",
+                    backoff.as_secs().max(1)
+                );
+                tokio::time::sleep(backoff).await;
+                attempt().await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn force_reindex_with_stores_once(
         codebase_path: &Path,
         db_path: &Path,
         stores: &SharedStores,
@@ -3266,6 +3321,55 @@ mod tests {
         let _again = tokio::time::timeout(std::time::Duration::from_secs(1), gate.acquire())
             .await
             .expect("the refresh must release its job permit");
+    }
+
+    /// The transient-FTS retry redrives the WHOLE pass exactly once: a
+    /// transient-shaped error is retried (the field case — the first pass
+    /// fails on the AV holding a new segment file, the retry lands), a
+    /// non-transient error is returned without a second attempt, and a
+    /// second transient failure gives up — bounded, never a loop.
+    #[tokio::test]
+    async fn retry_once_on_transient_fts_redrives_once_and_only_once() {
+        let ms = std::time::Duration::from_millis(1);
+
+        // Transient once → retried, succeeds, exactly two attempts.
+        let mut attempts = 0u32;
+        let out: Result<u32> = IndexManager::retry_once_on_transient_fts(ms, || {
+            let done = attempts >= 1;
+            attempts += 1;
+            async move {
+                if done {
+                    Ok(1)
+                } else {
+                    Err(anyhow::anyhow!(
+                        "FTS commit failed: Access is denied. (os error 5)"
+                    ))
+                }
+            }
+        })
+        .await;
+        assert_eq!(out.unwrap(), 1);
+        assert_eq!(attempts, 2);
+
+        // Non-transient → returned immediately, one attempt.
+        let mut attempts = 0u32;
+        let out: Result<()> = IndexManager::retry_once_on_transient_fts(ms, || {
+            attempts += 1;
+            async { Err(anyhow::anyhow!("schema mismatch")) }
+        })
+        .await;
+        assert!(out.is_err());
+        assert_eq!(attempts, 1);
+
+        // Transient twice → gives up after the second attempt.
+        let mut attempts = 0u32;
+        let out: Result<()> = IndexManager::retry_once_on_transient_fts(ms, || {
+            attempts += 1;
+            async { Err(anyhow::anyhow!("os error 32")) }
+        })
+        .await;
+        assert!(out.is_err());
+        assert_eq!(attempts, 2);
     }
 
     /// Regression for the wrapper/inner split: `force_reindex_with_stores`
