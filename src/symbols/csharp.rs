@@ -2346,6 +2346,14 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             .map(|s| s.to_string())
     }
 
+    /// Same freshness check the rebuild gate applies (mod.rs: an absent or
+    /// foreign builder stamp reads as stale for C#, unlike adapters that do
+    /// not stamp at all — hence the override, not the trait default).
+    fn index_matches_builder(&self, db_path: &Path) -> bool {
+        self.index_builder_version(db_path).as_deref()
+            == Some(crate::constants::INDEX_BUILDER_VERSION)
+    }
+
     /// Whether a SCIP index exists AND was built with the current key format.
     /// An index that is fresh by timestamp but stamped with another (or no)
     /// key-format generation would serve old-shaped canonical keys as truth,

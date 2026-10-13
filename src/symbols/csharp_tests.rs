@@ -305,6 +305,55 @@ fn index_warnings_roundtrip_and_clean_absence() {
 // script. Deleting the stamp write must fail this test, or every serve
 // start churns all inherited C# indexes (absent stamp reads as stale).
 
+/// The C# freshness override mirrors the rebuild gate exactly: a current
+/// stamp matches, an absent or foreign stamp does not — while adapters
+/// without stamping take the trait default (`true`) and never read stale.
+#[test]
+fn index_matches_builder_mirrors_the_rebuild_gate() {
+    use crate::constants::{INDEX_BUILDER_VERSION, SCIP_INDEX_BUILDER_VERSION_KEY};
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = dir.path().join("db");
+    let indexer = super::csharp::CSharpSymbolIndexer::new();
+    use crate::symbols::SymbolIndexer as _;
+
+    // No meta at all: absent stamp reads as stale (the pre-stamp class).
+    assert!(
+        !indexer.index_matches_builder(&db),
+        "an index with no builder stamp must not count as this build's"
+    );
+
+    // A foreign binary's stamp: stale.
+    let env = crate::symbols::get_shared_scip_env(&db).unwrap();
+    let mut wtxn = env.write_txn().unwrap();
+    let meta_db: heed::Database<heed::types::Str, heed::types::Str> = env
+        .create_database(&mut wtxn, Some(crate::constants::SCIP_META_DB_NAME))
+        .unwrap();
+    meta_db
+        .put(&mut wtxn, SCIP_INDEX_BUILDER_VERSION_KEY, "v0.0.0+1")
+        .unwrap();
+    wtxn.commit().unwrap();
+    assert!(
+        !indexer.index_matches_builder(&db),
+        "another build's stamp must not count as this build's"
+    );
+
+    // A rebuild by THIS binary: the meta write stamps the current version.
+    let env = crate::symbols::get_shared_scip_env(&db).unwrap();
+    let mut wtxn = env.write_txn().unwrap();
+    let meta_db: heed::Database<heed::types::Str, heed::types::Str> = env
+        .open_database(&wtxn, Some(crate::constants::SCIP_META_DB_NAME))
+        .unwrap()
+        .unwrap();
+    super::csharp::CSharpSymbolIndexer::write_rebuild_meta(&meta_db, &mut wtxn, &[])
+        .expect("meta write must succeed");
+    wtxn.commit().unwrap();
+    assert!(
+        indexer.index_matches_builder(&db),
+        "a rebuild by this binary must match (stamped {INDEX_BUILDER_VERSION})"
+    );
+}
+
 #[test]
 fn rebuild_meta_write_stamps_version_and_writes_or_clears_warnings() {
     use crate::constants::{INDEX_BUILDER_VERSION, SCIP_INDEX_BUILDER_VERSION_KEY};

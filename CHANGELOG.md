@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.5.13]
+
+### Added
+
+- **Symbol-index status surfaces.** The chunk fields on `/repos/:alias/info` and the Info overlay said nothing about the SCIP index that `find_impact` uses, so an agent could not tell a working symbol index from an absent/stale/degraded one before trusting `references: []`. Every info surface now carries `symbol_index[]` — per language a `state` (`ready` / `degraded` / `stale` / `restore-pending` / `absent` / `not-applicable`), the index age and applicability — composed from the same on-disk meta the rebuild gates act on (new shared collector `symbol_index_status`, C# freshness override `index_matches_builder` mirroring the rebuild gate). `find_impact` resolved/empty answers embed the same array (applicable languages only) and the tool description tells agents to check it before concluding "no callers"; both serve TUIs render the status lines with state coloring. Remote-TUI deserialization tolerates older peers (missing field → empty section; null age → unknown).
+
 ## [1.5.9]
 
 ### Fixed
