@@ -382,6 +382,85 @@ fn test_file_meta_store() {
     assert!(loaded.is_tracked("test.txt"));
 }
 
+/// A store produced by ANOTHER build (or from before the builder stamp
+/// existed) must wipe its records on load: the chunker's output convention
+/// can change without a single source byte changing, so every content
+/// signal reports "fresh" while the stored chunk lines are wrong-by-
+/// convention. The wipe makes the manager re-chunk everything once; the
+/// reloaded store carries the current stamp so the next run is incremental
+/// again.
+#[test]
+fn builder_version_mismatch_invalidates_the_store() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path();
+
+    let test_file = dir.path().join("test.txt");
+    fs::write(&test_file, "hello world").unwrap();
+
+    let mut store = FileMetaStore::new("test-model".to_string(), 384);
+    store
+        .update_file(&test_file, "test.txt", vec![1, 2, 3])
+        .unwrap();
+    store.save(db_path).unwrap();
+
+    // Simulate a store written by an older build (or a pre-stamp one).
+    let meta_path = db_path.join("file_meta.json");
+    let content = fs::read_to_string(&meta_path).unwrap();
+    let stripped: serde_json::Value = serde_json::from_str(&content).unwrap();
+    let mut obj = stripped.as_object().expect("json object").clone();
+    obj.insert(
+        "builder_version".to_string(),
+        serde_json::Value::String("0.0.0-old".to_string()),
+    );
+    fs::write(&meta_path, serde_json::to_string_pretty(&obj).unwrap()).unwrap();
+
+    let loaded = FileMetaStore::load_or_create(db_path, "test-model", 384).unwrap();
+    assert!(
+        loaded.files.is_empty(),
+        "records from another build must not survive, got {} file(s)",
+        loaded.files.len()
+    );
+    assert_eq!(
+        loaded.builder_version,
+        crate::constants::INDEX_BUILDER_VERSION
+    );
+    // And the wiped store behaves like a fresh one: the file is new again.
+    let (needs_reindex, _) = loaded.check_file(&test_file, "test.txt").unwrap();
+    assert!(needs_reindex);
+}
+
+/// A pre-stamp store (no builder_version field at all) is treated the same
+/// way: serde's default is an empty string, which never matches the current
+/// version.
+#[test]
+fn pre_stamp_store_invalidates_too() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path();
+
+    let test_file = dir.path().join("test.txt");
+    fs::write(&test_file, "hello world").unwrap();
+
+    let mut store = FileMetaStore::new("test-model".to_string(), 384);
+    store
+        .update_file(&test_file, "test.txt", vec![1, 2, 3])
+        .unwrap();
+    store.save(db_path).unwrap();
+
+    // Strip the field entirely, as an older binary would have written it.
+    let meta_path = db_path.join("file_meta.json");
+    let content = fs::read_to_string(&meta_path).unwrap();
+    let stripped: serde_json::Value = serde_json::from_str(&content).unwrap();
+    let mut obj = stripped.as_object().expect("json object").clone();
+    obj.remove("builder_version");
+    fs::write(&meta_path, serde_json::to_string_pretty(&obj).unwrap()).unwrap();
+
+    let loaded = FileMetaStore::load_or_create(db_path, "test-model", 384).unwrap();
+    assert!(
+        loaded.files.is_empty(),
+        "pre-stamp records must not survive"
+    );
+}
+
 #[test]
 fn test_storage_key_relative_and_portable() {
     let dir = tempdir().unwrap();
