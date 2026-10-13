@@ -3636,6 +3636,18 @@ impl ServeState {
         warnings
     }
 
+    /// Per-language symbol-index status for the info surfaces — the same
+    /// shared collector find_impact answers carry, so the TUI, REST and MCP
+    /// surfaces cannot disagree about what "ready" means. Needs the project
+    /// path (applicability) next to the db path.
+    pub(crate) fn collect_symbol_index_status(
+        &self,
+        project_path: &Path,
+        db_path: &Path,
+    ) -> Vec<crate::symbols::SymbolIndexStatus> {
+        crate::symbols::symbol_index_status(&self.symbol_registry, project_path, db_path)
+    }
+
     /// Get lightweight repo statuses WITHOUT opening any databases.
     /// Returns a list of (alias, status_info) where status is derived from DashMap state only.
     pub(crate) fn repo_statuses_lightweight(&self) -> Vec<(String, RepoStatusInfo)> {
@@ -4413,6 +4425,10 @@ async fn info_handler(
     // Durable symbol-index warnings, read fresh from the on-disk meta
     // (shared with the TUI info overlay so the two cannot drift).
     let symbol_warnings = state.collect_symbol_warnings(&db_path);
+    // Per-language symbol-index status — the same shared collector the TUI
+    // overlay and find_impact answers use, so a consumer can tell a working
+    // symbol index from an absent/stale/degraded one before trusting it.
+    let symbol_index = state.collect_symbol_index_status(&project_path, &db_path);
 
     AxumJson(json!({
         "path": db_path.display().to_string(),
@@ -4427,6 +4443,12 @@ async fn info_handler(
         // Durable record of a degraded symbol index (see the TUI's C#⚠):
         // build-environment failures the helper survived during rebuild.
         "symbol_warnings": symbol_warnings,
+        // Per-language symbol-index status (ready/degraded/stale/
+        // restore-pending/absent/not-applicable): is there a usable SCIP
+        // index at all, and is it THIS build's? The chunk fields above say
+        // nothing about it — that gap made agents trust "0 references"
+        // from a repo with no symbol index.
+        "symbol_index": symbol_index,
         // Is the HNSW graph built and committed? A non-zero `chunks` with
         // `indexed: false` is a searchable-looking but silently dead index:
         // `VectorStore::search` refuses to run without the graph. The cloud

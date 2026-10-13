@@ -3650,6 +3650,83 @@ fn build_info_overlay_reads_symbol_warnings_from_meta() {
     }
 }
 
+/// The symbol-index status collector reads plain meta (never a helper):
+/// stale without a current builder stamp, ready with one, degraded with
+/// warnings — and a repo without entrypoints reads not-applicable instead
+/// of blaming an absent index.
+#[test]
+#[serial]
+fn symbol_index_status_reflects_the_on_disk_meta() {
+    use crate::constants::{INDEX_BUILDER_VERSION, SCIP_INDEX_BUILDER_VERSION_KEY};
+
+    let (_tmp, repo_path, state) = state_with_repo("syminfo");
+    let db = repo_path.join(DB_DIR_NAME);
+    let registry = state.symbol_registry();
+
+    // No entrypoints at all: both languages are explicitly not-applicable.
+    let statuses = crate::symbols::symbol_index_status(&registry, &repo_path, &db);
+    assert!(
+        statuses.iter().all(|s| s.not_applicable),
+        "a repo without entrypoints must not blame an absent index: {statuses:?}"
+    );
+
+    // Applicable from here on: a solution file.
+    std::fs::write(repo_path.join("test.sln"), b"Solution File").unwrap();
+
+    // Key-format stamp only (no builder stamp): has_index accepts it, the
+    // builder check reads stale — the inherited-index class.
+    seed_scip_meta(&db, &[]);
+    let csharp = crate::symbols::symbol_index_status(&registry, &repo_path, &db)
+        .into_iter()
+        .find(|s| s.language == "csharp")
+        .expect("csharp status entry");
+    assert_eq!(csharp.state, "stale", "{csharp:?}");
+
+    // A rebuild by THIS binary (current stamp): ready.
+    seed_scip_meta(
+        &db,
+        &[(SCIP_INDEX_BUILDER_VERSION_KEY, INDEX_BUILDER_VERSION)],
+    );
+    let csharp = crate::symbols::symbol_index_status(&registry, &repo_path, &db)
+        .into_iter()
+        .find(|s| s.language == "csharp")
+        .expect("csharp status entry");
+    assert_eq!(csharp.state, "ready", "{csharp:?}");
+    assert!(!csharp.not_applicable);
+
+    // Survived build failures in meta: degraded — serving but incomplete.
+    seed_scip_meta(
+        &db,
+        &[
+            (SCIP_INDEX_BUILDER_VERSION_KEY, INDEX_BUILDER_VERSION),
+            (
+                crate::constants::SCIP_INDEX_WARNINGS_KEY,
+                r#"["Broken.csproj: Msbuild failed when processing the file"]"#,
+            ),
+        ],
+    );
+    let csharp = crate::symbols::symbol_index_status(&registry, &repo_path, &db)
+        .into_iter()
+        .find(|s| s.language == "csharp")
+        .expect("csharp status entry");
+    assert_eq!(csharp.state, "degraded", "{csharp:?}");
+}
+
+/// The overlay's age renderer must turn the unknown-age sentinel into
+/// words — a consumer must never read "18446744073709551615" as an age.
+#[test]
+fn human_age_seconds_renders_the_unknown_sentinel_as_words() {
+    assert_eq!(crate::serve::tui::human_age_seconds(0), "0s");
+    assert_eq!(crate::serve::tui::human_age_seconds(59), "59s");
+    assert_eq!(crate::serve::tui::human_age_seconds(120), "2m");
+    assert_eq!(crate::serve::tui::human_age_seconds(3 * 3600), "3h");
+    assert_eq!(crate::serve::tui::human_age_seconds(72 * 3600), "3d");
+    assert_eq!(
+        crate::serve::tui::human_age_seconds(u64::MAX),
+        "unknown age"
+    );
+}
+
 /// `c` copies the warnings of an Info overlay — and nothing else: other
 /// overlays ignore the key, Esc still dismisses everywhere.
 #[test]
@@ -3657,7 +3734,7 @@ fn overlay_copy_key_only_fires_on_info_overlays() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     let info = crate::serve::tui_common::OverlayState::Info {
-        alias: "acme-web".to_string(),
+        alias: "demo.app".to_string(),
         path: String::new(),
         chunks: 0,
         files: 0,
@@ -3668,6 +3745,7 @@ fn overlay_copy_key_only_fires_on_info_overlays() {
         lock: "write".to_string(),
         index_age: String::new(),
         symbol_warnings: vec!["w1".to_string()],
+        symbol_index: Vec::new(),
         copy_feedback: None,
     };
     let copy_key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
@@ -3719,6 +3797,7 @@ fn apply_copy_warnings_reports_when_nothing_is_recorded() {
         lock: "write".to_string(),
         index_age: String::new(),
         symbol_warnings: vec![],
+        symbol_index: Vec::new(),
         copy_feedback: None,
     };
     crate::serve::tui_common::apply_copy_warnings(&mut info);
@@ -3751,6 +3830,7 @@ fn apply_copy_warnings_feedback_covers_success_and_failure() {
             lock: "write".to_string(),
             index_age: String::new(),
             symbol_warnings: vec!["summary".to_string()],
+            symbol_index: Vec::new(),
             copy_feedback: None,
         }
     }

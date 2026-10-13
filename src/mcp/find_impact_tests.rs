@@ -256,6 +256,7 @@ fn fingerprint_fields_present_when_set_and_omitted_when_none() {
             scope: "project:p".to_string(),
             index_head_sha,
             current_head_sha,
+            symbol_index: Vec::new(),
         }
     };
     let all: serde_json::Value = serde_json::to_value(base(
@@ -305,6 +306,7 @@ fn index_age_sentinel_serializes_as_null_and_real_ages_as_numbers() {
         scope: "project:p".to_string(),
         index_head_sha: None,
         current_head_sha: None,
+        symbol_index: Vec::new(),
     };
 
     // u64::MAX is `index_age`'s unreadable-index sentinel; a consumer must
@@ -399,6 +401,15 @@ fn build_service() -> (CodesearchService, tempfile::TempDir) {
         std::sync::Arc::new(crate::index::SharedStores::new(&db, 2).expect("shared stores"));
     let service = CodesearchService::new_with_stores(Some(root.path().to_path_buf()), Some(stores))
         .expect("service");
+    (service, root)
+}
+
+/// [`build_service`] plus a solution file, so the csharp indexer is
+/// APPLICABLE and answers carry a real csharp `symbol_index` entry (the
+/// plain fixture repo has no entrypoints, so both languages filter out).
+fn build_applicable_service() -> (CodesearchService, tempfile::TempDir) {
+    let (service, root) = build_service();
+    std::fs::write(root.path().join("test.sln"), b"Solution File").expect("sln");
     (service, root)
 }
 
@@ -832,6 +843,52 @@ async fn resolved_answer_surfaces_persisted_warnings() {
             .unwrap()
             .contains("FindReferencesAsync failed for Warned"),
         "warning text must round-trip verbatim: {out}"
+    );
+}
+
+/// Every EMPTY answer carries the per-language symbol-index status of the
+/// repo it came from — the check an agent needs before reading
+/// `references: []` as "verified no callers". A name that matches nothing
+/// is the canonical empty answer: LMDB-only, no helper spawn. Applicable
+/// languages only: a repo without a tsconfig must not list typescript as
+/// absent-with-blame.
+#[tokio::test]
+#[serial_test::serial]
+async fn answers_carry_the_symbol_index_status() {
+    let helper_root = tempfile::tempdir().unwrap();
+    let _guard = make_helper_available(&helper_root);
+    let (service, root) = build_applicable_service();
+    populate_warnings_fixture(&root.path().join(".codesearch.db"));
+
+    let out = tool_text(
+        &service,
+        FindImpactRequest {
+            symbol_name: Some("NoSuchSymbol".to_string()),
+            ..find_impact_request()
+        },
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        v["references"],
+        serde_json::json!([]),
+        "the name must not match the fixture's symbols: {out}"
+    );
+
+    let statuses = v["symbol_index"]
+        .as_array()
+        .expect("symbol_index present on an empty answer");
+    let csharp = statuses
+        .iter()
+        .find(|s| s["language"] == "csharp")
+        .expect("csharp status entry present");
+    assert_eq!(
+        csharp["state"], "absent",
+        "the fixture has symbol tables but no key-format stamp, so has_index refuses it: {out}"
+    );
+    assert!(
+        statuses.iter().all(|s| s["language"] != "typescript"),
+        "non-applicable languages must be filtered out of find_impact answers: {out}"
     );
 }
 
