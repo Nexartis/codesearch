@@ -97,7 +97,7 @@ internal static class RestorePolicy
         var walkRoot = FindWalkRoot(solutionDir);
         foreach (var relative in projectRelativePaths)
         {
-            var projectPath = Path.GetFullPath(Path.Combine(solutionDir, relative));
+            var projectPath = ResolveProjectPath(solutionDir, relative);
             var projectDir = Path.GetDirectoryName(projectPath) ?? solutionDir;
             var assetsPath = Path.Combine(projectDir, "obj", "project.assets.json");
             if (!File.Exists(assetsPath))
@@ -178,10 +178,14 @@ internal static class RestorePolicy
     /// </summary>
     public static bool HasUsableAssets(string projectRelativePath, string solutionDir)
     {
-        var projectPath = Path.GetFullPath(Path.Combine(solutionDir, projectRelativePath.Replace('\\', Path.DirectorySeparatorChar)));
+        var projectPath = ResolveProjectPath(solutionDir, projectRelativePath);
         var projectDir = Path.GetDirectoryName(projectPath) ?? solutionDir;
         return File.Exists(Path.Combine(projectDir, "obj", "project.assets.json"));
     }
+
+    // MSBuild/Windows paths use backslashes; on non-Windows '\' is an ordinary filename char.
+    private static string ResolveProjectPath(string solutionDir, string relative) =>
+        Path.GetFullPath(Path.Combine(solutionDir, relative.Replace('\\', Path.DirectorySeparatorChar)));
 
     private static bool PathsEqual(string left, string right) =>
         string.Equals(
