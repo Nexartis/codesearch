@@ -171,7 +171,7 @@ public class RestorePolicyTests : IDisposable
     {
         var output = string.Join('\n',
             "C:\\repo\\A.csproj : warning NU1900: Unable to load the service index for source https://feed.example",
-            "C:\\repo\\B.csproj : error NU1101: Unable to find package Dlw.Net.Standard. No packages exist with this id in source(s): platina-dlwr.",
+            "C:\\repo\\B.csproj : error NU1101: Unable to find package Acme.Shared. No packages exist with this id in source(s): acme-feed.",
             "C:\\repo\\C.csproj : error NU1101: Unable to find package Other.",
             new string('x', 400) + " error NU1001 tail",
             "Done.");
@@ -179,7 +179,7 @@ public class RestorePolicyTests : IDisposable
         var detail = RestorePolicy.ExtractRestoreErrors(output);
 
         Assert.StartsWith(" Restore output: ", detail);
-        Assert.Contains("NU1101: Unable to find package Dlw.Net.Standard", detail);
+        Assert.Contains("NU1101: Unable to find package Acme.Shared", detail);
         Assert.Contains("Unable to find package Other", detail);
         Assert.DoesNotContain("NU1900", detail);
         Assert.DoesNotContain("Done.", detail);
