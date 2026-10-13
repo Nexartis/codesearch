@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.5.14]
+
+### Fixed
+
+- **The index database directory is now marked hidden on Windows.** The dot in `.codesearch.db` means nothing to Windows: the Search indexer crawled it like any folder, and its scanner holding a freshly created Tantivy segment file is the transient commit race behind the field incidents (os error 5). The indexer skips hidden directories (the `.git` convention), so `SharedStores` now marks the db dir hidden on creation and on every read-write open — existing directories are fixed on the next serve start, best-effort and idempotent.
+
 ## [1.5.13]
 
 ### Fixed
