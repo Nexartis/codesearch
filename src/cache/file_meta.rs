@@ -307,11 +307,15 @@ impl FileMetaStore {
             let mut store: FileMetaStore = serde_json::from_str(&content)
                 .map_err(|e| anyhow!("Failed to parse file metadata: {}", e))?;
 
-            // Check if model changed - if so, invalidate everything
+            // Check if model changed - if so, invalidate everything.
+            // warn_print!: stderr + quiet-aware — a raw println would
+            // corrupt the serve TUI's screen (observed live when the
+            // builder-version wipe below fired for the whole fleet).
             if store.model_name != model_name || store.dimensions != dimensions {
-                println!(
+                crate::warn_print!(
                     "⚠️  Model changed ({} -> {}), full re-index required",
-                    store.model_name, model_name
+                    store.model_name,
+                    model_name
                 );
                 store = Self::new(model_name.to_string(), dimensions);
             }
@@ -319,7 +323,7 @@ impl FileMetaStore {
             // Check if another build produced these records — its chunker
             // conventions (line bases, key shapes) are not ours.
             if store.builder_version != crate::constants::INDEX_BUILDER_VERSION {
-                println!(
+                crate::warn_print!(
                     "⚠️  Indexer version changed ({} -> {}), full re-index required",
                     if store.builder_version.is_empty() {
                         "pre-stamp".to_string()
