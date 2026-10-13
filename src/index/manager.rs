@@ -211,6 +211,25 @@ pub struct SharedStores {
     pub job_gate: Option<Arc<crate::limits::JobGate>>,
 }
 
+/// Mark the database directory hidden on Windows (the ".git" convention):
+/// the Search indexer skips hidden directories, and its scanner holding a
+/// freshly created Tantivy segment file is exactly the transient commit
+/// race [`IndexManager::force_reindex_with_stores`] retries around.
+/// Best-effort and idempotent — a missing or failing attrib never blocks
+/// indexing.
+#[cfg(windows)]
+fn hide_db_dir_on_windows(db_path: &Path) {
+    let _ = std::process::Command::new("attrib")
+        .arg("+H")
+        .arg(db_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+#[cfg(not(windows))]
+fn hide_db_dir_on_windows(_db_path: &Path) {}
+
 impl SharedStores {
     /// Attach a process-wide heavy-job gate to these stores (serve mode).
     pub fn with_job_gate(mut self, gate: Arc<crate::limits::JobGate>) -> Self {
@@ -270,6 +289,13 @@ impl SharedStores {
         std::fs::create_dir_all(db_path).with_context(|| {
             format!("Failed to create database directory {}", db_path.display())
         })?;
+        // The dot in ".codesearch.db" means nothing to Windows: the Search
+        // indexer crawls the folder like any other, and its scanner holding
+        // a freshly created Tantivy segment file is exactly the transient
+        // commit race `force_reindex_with_stores` retries around. The
+        // indexer skips hidden directories (the ".git" convention), so mark
+        // the folder hidden — idempotent, best-effort.
+        hide_db_dir_on_windows(db_path);
 
         // Try to acquire writer lock
         let lock = acquire_writer_lock(db_path);
@@ -3370,6 +3396,24 @@ mod tests {
         .await;
         assert!(out.is_err());
         assert_eq!(attempts, 2);
+    }
+
+    /// The db directory must carry FILE_ATTRIBUTE_HIDDEN after a read-write
+    /// create: the Search indexer skips hidden directories, which is the
+    /// structural fix for the scanner race on fresh Tantivy segment files.
+    #[cfg(windows)]
+    #[test]
+    fn shared_stores_marks_the_db_dir_hidden() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join(".codesearch.db");
+        let _stores = SharedStores::new(&db, 2).unwrap();
+        use std::os::windows::fs::MetadataExt;
+        let attrs = std::fs::metadata(&db).unwrap().file_attributes();
+        assert_ne!(
+            attrs & 0x2,
+            0,
+            "the db dir must carry FILE_ATTRIBUTE_HIDDEN"
+        );
     }
 
     /// Regression for the wrapper/inner split: `force_reindex_with_stores`
