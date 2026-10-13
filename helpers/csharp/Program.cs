@@ -403,12 +403,8 @@ public static class Program
             // "failure", but the affected project still loads and its symbol
             // tree is complete — build engineering settles the pin; the
             // index must not carry the noise as a warning.
-            // A NuGet package-version mismatch ("Dependency specified was X
-            // (>= A) but ended up with X B") also surfaces as an Msbuild
-            // "failure", but the affected project still loads and its symbol
-            // tree is complete — build engineering settles the pin; the
-            // index must not carry the noise as a warning.
-            if (WorkspaceNoise.IsPackageVersionConflict(e.Diagnostic?.Message))
+            if (WorkspaceNoise.IsPackageVersionConflict(e.Diagnostic?.Message)
+                || WorkspaceNoise.IsNuGetSourceFailure(e.Diagnostic?.Message))
             {
                 Console.Error.WriteLine(WorkspaceNoise.DemotedNote(e.Diagnostic!));
                 return;
@@ -827,8 +823,9 @@ public static class Program
         }
         catch (Exception ex)
         {
+            var level = WorkspaceNoise.IsBuildHostTypeInitializerCrash(ex.Message) ? "INFO" : "WARN";
             Console.Error.WriteLine(
-                $"[WARN] Filtered solution still failed ({ex.GetType().Name}: {ex.Message}); " +
+                $"[{level}] Filtered solution still failed ({ex.GetType().Name}: {ex.Message}); " +
                 $"falling back to loading {loadable.Count - noAssets.Count} individual .csproj files.");
         }
         finally
@@ -864,6 +861,15 @@ public static class Program
                 continue;
             }
 
+            // OpenProjectAsync also loads the project's ProjectReferences; re-opening
+            // one of them throws "already part of the workspace".
+            if (workspace.CurrentSolution.Projects.Any(p =>
+                    string.Equals(p.FilePath, csprojPath, StringComparison.OrdinalIgnoreCase)))
+            {
+                loaded++;
+                continue;
+            }
+
             try
             {
                 await workspace.OpenProjectAsync(csprojPath).ConfigureAwait(false);
@@ -871,8 +877,9 @@ public static class Program
             }
             catch (Exception ex)
             {
+                var level = WorkspaceNoise.IsBuildHostTypeInitializerCrash(ex.Message) ? "INFO" : "WARN";
                 Console.Error.WriteLine(
-                    $"[WARN] Failed to load project '{entry.RelativePath}': {ex.GetType().Name}: {ex.Message}");
+                    $"[{level}] Failed to load project '{entry.RelativePath}': {ex.GetType().Name}: {ex.Message}");
             }
         }
 

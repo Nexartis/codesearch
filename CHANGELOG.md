@@ -14,6 +14,14 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.5.9]
+
+### Fixed
+
+- **scip-csharp: projects already loaded through a ProjectReference are no longer added twice.** The per-project fallback re-opened them, causing `already part of the workspace` failures and cross-project references missing from the index.
+- **NuGet feed failures and the BuildHost `XMakeElements` crash are logged as `[INFO]`, not index warnings.** They are environment issues; an affected project is skipped in the index and the INFO line records it.
+- **Serve: `q` quits while a C# rebuild waits for `dotnet restore`.** The restore wait polls the shutdown flag and the runtime gives blocking tasks a 5 s grace, instead of joining a rebuild parked for up to 20 minutes.
+
 ## [1.5.6]
 
 ### Fixed
