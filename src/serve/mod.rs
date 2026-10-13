@@ -3648,6 +3648,27 @@ impl ServeState {
         crate::symbols::symbol_index_status(&self.symbol_registry, project_path, db_path)
     }
 
+    /// Record a failed first build for a newly added repo: log the error
+    /// with the heal command and release the Reindex marker. Deliberately
+    /// does NOT unregister — a vanished repo (the old rollback) is
+    /// unfixable by the operator who cannot even see it; a registered one
+    /// heals via reindex.
+    pub(crate) fn note_add_index_failure(
+        &self,
+        alias: &str,
+        project_path: &Path,
+        error: &anyhow::Error,
+    ) {
+        tracing::error!(
+            "Index creation failed for '{}' ({}): {error:#} — the repo stays \
+             registered with a partial index; reindex it to heal: \
+             `codesearch index reindex {alias}` (or POST /repos/{alias}/reindex)",
+            alias,
+            project_path.display()
+        );
+        self.end_indexing(alias, IndexingOwner::Reindex);
+    }
+
     /// Get lightweight repo statuses WITHOUT opening any databases.
     /// Returns a list of (alias, status_info) where status is derived from DashMap state only.
     pub(crate) fn repo_statuses_lightweight(&self) -> Vec<(String, RepoStatusInfo)> {
@@ -5448,20 +5469,14 @@ async fn add_repo_handler(
                     state_bg.end_indexing(&alias_bg, IndexingOwner::Reindex);
                     return;
                 }
-                tracing::error!("Index creation failed for '{}': {}", alias_bg, e);
-                // Clean up: remove from repos and config
-                state_bg.repos.remove(&alias_bg);
-                state_bg.end_indexing(&alias_bg, IndexingOwner::Reindex);
-                if let Ok(mut config) = state_bg.config.write() {
-                    config.unregister_alias(&alias_bg);
-                    if let Err(e) = state_bg.persist_config(&config) {
-                        tracing::warn!(
-                            "Failed to persist config after add-repo index failure for '{}': {}",
-                            alias_bg,
-                            e
-                        );
-                    }
-                }
+                // KEEP the repo registered on a failed first build. The old
+                // rollback (repos.remove + unregister + persist_config)
+                // turned one build crash into a vanishing repo: the 202 was
+                // the caller's last word, repos.json lost the entry, and
+                // self-cleanup then deleted the DB dir. A half-built store
+                // heals on the next reindex (it clears and rebuilds
+                // in-place), so the failure must be loud, not destructive.
+                state_bg.note_add_index_failure(&alias_bg, &project_path, &e);
                 return;
             }
         }

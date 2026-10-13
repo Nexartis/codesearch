@@ -16,6 +16,10 @@ finalized in place with a date — no renaming/migration step needed.
 
 ## [1.5.13]
 
+### Fixed
+
+- **Vanishing repos: failed first builds keep the registration and the transient FTS commit race gets one full-pass retry.** Two field incidents traced to the same root: an indexer (Defender/Search) holds a freshly created Tantivy segment file while the commit opens it (os error 5/32/33), and the add-repo task then silently unregistered the repo and let self-cleanup delete its DB dir — the 202 response was the operator's last word. Now: (1) a full reindex pass is redriven once after a 5s backoff when it fails on exactly that transient class (a pass is idempotent — clear + rebuild — where a commit retry on a half-joined writer is never safe); (2) a failed first build keeps the repo registered with a loud, actionable error (`codesearch index reindex <alias>` heals in place) instead of vanishing.
+
 ### Added
 
 - **Symbol-index status surfaces.** The chunk fields on `/repos/:alias/info` and the Info overlay said nothing about the SCIP index that `find_impact` uses, so an agent could not tell a working symbol index from an absent/stale/degraded one before trusting `references: []`. Every info surface now carries `symbol_index[]` — per language a `state` (`ready` / `degraded` / `stale` / `restore-pending` / `absent` / `not-applicable`), the index age and applicability — composed from the same on-disk meta the rebuild gates act on (new shared collector `symbol_index_status`, C# freshness override `index_matches_builder` mirroring the rebuild gate). `find_impact` resolved/empty answers embed the same array (applicable languages only) and the tool description tells agents to check it before concluding "no callers"; both serve TUIs render the status lines with state coloring. Remote-TUI deserialization tolerates older peers (missing field → empty section; null age → unknown).

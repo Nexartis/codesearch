@@ -420,6 +420,19 @@ impl FtsStore {
             || error.contains("IoError")
     }
 
+    /// Whether this failure is the transient Windows new-segment race: an
+    /// indexer (Defender / Search) holds the freshly created segment file
+    /// while tantivy opens it for the commit write (os error 5/32/33).
+    /// Only a failure of THIS class justifies redoing the whole indexing
+    /// pass — a commit retry on the same writer is never safe (a
+    /// half-joined pipeline must not be recommitted, see `commit_once`).
+    pub fn is_transient_fts_commit_error(error: &str) -> bool {
+        error.contains("Access is denied")
+            || error.contains("os error 5")
+            || error.contains("os error 32")
+            || error.contains("os error 33")
+    }
+
     /// One commit attempt, split so a failure in `prepare_commit` is told
     /// apart from a failure while publishing an already-prepared commit.
     ///
@@ -733,6 +746,24 @@ pub struct FtsStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The classifier must match the AV/new-segment race shapes seen in the
+    /// field (the exact logged incident message included) and refuse
+    /// everything a full-pass retry cannot fix.
+    #[test]
+    fn transient_fts_commit_classifier_matches_the_av_race_only() {
+        let logged = "FTS commit failed while flushing indexing workers: Failed to open \
+             file for write: 'IoError { io_error: Os { code: 5, kind: PermissionDenied, \
+             message: \"Access is denied.\" }, filepath: \"55fb.pos\" }'";
+        assert!(FtsStore::is_transient_fts_commit_error(logged));
+        assert!(FtsStore::is_transient_fts_commit_error("os error 5"));
+        assert!(FtsStore::is_transient_fts_commit_error("os error 32"));
+        assert!(FtsStore::is_transient_fts_commit_error("os error 33"));
+        assert!(!FtsStore::is_transient_fts_commit_error(
+            "writer was killed"
+        ));
+        assert!(!FtsStore::is_transient_fts_commit_error("schema error"));
+    }
 
     #[test]
     fn test_fts_basic() -> Result<()> {
