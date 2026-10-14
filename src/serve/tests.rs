@@ -3522,6 +3522,36 @@ fn csharp_success_outcome_partial_when_warnings_survived() {
     );
 }
 
+/// A running build wins over a cached (stale) Ready and over the probe, and
+/// skips the probe entirely; idle falls back cache → probe.
+#[test]
+fn resolve_csharp_status_precedence() {
+    use CSharpIndexStatus as S;
+    // (cached, indexing, probe result, expected, probe expected to run)
+    let cases = [
+        (Some(S::Ready), true, S::Ready, S::Indexing, false),
+        (None, true, S::Ready, S::Indexing, false),
+        (Some(S::Ready), false, S::None, S::Ready, false),
+        (None, false, S::Ready, S::Ready, true),
+        (None, false, S::None, S::None, true),
+    ];
+    for (cached, indexing, probe_result, expected, probe_runs) in cases {
+        let mut probed = false;
+        let got = resolve_csharp_status(cached, indexing, || {
+            probed = true;
+            probe_result
+        });
+        assert_eq!(
+            got, expected,
+            "cached={cached:?} indexing={indexing} probe={probe_result:?}"
+        );
+        assert_eq!(
+            probed, probe_runs,
+            "probe invocation for cached={cached:?} indexing={indexing}"
+        );
+    }
+}
+
 /// The watcher notifier must apply the SAME status contract as
 /// trigger_symbol_rebuild's success arm: Succeeded-with-warnings → Partial
 /// (red C#⚠) with bounded detail — never green — and a clean Succeeded →
@@ -3676,6 +3706,35 @@ fn repo_statuses_lightweight_carries_partial_with_detail() {
         Some("summary | A.csproj: failure one"),
         "the detail message must ride on the status row"
     );
+}
+
+/// A running index must show as `Indexing` only for the languages that apply
+/// to the repo: a Rust-only repo keeps `None` in both symbol columns.
+#[test]
+#[serial]
+fn indexing_marks_only_applicable_languages_in_status() {
+    let (_tmp, repo_path, bare) = state_with_repo("langrepo");
+    let state = std::sync::Arc::new(bare);
+    assert!(state.begin_indexing("langrepo", IndexingOwner::Reindex));
+
+    let row = |state: &ServeState| {
+        state
+            .repo_statuses_lightweight()
+            .into_iter()
+            .find(|(alias, _)| alias == "langrepo")
+            .expect("langrepo row")
+            .1
+    };
+
+    let info = row(&state);
+    assert_eq!(info.status, RepoStateLabel::Indexing);
+    assert_eq!(info.csharp_index, CSharpIndexStatus::None);
+    assert_eq!(info.typescript_index, CSharpIndexStatus::None);
+
+    std::fs::write(repo_path.join("App.sln"), "").unwrap();
+    assert_eq!(row(&state).csharp_index, CSharpIndexStatus::Indexing);
+
+    state.end_indexing("langrepo", IndexingOwner::Reindex);
 }
 
 /// The serve-tui `i` overlay reads the DURABLE warnings from the on-disk

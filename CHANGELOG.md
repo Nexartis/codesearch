@@ -26,6 +26,8 @@ finalized in place with a date — no renaming/migration step needed.
 
 - **`index add` / `index reindex` stop instead of building locally when the serve reports the alias is already indexing.** A transport-level delegation failure can mean the first POST landed and its 202 never reached the client (field case: the follow-up call got 409 "reindex already in progress", then the CLI built locally anyway and died on the Tantivy lockfile while the serve's own pass was running). On that specific 409 the CLI now exits with "let it finish" guidance; other delegation failures keep the previous local fallback (a registered-but-idle repo indexes locally fine — the pre-push gate depends on it). `--local` remains the explicit escape hatch.
 
+- **Status no longer reports "ready" while a rebuild is running.** MCP `status` (project and group) answers "building" during a rebuild, and the TUI C#/TypeScript indicators show indexing instead of "ready" from an old on-disk index; the fresh-index route and pre-warm no longer set Ready mid-build.
+
 ## [1.5.14]
 
 ### Fixed
