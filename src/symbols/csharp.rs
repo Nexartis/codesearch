@@ -261,19 +261,21 @@ pub const CSHARP_REBUILD_DEBOUNCE_SECS: u64 = crate::constants::SCIP_CSHARP_DEBO
 /// wrote no output file, and built no index.
 pub(crate) const HELPER_RESTORE_PENDING_EXIT: i32 = 75;
 
-/// Seconds between restore-pending retries of the same rebuild scope.
-const RESTORE_PENDING_RETRY_INTERVAL_SECS: u64 = 60;
+/// Base of the exponential backoff between restore-pending retries of the
+/// same rebuild scope: retry N waits base × 2^(N-1).
+const RESTORE_PENDING_RETRY_BASE_INTERVAL_SECS: u64 = 60;
 
 /// Granularity of the restore wait's shutdown check.
 const RESTORE_PENDING_POLL_MS: u64 = 500;
 
-/// Restore-pending retries before a rebuild gives up with LMDB untouched.
-/// 60s × 20 = 20 min of restore patience, deliberately below the
-/// MAX_INDEXING_SECS (30 min) claim-takeover in serve so a still-running
-/// rebuild is never mistaken for a leaked one and double-driven.
-const RESTORE_PENDING_RETRY_MAX_ATTEMPTS: u32 = 20;
+/// Restore-pending helper attempts before a rebuild gives up with LMDB
+/// untouched: initial attempt + 2 retries. Backoff 60s + 120s = 3 min of
+/// restore patience, far below the MAX_INDEXING_SECS (30 min)
+/// claim-takeover in serve so a still-running rebuild is never mistaken
+/// for a leaked one and double-driven.
+const RESTORE_PENDING_RETRY_MAX_ATTEMPTS: u32 = 3;
 
-/// Retry interval seconds: `CODESEARCH_RESTORE_RETRY_INTERVAL_SECS` when set
+/// Retry base seconds: `CODESEARCH_RESTORE_RETRY_INTERVAL_SECS` when set
 /// to a positive integer, otherwise the built-in 60. Zero and unparseable
 /// fall back to the default (a zero interval would hot-spin the helper);
 /// tests use 1 to exercise the retry loop in seconds.
@@ -281,7 +283,13 @@ fn restore_pending_retry_interval_secs() -> u64 {
     let raw = std::env::var(crate::constants::SCIP_RESTORE_RETRY_INTERVAL_SECS_ENV).ok();
     raw.and_then(|v| v.parse::<u64>().ok())
         .filter(|&secs| secs > 0)
-        .unwrap_or(RESTORE_PENDING_RETRY_INTERVAL_SECS)
+        .unwrap_or(RESTORE_PENDING_RETRY_BASE_INTERVAL_SECS)
+}
+
+/// Backoff before restore-pending retry number `attempts` (1-based, the
+/// count of pending exits so far): base × 2^(attempts-1), saturating.
+fn restore_pending_retry_delay_secs(attempts: u32) -> u64 {
+    restore_pending_retry_interval_secs().saturating_mul(1u64 << (attempts - 1).min(16))
 }
 
 /// Sleeps `total` in poll steps; returns `false` as soon as shutdown is
@@ -311,6 +319,26 @@ pub struct RestorePendingError;
 /// True when `e` is the typed restore-pending outcome.
 pub(super) fn is_restore_pending(e: &anyhow::Error) -> bool {
     e.downcast_ref::<RestorePendingError>().is_some()
+}
+
+/// Typed marker for the restore retry cap being exhausted: the previous
+/// index stays live and LMDB is untouched, so callers render a warning
+/// (stale-but-usable index), never a red error.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "dotnet restore for this solution did not finish within {attempts} attempts \
+     (backoff {backoff}) — rebuild abandoned, the previous index stays live \
+     (issue #225)"
+)]
+pub struct RestoreExhaustedError {
+    pub attempts: u32,
+    /// Concrete waits between attempts, e.g. "60s + 120s".
+    pub backoff: String,
+}
+
+/// True when `e` is the typed restore-exhausted outcome.
+pub(crate) fn is_restore_exhausted(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<RestoreExhaustedError>().is_some()
 }
 
 /// Solutions whose rebuild retry loop is currently waiting out a restore.
@@ -1758,26 +1786,27 @@ impl SymbolIndexer for CSharpSymbolIndexer {
                     // and the warning must survive that.
                     restore_pending_flag_set(db_path);
                     marked_pending = true;
-                    if attempts > RESTORE_PENDING_RETRY_MAX_ATTEMPTS {
+                    if attempts >= RESTORE_PENDING_RETRY_MAX_ATTEMPTS {
                         restore_pending_flag_clear(db_path);
-                        bail!(
-                            "dotnet restore for this solution did not finish within {} retries x {}s \
-                             — rebuild abandoned, the previous index stays live (issue #225)",
-                            RESTORE_PENDING_RETRY_MAX_ATTEMPTS,
-                            RESTORE_PENDING_RETRY_INTERVAL_SECS
-                        );
+                        let backoff = (1..RESTORE_PENDING_RETRY_MAX_ATTEMPTS)
+                            .map(|k| format!("{}s", restore_pending_retry_delay_secs(k)))
+                            .collect::<Vec<_>>()
+                            .join(" + ");
+                        bail!(RestoreExhaustedError {
+                            attempts: RESTORE_PENDING_RETRY_MAX_ATTEMPTS,
+                            backoff,
+                        });
                     }
+                    let delay_secs = restore_pending_retry_delay_secs(attempts);
                     tracing::warn!(
                         "restore pending for '{}' — retrying the same rebuild scope in {}s \
                          (attempt {}/{})",
                         solution.display(),
-                        RESTORE_PENDING_RETRY_INTERVAL_SECS,
+                        delay_secs,
                         attempts,
                         RESTORE_PENDING_RETRY_MAX_ATTEMPTS
                     );
-                    if !sleep_unless_shutdown(std::time::Duration::from_secs(
-                        restore_pending_retry_interval_secs(),
-                    )) {
+                    if !sleep_unless_shutdown(std::time::Duration::from_secs(delay_secs)) {
                         restore_pending_flag_clear(db_path);
                         bail!(
                             "rebuild cancelled while waiting for dotnet restore — shutdown \
@@ -3088,8 +3117,8 @@ mod tests {
         let _guard = crate::testing::EnvRestore::set(&[
             (HELPER_ENV_VAR, helper.to_string_lossy().as_ref()),
             ("CS_FAKE_HELPER_MODE", "exit75"),
-            // 1s interval: 0 is filtered (fail-safe against a prod hot-spin),
-            // so 1s keeps the 20-retry cap at ~20s instead of 20 minutes.
+            // 1s base: 0 is filtered (fail-safe against a prod hot-spin),
+            // so the backoff runs 1s + 2s — the cap exhausts in ~3s, not 3 min.
             (crate::constants::SCIP_RESTORE_RETRY_INTERVAL_SECS_ENV, "1"),
         ]);
 
@@ -3099,8 +3128,18 @@ mod tests {
             .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("did not finish within"),
-            "cap exhaustion must name the abandonment, got: {msg}"
+            msg.contains(&format!(
+                "did not finish within {RESTORE_PENDING_RETRY_MAX_ATTEMPTS} attempts"
+            )),
+            "cap exhaustion must name attempts and the abandonment, got: {msg}"
+        );
+        assert!(
+            msg.contains("backoff 1s + 2s"),
+            "the message must carry the concrete backoff waits, got: {msg}"
+        );
+        assert!(
+            err.downcast_ref::<RestoreExhaustedError>().is_some(),
+            "cap exhaustion must be the typed outcome, got: {err:#}"
         );
 
         // LMDB untouched: no rebuild meta written, and the pending flag that
@@ -3114,6 +3153,19 @@ mod tests {
             !indexer.restore_pending(&db),
             "the pending flag must be cleared when the retry loop gives up"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn restore_pending_backoff_doubles_from_the_configured_base() {
+        let _guard = crate::testing::EnvRestore::set(&[(
+            crate::constants::SCIP_RESTORE_RETRY_INTERVAL_SECS_ENV,
+            "1",
+        )]);
+        assert_eq!(restore_pending_retry_delay_secs(1), 1);
+        assert_eq!(restore_pending_retry_delay_secs(2), 2);
+        // Saturating shift cap: an absurd attempt count can never overflow.
+        assert_eq!(restore_pending_retry_delay_secs(1_000), 1 << 16);
     }
 
     #[test]

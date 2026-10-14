@@ -1046,7 +1046,8 @@ pub fn render_overlay(f: &mut ratatui::Frame, area: Rect, overlay: &OverlayState
                 }
             }
             // Durable record of a degraded symbol index: the build problems
-            // the helper survived. Red, like the table's `C#⚠` indicator.
+            // the helper survived. Red — the table's `C#⚠` indicator is
+            // yellow (degraded-index semantics stay the stronger red here).
             if !symbol_warnings.is_empty() {
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(

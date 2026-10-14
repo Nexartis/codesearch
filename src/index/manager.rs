@@ -45,6 +45,7 @@ use super::Result;
 /// POST-/reindex paths. Without `Started`, a watcher-triggered rebuild only
 /// ever reported its terminal state, so the C#-specific indicator never showed
 /// "Indexing" while the (35–84s) rebuild was actually running.
+#[derive(Debug, PartialEq)]
 pub enum SymbolRebuildSignal {
     /// A rebuild is about to run (helper available and project applies).
     Started,
@@ -56,13 +57,37 @@ pub enum SymbolRebuildSignal {
     Succeeded { index_warnings: Vec<String> },
     /// Rebuild failed with the given message.
     Failed(String),
+    /// Rebuild was abandoned because `dotnet restore` never finished within
+    /// the retry cap: LMDB untouched, the previous index stays live. NOT a
+    /// failure — the serve layer renders a warning (yellow C#⚠), not a red
+    /// error.
+    Abandoned(String),
+}
+
+/// Terminal signal for a grouped incremental rebuild: a real failure
+/// (`last_error`) wins over an abandonment (`last_abandon`), which wins over
+/// success. Pure so the ordering is table-testable — the watcher-path
+/// counterpart of the serve layer's `classify_symbol_rebuild_failure`.
+pub(crate) fn grouped_rebuild_signal(
+    last_error: Option<String>,
+    last_abandon: Option<String>,
+    index_warnings: Vec<String>,
+) -> SymbolRebuildSignal {
+    if let Some(msg) = last_error {
+        SymbolRebuildSignal::Failed(msg)
+    } else if let Some(msg) = last_abandon {
+        SymbolRebuildSignal::Abandoned(msg)
+    } else {
+        SymbolRebuildSignal::Succeeded { index_warnings }
+    }
 }
 
 /// Callback invoked around each watcher-triggered C# symbol rebuild.
 ///
 /// Called with [`SymbolRebuildSignal::Started`] just before the rebuild runs,
-/// then exactly once more with [`SymbolRebuildSignal::Succeeded`] or
-/// [`SymbolRebuildSignal::Failed`] when it finishes.
+/// then exactly once more with [`SymbolRebuildSignal::Succeeded`],
+/// [`SymbolRebuildSignal::Failed`] or [`SymbolRebuildSignal::Abandoned`] when
+/// it finishes.
 ///
 /// The serve layer uses this to update `csharp_index_status` / `csharp_index_error`
 /// without coupling `IndexManager` to `ServeState`.
@@ -1610,6 +1635,18 @@ impl IndexManager {
                     });
                 }
             }
+            Err(e) if crate::symbols::csharp::is_restore_exhausted(&e) => {
+                // Restore never finished within the retry cap: the previous
+                // index stays live, so this is a warning, never a red error.
+                warn!(
+                    "⚠️ [{}] {} symbol rebuild abandoned — dotnet restore did not finish, \
+                     previous index stays live: {:#}",
+                    repo_label, lang_label, e
+                );
+                if let Some(n) = notifier {
+                    n(SymbolRebuildSignal::Abandoned(format!("{e:#}")));
+                }
+            }
             Err(e) => {
                 // `{:#}` — the whole chain. Plain `{}` prints only the outermost
                 // context, which hides the LMDB error under its put context.
@@ -2086,6 +2123,9 @@ impl IndexManager {
                                     // cleaned up from LMDB regardless of origin project.
                                     let total_groups = groups.len();
                                     let mut last_error: Option<String> = None;
+                                    // Restore-exhausted groups land here instead:
+                                    // LMDB untouched, previous index stays live.
+                                    let mut last_abandon: Option<String> = None;
                                     // Index-level warnings survived by any
                                     // group's rebuild — deduped across groups
                                     // (MSBuild repeats per project).
@@ -2140,25 +2180,46 @@ impl IndexManager {
                                                 // `{:#}` for the same reason as the
                                                 // full-rebuild path: the put context
                                                 // would otherwise hide the MDB_* code.
-                                                warn!(
-                                                    "⚠️ [{}/{}] Symbol rebuild failed ({}): {:#}",
-                                                    i + 1,
-                                                    total_groups,
-                                                    csproj_name,
-                                                    e
-                                                );
-                                                last_error = Some(format!("{e:#}"));
+                                                // A restore-exhausted group is an
+                                                // abandonment (previous index stays
+                                                // live), not a failure.
+                                                if crate::symbols::csharp::is_restore_exhausted(&e)
+                                                {
+                                                    warn!(
+                                                        "⚠️ [{}/{}] Symbol rebuild abandoned ({}): dotnet \
+                                                         restore did not finish — previous index stays live: {:#}",
+                                                        i + 1,
+                                                        total_groups,
+                                                        csproj_name,
+                                                        e
+                                                    );
+                                                    if last_abandon.is_none() {
+                                                        last_abandon = Some(format!("{e:#}"));
+                                                    }
+                                                } else {
+                                                    warn!(
+                                                        "⚠️ [{}/{}] Symbol rebuild failed ({}): {:#}",
+                                                        i + 1,
+                                                        total_groups,
+                                                        csproj_name,
+                                                        e
+                                                    );
+                                                    last_error = Some(format!("{e:#}"));
+                                                }
                                             }
                                         }
                                     }
-                                    // Notify serve layer about overall outcome
+                                    // Notify serve layer about overall outcome.
+                                    // A real failure wins over an abandonment:
+                                    // exhausted groups leave the previous index
+                                    // live (warning), but a genuine failure must
+                                    // still render red.
                                     if let Some(ref n) = notifier {
-                                        match last_error {
-                                            None => {
-                                                n(SymbolRebuildSignal::Succeeded { index_warnings })
-                                            }
-                                            Some(msg) => n(SymbolRebuildSignal::Failed(msg)),
-                                        }
+                                        n(grouped_rebuild_signal(
+                                            last_error,
+                                            last_abandon,
+                                            index_warnings,
+                                        ));
                                     }
                                     // Clear "Indexing" now that all groups are done
                                     if let Some(ref cb) = indexing_cb_scip {
@@ -3105,6 +3166,49 @@ mod tests {
                 classify_symbol_rebuild_event(Path::new(path)),
                 expected,
                 "path: {path}"
+            );
+        }
+    }
+
+    /// The grouped incremental rebuild's terminal-signal ordering: a real
+    /// failure beats an abandonment (exhausted groups leave the previous
+    /// index live — warning — but a genuine failure must render red), and
+    /// an abandonment beats success. Pins the decision the watcher path
+    /// relies on, without driving the async loop — the same
+    /// extract-and-table-test shape as the serve layer's classifier.
+    #[test]
+    fn grouped_rebuild_signal_priority_table() {
+        use SymbolRebuildSignal::*;
+        let real = "MDB_BAD_VALSIZE: put failed".to_string();
+        let exhausted = "dotnet restore did not finish within 3 attempts".to_string();
+        let warnings = vec!["MSBuild advisory".to_string()];
+        let cases = [
+            (
+                "real failure beats abandonment",
+                Some(real.clone()),
+                Some(exhausted.clone()),
+                Failed(real.clone()),
+            ),
+            (
+                "abandonment beats success",
+                None,
+                Some(exhausted.clone()),
+                Abandoned(exhausted.clone()),
+            ),
+            (
+                "clean run keeps the surviving warnings",
+                None,
+                None,
+                Succeeded {
+                    index_warnings: warnings.clone(),
+                },
+            ),
+        ];
+        for (label, last_error, last_abandon, expected) in cases {
+            assert_eq!(
+                grouped_rebuild_signal(last_error, last_abandon, warnings.clone()),
+                expected,
+                "case: {label}"
             );
         }
     }
