@@ -564,6 +564,11 @@ pub const MAX_INDEXING_SECS: u64 = 30 * 60; // 30 minutes
 /// Environment variable to override the maximum indexing duration.
 pub const MAX_INDEXING_SECS_ENV: &str = "CODESEARCH_MAX_INDEXING_SECS";
 
+/// How often a flow without its own progress callback (the SCIP symbol
+/// rebuild) renews its indexing marker so it never ages out at
+/// `MAX_INDEXING_SECS` mid-run. Must stay well below that threshold.
+pub const INDEXING_MARKER_HEARTBEAT_SECS: u64 = 60;
+
 /// How long an MCP handler may wait for the vector-store read lock before
 /// giving up with a "store busy" error.
 ///
