@@ -149,8 +149,32 @@ public sealed class ReferenceResolver
 
         try
         {
+            // The symbol map is built from detached generator-augmented
+            // compilations. For Razor component types SymbolFinder cannot
+            // pair such a foreign symbol with its workspace counterpart and
+            // returns instantly with nothing (observed live: a code-behind
+            // method of a Blazor component answered 0 references in ~3ms
+            // while the calls were visible to text search). Re-resolve the
+            // symbol inside the containing project's workspace compilation
+            // first; fall back to the foreign symbol when no counterpart
+            // exists.
+            var workspaceSymbol = targetSymbol;
+            var assemblyName = targetSymbol.ContainingAssembly?.Name;
+            var project = solution.Projects.FirstOrDefault(p =>
+                string.Equals(p.AssemblyName, assemblyName, StringComparison.OrdinalIgnoreCase));
+            if (project is not null)
+            {
+                var compilation = await project.GetCompilationAsync().ConfigureAwait(false);
+                if (compilation is not null)
+                {
+                    var similar = SymbolFinder
+                        .FindSimilarSymbols(targetSymbol, compilation);
+                    workspaceSymbol = similar.FirstOrDefault() ?? targetSymbol;
+                }
+            }
+
             var refResults = await SymbolFinder
-                .FindReferencesAsync(targetSymbol, solution)
+                .FindReferencesAsync(workspaceSymbol, solution)
                 .ConfigureAwait(false);
 
             foreach (var refLocation in refResults.SelectMany(r => r.Locations))

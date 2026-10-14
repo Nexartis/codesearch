@@ -153,6 +153,11 @@ pub enum OverlayState {
         /// helper survived. Unlike the in-memory C# status these survive a
         /// serve restart — the durable record of a degraded index.
         symbol_warnings: Vec<String>,
+        /// Per-language symbol-index status (ready/degraded/stale/
+        /// restore-pending/absent/not-applicable) — the shared
+        /// [`crate::symbols::symbol_index_status`] collector, so the TUI,
+        /// REST info and find_impact answers cannot disagree.
+        symbol_index: Vec<crate::symbols::SymbolIndexStatus>,
         /// Transient result of the `c` (copy warnings) key, shown as the
         /// overlay's last content line until it closes.
         copy_feedback: Option<String>,
@@ -953,6 +958,7 @@ pub fn render_overlay(f: &mut ratatui::Frame, area: Rect, overlay: &OverlayState
             lock,
             index_age,
             symbol_warnings,
+            symbol_index,
             copy_feedback,
         } => {
             let title = format!(" {} — Index Info ", alias);
@@ -1005,6 +1011,40 @@ pub fn render_overlay(f: &mut ratatui::Frame, area: Rect, overlay: &OverlayState
                 ]),
             ];
             let mut lines = lines;
+            // Per-language symbol-index status — the same shared collector
+            // find_impact answers carry. The chunk stats above say nothing
+            // about the SCIP index; this line-up does.
+            if !symbol_index.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "  Symbol index:",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                for status in symbol_index {
+                    let (color, note) = match status.state.as_str() {
+                        "ready" => (Color::Green, ""),
+                        "degraded" => (Color::Red, " (incomplete — see warnings)"),
+                        "stale" => (
+                            Color::Yellow,
+                            " (another build produced it; rebuild queued)",
+                        ),
+                        "restore-pending" => (Color::Yellow, " (waiting out a NuGet restore)"),
+                        _ => (Color::DarkGray, ""),
+                    };
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "    {}: {} · {}{}",
+                            status.language,
+                            status.state,
+                            super::tui::human_age_seconds(status.age_seconds),
+                            note
+                        ),
+                        Style::default().fg(color),
+                    )));
+                }
+            }
             // Durable record of a degraded symbol index: the build problems
             // the helper survived. Red, like the table's `C#⚠` indicator.
             if !symbol_warnings.is_empty() {

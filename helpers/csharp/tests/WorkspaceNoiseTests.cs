@@ -19,6 +19,26 @@ public class WorkspaceNoiseTests
         Assert.True(WorkspaceNoise.IsNuGetAuditNoise(message));
     }
 
+    [Theory]
+    [InlineData("Acme.Core.csproj: Unable to load the service index for source https://pkgs.example/index.json.")]
+    [InlineData("Acme.Core.csproj: Unable to find package Acme.Shared. No packages exist with this id in source(s)")]
+    [InlineData("Acme.Core.csproj: Error occurred while getting package vulnerability data: Unable to load the service index")]
+    public void NuGetSourceFailureIsDemoted(string message) =>
+        Assert.True(WorkspaceNoise.IsNuGetSourceFailure(message));
+
+    [Fact]
+    public void GenuineLoadFailureIsNotNuGetSourceFailure() =>
+        Assert.False(WorkspaceNoise.IsNuGetSourceFailure("The type or namespace name 'Catalog' does not exist"));
+
+    [Fact]
+    public void BuildHostTypeInitializerCrashIsDemoted() =>
+        Assert.True(WorkspaceNoise.IsBuildHostTypeInitializerCrash(
+            "RemoteInvocationException: An exception of type System.TypeInitializationException was thrown: The type initializer for 'Microsoft.Build.Shared.XMakeElements' threw an exception."));
+
+    [Fact]
+    public void GenuineLoadFailureIsNotTypeInitializerCrash() =>
+        Assert.False(WorkspaceNoise.IsBuildHostTypeInitializerCrash("The type or namespace name 'Catalog' does not exist"));
+
     [Fact]
     public void GenuineLoadFailureIsKept()
     {

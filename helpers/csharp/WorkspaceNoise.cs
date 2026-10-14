@@ -85,4 +85,32 @@ internal static class WorkspaceNoise
             && (message.Contains("Exception while shutting down", StringComparison.OrdinalIgnoreCase)
                 || message.Contains("not responding", StringComparison.OrdinalIgnoreCase));
     }
+
+    /// <summary>
+    /// True when a restore or load diagnostic is a NuGet source that cannot
+    /// be reached or authenticated ("Unable to load the service index for
+    /// source ...", "Unable to find package X ... in source(s)"). A host
+    /// environment problem, not a code defect; the restore fallback already
+    /// reports the affected projects. Pure and null-tolerant.
+    /// </summary>
+    public static bool IsNuGetSourceFailure(string? message)
+    {
+        if (message is null)
+        {
+            return false;
+        }
+        return message.Contains("Unable to load the service index for source", StringComparison.OrdinalIgnoreCase)
+            || message.Contains("Unable to find package", StringComparison.OrdinalIgnoreCase)
+            || message.Contains("Error occurred while getting package vulnerability data", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// True when a load failure is the MSBuild BuildHost's type initializer
+    /// crashing on <c>Microsoft.Build.Shared.XMakeElements</c>. The affected
+    /// project is still attempted by the per-project fallback; the crash is
+    /// tool-side and must not pin the index warning. Pure and null-tolerant.
+    /// </summary>
+    public static bool IsBuildHostTypeInitializerCrash(string? message) =>
+        message is not null
+        && message.Contains("XMakeElements", StringComparison.OrdinalIgnoreCase);
 }

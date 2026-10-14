@@ -2346,6 +2346,14 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             .map(|s| s.to_string())
     }
 
+    /// Same freshness check the rebuild gate applies (mod.rs: an absent or
+    /// foreign builder stamp reads as stale for C#, unlike adapters that do
+    /// not stamp at all — hence the override, not the trait default).
+    fn index_matches_builder(&self, db_path: &Path) -> bool {
+        self.index_builder_version(db_path).as_deref()
+            == Some(crate::constants::INDEX_BUILDER_VERSION)
+    }
+
     /// Whether a SCIP index exists AND was built with the current key format.
     /// An index that is fresh by timestamp but stamped with another (or no)
     /// key-format generation would serve old-shaped canonical keys as truth,
@@ -3143,6 +3151,29 @@ mod tests {
                 panic!("rebuild still parked in the restore wait 10s after shutdown was requested")
             }
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn runtime_teardown_finishes_a_restore_parked_blocking_task_within_grace() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.spawn_blocking(|| {
+            while super::sleep_unless_shutdown(std::time::Duration::from_secs(60)) {}
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        crate::constants::SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        runtime.shutdown_timeout(std::time::Duration::from_secs(
+            crate::constants::RUNTIME_SHUTDOWN_GRACE_SECS,
+        ));
+        let elapsed = started.elapsed();
+        crate::constants::SHUTDOWN_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(crate::constants::RUNTIME_SHUTDOWN_GRACE_SECS),
+            "teardown waited out the full grace ({elapsed:?}): the restore wait did not observe shutdown"
+        );
     }
 
     #[test]

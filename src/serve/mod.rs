@@ -3636,6 +3636,39 @@ impl ServeState {
         warnings
     }
 
+    /// Per-language symbol-index status for the info surfaces — the same
+    /// shared collector find_impact answers carry, so the TUI, REST and MCP
+    /// surfaces cannot disagree about what "ready" means. Needs the project
+    /// path (applicability) next to the db path.
+    pub(crate) fn collect_symbol_index_status(
+        &self,
+        project_path: &Path,
+        db_path: &Path,
+    ) -> Vec<crate::symbols::SymbolIndexStatus> {
+        crate::symbols::symbol_index_status(&self.symbol_registry, project_path, db_path)
+    }
+
+    /// Record a failed first build for a newly added repo: log the error
+    /// with the heal command and release the Reindex marker. Deliberately
+    /// does NOT unregister — a vanished repo (the old rollback) is
+    /// unfixable by the operator who cannot even see it; a registered one
+    /// heals via reindex.
+    pub(crate) fn note_add_index_failure(
+        &self,
+        alias: &str,
+        project_path: &Path,
+        error: &anyhow::Error,
+    ) {
+        tracing::error!(
+            "Index creation failed for '{}' ({}): {error:#} — the repo stays \
+             registered with a partial index; reindex it to heal: \
+             `codesearch index reindex {alias}` (or POST /repos/{alias}/reindex)",
+            alias,
+            project_path.display()
+        );
+        self.end_indexing(alias, IndexingOwner::Reindex);
+    }
+
     /// Get lightweight repo statuses WITHOUT opening any databases.
     /// Returns a list of (alias, status_info) where status is derived from DashMap state only.
     pub(crate) fn repo_statuses_lightweight(&self) -> Vec<(String, RepoStatusInfo)> {
@@ -4413,6 +4446,10 @@ async fn info_handler(
     // Durable symbol-index warnings, read fresh from the on-disk meta
     // (shared with the TUI info overlay so the two cannot drift).
     let symbol_warnings = state.collect_symbol_warnings(&db_path);
+    // Per-language symbol-index status — the same shared collector the TUI
+    // overlay and find_impact answers use, so a consumer can tell a working
+    // symbol index from an absent/stale/degraded one before trusting it.
+    let symbol_index = state.collect_symbol_index_status(&project_path, &db_path);
 
     AxumJson(json!({
         "path": db_path.display().to_string(),
@@ -4427,6 +4464,12 @@ async fn info_handler(
         // Durable record of a degraded symbol index (see the TUI's C#⚠):
         // build-environment failures the helper survived during rebuild.
         "symbol_warnings": symbol_warnings,
+        // Per-language symbol-index status (ready/degraded/stale/
+        // restore-pending/absent/not-applicable): is there a usable SCIP
+        // index at all, and is it THIS build's? The chunk fields above say
+        // nothing about it — that gap made agents trust "0 references"
+        // from a repo with no symbol index.
+        "symbol_index": symbol_index,
         // Is the HNSW graph built and committed? A non-zero `chunks` with
         // `indexed: false` is a searchable-looking but silently dead index:
         // `VectorStore::search` refuses to run without the graph. The cloud
@@ -5426,20 +5469,14 @@ async fn add_repo_handler(
                     state_bg.end_indexing(&alias_bg, IndexingOwner::Reindex);
                     return;
                 }
-                tracing::error!("Index creation failed for '{}': {}", alias_bg, e);
-                // Clean up: remove from repos and config
-                state_bg.repos.remove(&alias_bg);
-                state_bg.end_indexing(&alias_bg, IndexingOwner::Reindex);
-                if let Ok(mut config) = state_bg.config.write() {
-                    config.unregister_alias(&alias_bg);
-                    if let Err(e) = state_bg.persist_config(&config) {
-                        tracing::warn!(
-                            "Failed to persist config after add-repo index failure for '{}': {}",
-                            alias_bg,
-                            e
-                        );
-                    }
-                }
+                // KEEP the repo registered on a failed first build. The old
+                // rollback (repos.remove + unregister + persist_config)
+                // turned one build crash into a vanishing repo: the 202 was
+                // the caller's last word, repos.json lost the entry, and
+                // self-cleanup then deleted the DB dir. A half-built store
+                // heals on the next reindex (it clears and rebuilds
+                // in-place), so the failure must be loud, not destructive.
+                state_bg.note_add_index_failure(&alias_bg, &project_path, &e);
                 return;
             }
         }

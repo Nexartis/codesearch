@@ -14,6 +14,36 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.5.15]
+
+### Fixed
+
+- **`index add` / `index reindex` stop instead of building locally when the serve reports the alias is already indexing.** A transport-level delegation failure can mean the first POST landed and its 202 never reached the client (field case: the follow-up call got 409 "reindex already in progress", then the CLI built locally anyway and died on the Tantivy lockfile while the serve's own pass was running). On that specific 409 the CLI now exits with "let it finish" guidance; other delegation failures keep the previous local fallback (a registered-but-idle repo indexes locally fine — the pre-push gate depends on it). `--local` remains the explicit escape hatch.
+
+## [1.5.14]
+
+### Fixed
+
+- **The index database directory is now marked hidden on Windows.** The dot in `.codesearch.db` means nothing to Windows: the Search indexer crawled it like any folder, and its scanner holding a freshly created Tantivy segment file is the transient commit race behind the field incidents (os error 5). The indexer skips hidden directories (the `.git` convention), so `SharedStores` now marks the db dir hidden on creation and on every read-write open — existing directories are fixed on the next serve start, best-effort and idempotent.
+
+## [1.5.13]
+
+### Fixed
+
+- **Vanishing repos: failed first builds keep the registration and the transient FTS commit race gets one full-pass retry.** Two field incidents traced to the same root: an indexer (Defender/Search) holds a freshly created Tantivy segment file while the commit opens it (os error 5/32/33), and the add-repo task then silently unregistered the repo and let self-cleanup delete its DB dir — the 202 response was the operator's last word. Now: (1) a full reindex pass is redriven once after a 5s backoff when it fails on exactly that transient class (a pass is idempotent — clear + rebuild — where a commit retry on a half-joined writer is never safe); (2) a failed first build keeps the repo registered with a loud, actionable error (`codesearch index reindex <alias>` heals in place) instead of vanishing.
+
+### Added
+
+- **Symbol-index status surfaces.** The chunk fields on `/repos/:alias/info` and the Info overlay said nothing about the SCIP index that `find_impact` uses, so an agent could not tell a working symbol index from an absent/stale/degraded one before trusting `references: []`. Every info surface now carries `symbol_index[]` — per language a `state` (`ready` / `degraded` / `stale` / `restore-pending` / `absent` / `not-applicable`), the index age and applicability — composed from the same on-disk meta the rebuild gates act on (new shared collector `symbol_index_status`, C# freshness override `index_matches_builder` mirroring the rebuild gate). `find_impact` resolved/empty answers embed the same array (applicable languages only) and the tool description tells agents to check it before concluding "no callers"; both serve TUIs render the status lines with state coloring. Remote-TUI deserialization tolerates older peers (missing field → empty section; null age → unknown).
+
+## [1.5.9]
+
+### Fixed
+
+- **scip-csharp: projects already loaded through a ProjectReference are no longer added twice.** The per-project fallback re-opened them, causing `already part of the workspace` failures and cross-project references missing from the index.
+- **NuGet feed failures and the BuildHost `XMakeElements` crash are logged as `[INFO]`, not index warnings.** They are environment issues; an affected project is skipped in the index and the INFO line records it.
+- **Serve: `q` quits while a C# rebuild waits for `dotnet restore`.** The restore wait polls the shutdown flag and the runtime gives blocking tasks a 5 s grace, instead of joining a rebuild parked for up to 20 minutes.
+
 ## [1.5.6]
 
 ### Fixed

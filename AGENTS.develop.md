@@ -242,6 +242,9 @@ Never `unwrap_or_default()` a store error on a search path — "no results" and 
 ## Changelog highlights (recent)
 
 - **v1.5.6 (pending)** — scip-csharp demotes MSBuild check advisories + BuildHost shutdown chatter from index warnings
+- **v1.5.15 (pending)** — CLI add/reindex refuse to build locally when the serve reports the alias already indexing (409 two-writer case); other delegation failures keep the local fallback
+- **v1.5.14 (pending)** — db dir marked hidden on Windows: the Search indexer no longer crawls `.codesearch.db` (structural fix for the scanner race on fresh Tantivy segments)
+- **v1.5.13 (pending)** — symbol-index status (ready/stale/degraded/absent) on REST info, both TUIs and every find_impact answer; vanishing-repo fix: transient FTS commit race gets one full-pass retry and failed first builds keep the repo registered
 - **v1.5.5** — serve TUI: symbol-index warnings wrap instead of clipping and `c` copies them to the clipboard
 - **v1.5.4** — restore gate: CPM-aware restore freshness (Directory.Packages.props etc.), restore-pending exit 75 with host-side bounded retry, previous index stays live during restore, watcher fires full C# rebuild on restore-input changes
 - **v1.4.4** — resident C# workspace pool no longer serves stale `find_impact` results after a rebuild: `WorkspacePool::evict` bumps a per-solution generation counter closing a spawn-in-flight race, and `scip_ref_cache` is now cleared unconditionally on both full and incremental rebuilds
