@@ -93,10 +93,12 @@ pub(crate) enum CSharpIndexStatus {
     None,
     /// Helper available and index built successfully.
     Ready,
-    /// Index built, but the helper survived workspace/MSBuild failures —
-    /// definitions are present while cross-project references may be
-    /// missing. Rendered red (`C#⚠`) in the TUI; the failures are in the
-    /// info panel and on every find_impact answer from this index.
+    /// Index built, but degraded or stale: the helper survived
+    /// workspace/MSBuild failures (definitions present while cross-project
+    /// references may be missing), or a rebuild was abandoned because
+    /// `dotnet restore` never finished (the previous index stays live).
+    /// Rendered yellow (`C#⚠`) in the TUI; the failures are in the info
+    /// panel and on every find_impact answer from this index.
     Partial,
     /// Index exists but had errors or is stale.
     Error,
@@ -134,6 +136,37 @@ pub(crate) fn resolve_csharp_status(
         CSharpIndexStatus::Indexing
     } else {
         cached.unwrap_or_else(probe)
+    }
+}
+
+/// Classification of a FAILED symbol rebuild, deciding how the serve layer
+/// renders the outcome. Pure so the contract is table-testable without
+/// running a helper (same reason as [`csharp_success_outcome`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SymbolRebuildFailureKind {
+    /// `dotnet restore` never finished within the retry cap: the previous
+    /// index stays live — warning (Partial), never a red error.
+    RestoreExhausted,
+    /// LMDB storage-format corruption: wipe + recovery path.
+    LmdbCorruption,
+    /// Any other failure: red Error.
+    Generic,
+}
+
+/// Restore-exhaustion is checked FIRST: the typed error carries its own
+/// contract (LMDB untouched, previous index live) that the corruption
+/// matcher must not override.
+fn classify_symbol_rebuild_failure(
+    msg: &str,
+    e: &anyhow::Error,
+    is_csharp: bool,
+) -> SymbolRebuildFailureKind {
+    if is_csharp && csharp::is_restore_exhausted(e) {
+        SymbolRebuildFailureKind::RestoreExhausted
+    } else if ServeState::is_lmdb_format_corruption(msg) {
+        SymbolRebuildFailureKind::LmdbCorruption
+    } else {
+        SymbolRebuildFailureKind::Generic
     }
 }
 
@@ -680,10 +713,11 @@ impl ServeState {
     /// The notifier captures `Arc` clones of the two status maps so it can be sent
     /// into the file-watcher background task without holding a reference to `&self`.
     /// The watcher calls it with [`SymbolRebuildSignal::Started`] just before a
-    /// rebuild runs (→ `Indexing`) and again with `Succeeded`/`Failed` when it
-    /// finishes (→ `Ready`/`Error`), updating `csharp_index_status` /
-    /// `csharp_index_error` — making both the in-progress and terminal states
-    /// visible in the TUI and in `/status` without any extra polling.
+    /// rebuild runs (→ `Indexing`) and again with `Succeeded`/`Abandoned`/
+    /// `Failed` when it finishes (→ `Ready`/`Partial`/`Error`), updating
+    /// `csharp_index_status` / `csharp_index_error` — making both the
+    /// in-progress and terminal states visible in the TUI and in `/status`
+    /// without any extra polling.
     fn make_csharp_notifier(&self, alias: &str) -> CSharpRebuildNotifier {
         let status_map = Arc::clone(&self.csharp_index_status);
         let error_map = Arc::clone(&self.csharp_index_error);
@@ -705,6 +739,13 @@ impl ServeState {
                 } else {
                     error_map.remove(&alias_key);
                 }
+            }
+            SymbolRebuildSignal::Abandoned(msg) => {
+                // Restore never finished within the retry cap: the previous
+                // index stays live, so a warning (yellow C#⚠ + detail) —
+                // never a red Error. Not Ready either: the index is stale.
+                error_map.insert(alias_key.clone(), msg);
+                status_map.insert(alias_key.clone(), CSharpIndexStatus::Partial);
             }
             SymbolRebuildSignal::Failed(msg) => {
                 error_map.insert(alias_key.clone(), msg);
@@ -4694,44 +4735,61 @@ async fn trigger_symbol_rebuild(
                     .csharp_index_error
                     .insert(alias_owned.clone(), msg.clone());
             }
-            if ServeState::is_lmdb_format_corruption(&msg)
-                && state.enqueue_format_recovery(&alias_owned)
-            {
-                tracing::warn!(
-                    "⚠️ LMDB storage-format corruption for '{}' — queueing sequential wipe + \
-                     full rebuild. Raw error: {}",
-                    alias_owned,
-                    msg
-                );
-                // Recovery owns the outcome from here: show in-progress rather
-                // than Error; it flips to Ready on success or Error on failure.
-                if is_csharp {
+            match classify_symbol_rebuild_failure(&msg, &e, is_csharp) {
+                SymbolRebuildFailureKind::RestoreExhausted => {
+                    // Restore never finished within the retry cap: the previous
+                    // index stays live — warning (yellow C#⚠ + detail), not a red
+                    // Error, and no touch_last_scip: the index is stale, the next
+                    // rebuild attempt must not be gated as fresh.
+                    tracing::warn!(
+                        "⚠️ Symbol rebuild abandoned for '{}': dotnet restore did not finish \
+                         within the retry cap — previous index stays live",
+                        alias_owned
+                    );
                     state
                         .csharp_index_status
-                        .insert(alias_owned, CSharpIndexStatus::Indexing);
+                        .insert(alias_owned, CSharpIndexStatus::Partial);
                 }
-            } else if ServeState::is_lmdb_format_corruption(&msg) {
-                // A wipe already happened for this alias in this process, so the
-                // data was written by the running binary: the error is write-side
-                // (LMDB rejects an empty or >511-byte key), not an old format.
-                // Wiping again would only restart a multi-hour reindex loop.
-                tracing::error!(
-                    "❌ Symbol rebuild for '{}' hit an LMDB key/value-size error AFTER a format \
-                     wipe — refusing a second wipe, this is a bug in the writer: {}",
-                    alias_owned,
-                    msg
-                );
-                if is_csharp {
-                    state
-                        .csharp_index_status
-                        .insert(alias_owned, CSharpIndexStatus::Error);
+                SymbolRebuildFailureKind::LmdbCorruption => {
+                    if state.enqueue_format_recovery(&alias_owned) {
+                        tracing::warn!(
+                            "⚠️ LMDB storage-format corruption for '{}' — queueing sequential wipe + \
+                             full rebuild. Raw error: {}",
+                            alias_owned,
+                            msg
+                        );
+                        // Recovery owns the outcome from here: show in-progress rather
+                        // than Error; it flips to Ready on success or Error on failure.
+                        if is_csharp {
+                            state
+                                .csharp_index_status
+                                .insert(alias_owned, CSharpIndexStatus::Indexing);
+                        }
+                    } else {
+                        // A wipe already happened for this alias in this process, so the
+                        // data was written by the running binary: the error is write-side
+                        // (LMDB rejects an empty or >511-byte key), not an old format.
+                        // Wiping again would only restart a multi-hour reindex loop.
+                        tracing::error!(
+                            "❌ Symbol rebuild for '{}' hit an LMDB key/value-size error AFTER a format \
+                             wipe — refusing a second wipe, this is a bug in the writer: {}",
+                            alias_owned,
+                            msg
+                        );
+                        if is_csharp {
+                            state
+                                .csharp_index_status
+                                .insert(alias_owned, CSharpIndexStatus::Error);
+                        }
+                    }
                 }
-            } else {
-                tracing::error!("❌ Symbol rebuild failed for '{}': {}", alias_owned, msg);
-                if is_csharp {
-                    state
-                        .csharp_index_status
-                        .insert(alias_owned, CSharpIndexStatus::Error);
+                SymbolRebuildFailureKind::Generic => {
+                    tracing::error!("❌ Symbol rebuild failed for '{}': {}", alias_owned, msg);
+                    if is_csharp {
+                        state
+                            .csharp_index_status
+                            .insert(alias_owned, CSharpIndexStatus::Error);
+                    }
                 }
             }
         }
