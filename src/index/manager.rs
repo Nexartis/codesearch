@@ -45,6 +45,7 @@ use super::Result;
 /// POST-/reindex paths. Without `Started`, a watcher-triggered rebuild only
 /// ever reported its terminal state, so the C#-specific indicator never showed
 /// "Indexing" while the (35–84s) rebuild was actually running.
+#[derive(Debug, PartialEq)]
 pub enum SymbolRebuildSignal {
     /// A rebuild is about to run (helper available and project applies).
     Started,
@@ -61,6 +62,24 @@ pub enum SymbolRebuildSignal {
     /// failure — the serve layer renders a warning (yellow C#⚠), not a red
     /// error.
     Abandoned(String),
+}
+
+/// Terminal signal for a grouped incremental rebuild: a real failure
+/// (`last_error`) wins over an abandonment (`last_abandon`), which wins over
+/// success. Pure so the ordering is table-testable — the watcher-path
+/// counterpart of the serve layer's `classify_symbol_rebuild_failure`.
+pub(crate) fn grouped_rebuild_signal(
+    last_error: Option<String>,
+    last_abandon: Option<String>,
+    index_warnings: Vec<String>,
+) -> SymbolRebuildSignal {
+    if let Some(msg) = last_error {
+        SymbolRebuildSignal::Failed(msg)
+    } else if let Some(msg) = last_abandon {
+        SymbolRebuildSignal::Abandoned(msg)
+    } else {
+        SymbolRebuildSignal::Succeeded { index_warnings }
+    }
 }
 
 /// Callback invoked around each watcher-triggered C# symbol rebuild.
@@ -2196,13 +2215,11 @@ impl IndexManager {
                                     // live (warning), but a genuine failure must
                                     // still render red.
                                     if let Some(ref n) = notifier {
-                                        if let Some(msg) = last_error {
-                                            n(SymbolRebuildSignal::Failed(msg));
-                                        } else if let Some(msg) = last_abandon {
-                                            n(SymbolRebuildSignal::Abandoned(msg));
-                                        } else {
-                                            n(SymbolRebuildSignal::Succeeded { index_warnings });
-                                        }
+                                        n(grouped_rebuild_signal(
+                                            last_error,
+                                            last_abandon,
+                                            index_warnings,
+                                        ));
                                     }
                                     // Clear "Indexing" now that all groups are done
                                     if let Some(ref cb) = indexing_cb_scip {
@@ -3149,6 +3166,49 @@ mod tests {
                 classify_symbol_rebuild_event(Path::new(path)),
                 expected,
                 "path: {path}"
+            );
+        }
+    }
+
+    /// The grouped incremental rebuild's terminal-signal ordering: a real
+    /// failure beats an abandonment (exhausted groups leave the previous
+    /// index live — warning — but a genuine failure must render red), and
+    /// an abandonment beats success. Pins the decision the watcher path
+    /// relies on, without driving the async loop — the same
+    /// extract-and-table-test shape as the serve layer's classifier.
+    #[test]
+    fn grouped_rebuild_signal_priority_table() {
+        use SymbolRebuildSignal::*;
+        let real = "MDB_BAD_VALSIZE: put failed".to_string();
+        let exhausted = "dotnet restore did not finish within 3 attempts".to_string();
+        let warnings = vec!["MSBuild advisory".to_string()];
+        let cases = [
+            (
+                "real failure beats abandonment",
+                Some(real.clone()),
+                Some(exhausted.clone()),
+                Failed(real.clone()),
+            ),
+            (
+                "abandonment beats success",
+                None,
+                Some(exhausted.clone()),
+                Abandoned(exhausted.clone()),
+            ),
+            (
+                "clean run keeps the surviving warnings",
+                None,
+                None,
+                Succeeded {
+                    index_warnings: warnings.clone(),
+                },
+            ),
+        ];
+        for (label, last_error, last_abandon, expected) in cases {
+            assert_eq!(
+                grouped_rebuild_signal(last_error, last_abandon, warnings.clone()),
+                expected,
+                "case: {label}"
             );
         }
     }
