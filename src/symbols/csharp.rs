@@ -3186,12 +3186,29 @@ mod tests {
 
         let (tx, rx) = std::sync::mpsc::channel();
         let repo = dir.path().to_path_buf();
+        let db_thread = db.clone();
         std::thread::spawn(move || {
-            let res = CSharpSymbolIndexer::new().rebuild(&repo, &db, RebuildScope::Full);
+            let res = CSharpSymbolIndexer::new().rebuild(&repo, &db_thread, RebuildScope::Full);
             let _ = tx.send(res.map(|_| ()).map_err(|e| format!("{e:#}")));
         });
 
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        // Arm the promptness clock only once the rebuild is actually parked
+        // in the restore wait: under full-suite load the helper spawn + LMDB
+        // open can outlast a fixed settle sleep, failing the test before the
+        // property under test ever engaged. The pending flag rides the retry
+        // loop, so it flips true exactly when the wait starts.
+        let indexer = CSharpSymbolIndexer::new();
+        let park_started = std::time::Instant::now();
+        loop {
+            assert!(
+                park_started.elapsed() < std::time::Duration::from_secs(30),
+                "rebuild never reached the restore wait"
+            );
+            if indexer.restore_pending(&db) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
         crate::constants::SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
         let outcome = rx.recv_timeout(std::time::Duration::from_secs(10));
         crate::constants::SHUTDOWN_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);

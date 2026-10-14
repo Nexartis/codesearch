@@ -18,6 +18,8 @@ finalized in place with a date — no renaming/migration step needed.
 
 ### Fixed
 
+- **The serve TUI/`/status` repo label no longer flips to `idle` while a rebuild is still queued.** Phase-2 pre-marks queued C# rebuilds in the per-language status cache, but the repo-level label waited for the `active_reindexes` marker that only appears when the task actually starts — so during a startup rebuild wave most repos read `idle` with only the C# column showing indexing. A resolved `Indexing` language status now also holds the repo label at `indexing`; it returns to idle/open when the rebuild completes. Queued pre-marks are cleared on the phase-2 skip paths (unresolvable/missing repo) so a skipped rebuild cannot show indexing forever.
+
 - **C# restore-pending retries capped at 3 attempts with exponential backoff, and restore exhaustion renders as a warning instead of an error.** A hung `dotnet restore` burned 20 retries × 60s before the rebuild gave up — and then flagged the index red as if broken. Now: 3 attempts with doubling waits (60s + 120s by default, base tunable via `CODESEARCH_RESTORE_RETRY_INTERVAL_SECS`), after which the rebuild stops with a typed `RestoreExhaustedError`, LMDB stays untouched and the previous index keeps serving. Exhaustion surfaces as yellow `C#⚠ partial` with the reason on every serve path (reindex trigger, FSW full and grouped incremental rebuilds); a real failure still renders red, and a later clean rebuild clears the warning back to Ready.
 
 ## [1.5.15]

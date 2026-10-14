@@ -3737,6 +3737,85 @@ fn indexing_marks_only_applicable_languages_in_status() {
     state.end_indexing("langrepo", IndexingOwner::Reindex);
 }
 
+/// A queued phase-2 rebuild holds no active_reindexes marker yet: the C#
+/// cache pre-mark alone must carry the row (label Indexing, not Idle) so a
+/// waiting repo doesn't read as idle while its rebuild is pending.
+#[test]
+fn queued_rebuild_pre_mark_keeps_the_repo_label_indexing() {
+    let (_tmp, repo_path, bare) = state_with_repo("queuedrepo");
+    let state = std::sync::Arc::new(bare);
+    std::fs::create_dir_all(repo_path.join(DB_DIR_NAME)).unwrap();
+
+    // The phase-2 queue pre-mark — no begin_indexing, the task hasn't started.
+    state
+        .csharp_index_status
+        .insert("queuedrepo".to_string(), CSharpIndexStatus::Indexing);
+
+    let row = || {
+        state
+            .repo_statuses_lightweight()
+            .into_iter()
+            .find(|(alias, _)| alias == "queuedrepo")
+            .expect("queuedrepo row")
+            .1
+    };
+
+    let info = row();
+    assert_eq!(info.status, RepoStateLabel::Indexing);
+    assert_eq!(info.csharp_index, CSharpIndexStatus::Indexing);
+
+    // Completed rebuilds overwrite the cache; without pending work the same
+    // closed repo reads Idle again.
+    state.csharp_index_status.remove("queuedrepo");
+    assert_eq!(row().status, RepoStateLabel::Idle);
+}
+
+/// The `!applies` skip in trigger_symbol_rebuild must drop a queued pre-mark:
+/// applicability can change while the task waits for its semaphore slot, and
+/// no rebuild will start to overwrite the mark.
+#[tokio::test]
+async fn trigger_symbol_rebuild_clears_a_pre_mark_when_not_applicable() {
+    let (_tmp, repo_path, bare) = state_with_repo("naq");
+    let state = std::sync::Arc::new(bare);
+    // No .sln written → C# does not apply to this repo.
+    state
+        .csharp_index_status
+        .insert("naq".to_string(), CSharpIndexStatus::Indexing);
+
+    trigger_symbol_rebuild(
+        "naq",
+        &repo_path,
+        &repo_path.join(DB_DIR_NAME),
+        &state,
+        LANG_CSHARP,
+    )
+    .await;
+
+    assert!(
+        state.csharp_index_status.get("naq").is_none(),
+        "a skipped rebuild must not leave the queue pre-mark behind"
+    );
+}
+
+/// A repo whose directory is gone by the time phase-2 runs must never show
+/// indexing: either candidacy filtering skips it or the task's skip guard
+/// drops the pre-mark. No helper env is set (applicability gates before
+/// availability, so a missing dir is decided without probing a helper) —
+/// env-mutating variants of this test must stay `#[serial]`.
+#[tokio::test]
+async fn phase_2_never_marks_a_missing_repo_indexing() {
+    let (_tmp, repo_path, bare) = state_with_repo("gone");
+    std::fs::remove_dir_all(&repo_path).unwrap();
+    let state = std::sync::Arc::new(bare);
+
+    state.run_phase_2_symbols().await;
+
+    assert!(
+        state.csharp_index_status.get("gone").is_none(),
+        "a missing repo must not end up marked indexing"
+    );
+}
+
 /// The serve-tui `i` overlay reads the DURABLE warnings from the on-disk
 /// meta (survives a restart, unlike the in-memory status) and prefixes them
 /// with the language. A repo whose meta carries no warnings yields none.
