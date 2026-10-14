@@ -122,6 +122,21 @@ fn csharp_success_outcome(index_warnings: &[String]) -> (CSharpIndexStatus, Opti
     }
 }
 
+/// Symbol-index status shown for a repo: a running build wins over any cached
+/// value (a stale `Ready` must not outlive a rebuild), otherwise the cache,
+/// otherwise a fresh probe. Pure so the precedence is testable.
+pub(crate) fn resolve_csharp_status(
+    cached: Option<CSharpIndexStatus>,
+    indexing: bool,
+    probe: impl FnOnce() -> CSharpIndexStatus,
+) -> CSharpIndexStatus {
+    if indexing {
+        CSharpIndexStatus::Indexing
+    } else {
+        cached.unwrap_or_else(probe)
+    }
+}
+
 /// Lightweight repo status derived from DashMap state only (no DB opens).
 pub(crate) struct RepoStatusInfo {
     pub(crate) status: RepoStateLabel,
@@ -1757,7 +1772,11 @@ impl ServeState {
                 if !decision.needs_rebuild() {
                     // A fresh C# index flips the TUI C# indicator to Ready;
                     // other languages have no status map, nothing to update.
-                    if decision == RebuildDecision::Fresh && lang.as_str() == LANG_CSHARP {
+                    // Skipped while a build runs: Ready would mask it.
+                    if decision == RebuildDecision::Fresh
+                        && lang.as_str() == LANG_CSHARP
+                        && !self.is_indexing(alias)
+                    {
                         let mut status = self
                             .csharp_index_status
                             .get(alias)
@@ -1990,9 +2009,12 @@ impl ServeState {
                 // Restore Ready status regardless of pre-warm outcome: the SCIP
                 // definitions index (built in Phase 2) remains valid even if
                 // ref-cache pre-warm fails. TUI returns to "C#·" (ready).
-                state
-                    .csharp_index_status
-                    .insert(alias_owned, CSharpIndexStatus::Ready);
+                // Not while a build runs: it sets the final status itself.
+                if !state.is_indexing(&alias_owned) {
+                    state
+                        .csharp_index_status
+                        .insert(alias_owned, CSharpIndexStatus::Ready);
+                }
             }));
         }
 
@@ -3682,7 +3704,8 @@ impl ServeState {
             let db_path = path.join(DB_DIR_NAME);
             let db_exists = db_path.exists();
 
-            let label = if self.is_indexing(alias) {
+            let indexing = self.is_indexing(alias);
+            let label = if indexing {
                 RepoStateLabel::Indexing
             } else {
                 match self.repos.get(alias) {
@@ -3730,12 +3753,11 @@ impl ServeState {
                 .map(|c| c.load(Ordering::Relaxed))
                 .unwrap_or(0);
 
-            // C# index status: check cached value first, then probe
-            let csharp_index = self
-                .csharp_index_status
-                .get(alias)
-                .map(|e| *e.value())
-                .unwrap_or_else(|| {
+            // C# index status: a running build, else the cached value, else a probe
+            let csharp_index = resolve_csharp_status(
+                self.csharp_index_status.get(alias).map(|e| *e.value()),
+                indexing,
+                || {
                     // Probe: helper available + index exists → Ready
                     let registry = &self.symbol_registry;
                     let has_helper = registry
@@ -3747,7 +3769,8 @@ impl ServeState {
                     } else {
                         CSharpIndexStatus::None
                     }
-                });
+                },
+            );
 
             let csharp_error = if matches!(
                 csharp_index,
@@ -3766,7 +3789,9 @@ impl ServeState {
             // exists → Ready; otherwise None. The TUI icon reflects "an index
             // exists", which is exactly what matters for discoverability.
             let registry = &self.symbol_registry;
-            let typescript_index = {
+            let typescript_index = if indexing {
+                CSharpIndexStatus::Indexing
+            } else {
                 let has_ts_helper = registry
                     .get(LANG_TYPESCRIPT)
                     .map(|i| i.is_available())

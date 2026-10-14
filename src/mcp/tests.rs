@@ -2232,14 +2232,14 @@ fn note_store_failure_survives_a_short_alias_list() {
 
 #[test]
 fn index_status_summary_reports_building_before_anything_failed() {
-    let (status, message) = super::index_status_summary(3, 0, 0, true);
+    let (status, message) = super::index_status_summary(3, 0, 0, true, false);
     assert_eq!(status, "building");
     assert!(!message.contains("failed"), "got: {message}");
 }
 
 #[test]
 fn index_status_summary_reports_clean_ready_with_no_failures() {
-    let (status, message) = super::index_status_summary(3, 0, 500, true);
+    let (status, message) = super::index_status_summary(3, 0, 500, true, false);
     assert_eq!(status, "ready");
     assert!(!message.contains("failed"), "got: {message}");
     assert!(message.contains("3 repo(s)"), "got: {message}");
@@ -2249,7 +2249,7 @@ fn index_status_summary_reports_clean_ready_with_no_failures() {
 fn index_status_summary_surfaces_a_degraded_group_as_ready_with_a_count() {
     // This is the exact case that used to be indistinguishable from
     // "index still warming": some data is in, one store didn't answer.
-    let (status, message) = super::index_status_summary(3, 1, 500, true);
+    let (status, message) = super::index_status_summary(3, 1, 500, true, false);
     assert_eq!(
         status, "ready",
         "the two healthy stores must not be masked by the one that failed"
@@ -2269,7 +2269,7 @@ fn index_status_summary_reports_error_when_every_store_failed() {
     // this fix, `total_chunks == 0` was checked first and this rendered as
     // "building" — byte-identical to "not indexed yet" — even though every
     // store actively failed. `failed_count >= total_repos` must win.
-    let (status, message) = super::index_status_summary(3, 3, 0, true);
+    let (status, message) = super::index_status_summary(3, 3, 0, true, false);
     assert_eq!(
         status, "error",
         "a group where every store failed must not read as merely 'still building'"
@@ -2995,7 +2995,7 @@ fn readonly_or_require_ready_never_creates_a_missing_index() {
 /// failed with "Index not built. Call build_index() after inserting chunks."
 #[test]
 fn index_status_summary_reports_building_when_chunks_exist_but_graph_is_not_built() {
-    let (status, message) = super::index_status_summary(3, 0, 500, false);
+    let (status, message) = super::index_status_summary(3, 0, 500, false, false);
     assert_eq!(
         status, "building",
         "chunks without a built vector index are not searchable"
@@ -3006,27 +3006,71 @@ fn index_status_summary_reports_building_when_chunks_exist_but_graph_is_not_buil
         "message must still name the scope, got: {message}"
     );
     // A stats() failure on some stores must NOT be misread as "not built".
-    let (status, _) = super::index_status_summary(3, 1, 500, true);
+    let (status, _) = super::index_status_summary(3, 1, 500, true, false);
     assert_eq!(
         status, "ready",
         "a failed store is surfaced as degraded-ready"
     );
 }
 
+/// A running rebuild turns every would-be "ready" into "building"; states that
+/// already carry a more specific verdict (all stores failed) are left alone.
+#[test]
+fn index_status_summary_reports_building_while_a_rebuild_runs() {
+    // (total_repos, failed, chunks, all_built, indexing) -> expected status
+    let cases = [
+        ((3, 0, 500, true, true), "building"),
+        ((3, 1, 500, true, true), "building"),
+        ((3, 0, 500, true, false), "ready"),
+        ((3, 3, 0, true, true), "error"),
+    ];
+    for ((repos, failed, chunks, built, indexing), expected) in cases {
+        let (status, message) = super::index_status_summary(repos, failed, chunks, built, indexing);
+        assert_eq!(
+            status, expected,
+            "case ({repos},{failed},{chunks},{built},{indexing}): {message}"
+        );
+    }
+    let (_, message) = super::index_status_summary(3, 0, 500, true, true);
+    assert!(message.contains("rebuild"), "got: {message}");
+}
+
 /// Single-store counterpart: the same `total_chunks > 0` shortcut reported
 /// `ready` for a store whose graph was never built (`indexed == false`).
 #[test]
 fn single_index_status_requires_a_built_graph_to_report_ready() {
-    let (status, message) = super::single_index_status(403, false);
+    let (status, message) = super::single_index_status(403, false, false);
     assert_eq!(
         status, "building",
         "403 chunks with no built graph are not searchable"
     );
     assert!(message.contains("not built"), "got: {message}");
 
-    let (status, _) = super::single_index_status(403, true);
+    let (status, _) = super::single_index_status(403, true, false);
     assert_eq!(status, "ready");
 
-    let (status, _) = super::single_index_status(0, false);
+    let (status, _) = super::single_index_status(0, false, false);
     assert_eq!(status, "building");
+}
+
+/// A running rebuild overrides "ready": the stores are still being rewritten
+/// even though the previous generation's graph reports built.
+#[test]
+fn single_index_status_reports_building_while_a_rebuild_runs() {
+    // (total_chunks, indexed, indexing) -> expected status
+    let cases = [
+        ((403, true, true), "building"),
+        ((403, false, true), "building"),
+        ((0, false, true), "building"),
+        ((403, true, false), "ready"),
+    ];
+    for ((chunks, indexed, indexing), expected) in cases {
+        let (status, message) = super::single_index_status(chunks, indexed, indexing);
+        assert_eq!(
+            status, expected,
+            "case ({chunks},{indexed},{indexing}): {message}"
+        );
+    }
+    let (_, message) = super::single_index_status(403, true, true);
+    assert!(message.contains("rebuild"), "got: {message}");
 }

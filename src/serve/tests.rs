@@ -3522,6 +3522,36 @@ fn csharp_success_outcome_partial_when_warnings_survived() {
     );
 }
 
+/// A running build wins over a cached (stale) Ready and over the probe, and
+/// skips the probe entirely; idle falls back cache → probe.
+#[test]
+fn resolve_csharp_status_precedence() {
+    use CSharpIndexStatus as S;
+    // (cached, indexing, probe result, expected, probe expected to run)
+    let cases = [
+        (Some(S::Ready), true, S::Ready, S::Indexing, false),
+        (None, true, S::Ready, S::Indexing, false),
+        (Some(S::Ready), false, S::None, S::Ready, false),
+        (None, false, S::Ready, S::Ready, true),
+        (None, false, S::None, S::None, true),
+    ];
+    for (cached, indexing, probe_result, expected, probe_runs) in cases {
+        let mut probed = false;
+        let got = resolve_csharp_status(cached, indexing, || {
+            probed = true;
+            probe_result
+        });
+        assert_eq!(
+            got, expected,
+            "cached={cached:?} indexing={indexing} probe={probe_result:?}"
+        );
+        assert_eq!(
+            probed, probe_runs,
+            "probe invocation for cached={cached:?} indexing={indexing}"
+        );
+    }
+}
+
 /// The watcher notifier must apply the SAME status contract as
 /// trigger_symbol_rebuild's success arm: Succeeded-with-warnings → Partial
 /// (red C#⚠) with bounded detail — never green — and a clean Succeeded →
