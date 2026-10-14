@@ -1877,12 +1877,20 @@ impl ServeState {
             handles.push(tokio::spawn(async move {
                 let permit = match sem.acquire_owned().await {
                     Ok(p) => p,
-                    Err(_) => return,
+                    Err(_) => {
+                        if lang.as_str() == LANG_CSHARP {
+                            state.csharp_index_status.remove(&alias);
+                        }
+                        return;
+                    }
                 };
                 info!("phase-2: starting '{}' ({})", alias, lang);
                 let path = match state.config.read().ok().and_then(|c| c.resolve(&alias)) {
                     Some(p) => p,
                     None => {
+                        if lang.as_str() == LANG_CSHARP {
+                            state.csharp_index_status.remove(&alias);
+                        }
                         drop(permit);
                         return;
                     }
@@ -1896,6 +1904,11 @@ impl ServeState {
                         alias,
                         path.display()
                     );
+                    // Skip paths drop the queue pre-mark: no rebuild will
+                    // start, so the row must not keep showing indexing.
+                    if lang.as_str() == LANG_CSHARP {
+                        state.csharp_index_status.remove(&alias);
+                    }
                     drop(permit);
                     return;
                 }
@@ -3746,25 +3759,6 @@ impl ServeState {
             let db_exists = db_path.exists();
 
             let indexing = self.is_indexing(alias);
-            let label = if indexing {
-                RepoStateLabel::Indexing
-            } else {
-                match self.repos.get(alias) {
-                    Some(entry) => match entry.value() {
-                        RepoState::Write { .. } => RepoStateLabel::Open,
-                        RepoState::Warm { .. } => RepoStateLabel::Warm,
-                        RepoState::Readonly { .. } => RepoStateLabel::Readonly,
-                        RepoState::Conflicted => RepoStateLabel::Error,
-                    },
-                    None => {
-                        if !db_exists {
-                            RepoStateLabel::NoIndex
-                        } else {
-                            RepoStateLabel::Idle
-                        }
-                    }
-                }
-            };
 
             let changes = match self.repos.get(alias) {
                 Some(entry) => match entry.value() {
@@ -3853,6 +3847,31 @@ impl ServeState {
                     CSharpIndexStatus::Ready
                 } else {
                     CSharpIndexStatus::None
+                }
+            };
+
+            // A queued rebuild holds no active_reindexes marker yet (phase-2
+            // pre-marks the C# cache; LMDB format recovery owns its outcome
+            // the same way), so the label must also follow a resolved
+            // Indexing status — otherwise a waiting repo reads as idle while
+            // its rebuild is pending.
+            let label = if indexing || csharp_index == CSharpIndexStatus::Indexing {
+                RepoStateLabel::Indexing
+            } else {
+                match self.repos.get(alias) {
+                    Some(entry) => match entry.value() {
+                        RepoState::Write { .. } => RepoStateLabel::Open,
+                        RepoState::Warm { .. } => RepoStateLabel::Warm,
+                        RepoState::Readonly { .. } => RepoStateLabel::Readonly,
+                        RepoState::Conflicted => RepoStateLabel::Error,
+                    },
+                    None => {
+                        if !db_exists {
+                            RepoStateLabel::NoIndex
+                        } else {
+                            RepoStateLabel::Idle
+                        }
+                    }
                 }
             };
 
@@ -4649,6 +4668,12 @@ async fn trigger_symbol_rebuild(
             "🔬 symbol reindex skipped for '{}': not applicable (no .sln / tsconfig.json)",
             alias
         );
+        // A queued pre-mark (phase-2) can outlive its applicability window
+        // (e.g. the .sln vanished while the task waited for its slot): drop
+        // it — no rebuild will start here to overwrite it.
+        if is_csharp {
+            state.csharp_index_status.remove(alias);
+        }
         return;
     }
 
