@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.5.16]
+
+### Fixed
+
+- **C# restore-pending retries capped at 3 attempts with exponential backoff, and restore exhaustion renders as a warning instead of an error.** A hung `dotnet restore` burned 20 retries × 60s before the rebuild gave up — and then flagged the index red as if broken. Now: 3 attempts with doubling waits (60s + 120s by default, base tunable via `CODESEARCH_RESTORE_RETRY_INTERVAL_SECS`), after which the rebuild stops with a typed `RestoreExhaustedError`, LMDB stays untouched and the previous index keeps serving. Exhaustion surfaces as yellow `C#⚠ partial` with the reason on every serve path (reindex trigger, FSW full and grouped incremental rebuilds); a real failure still renders red, and a later clean rebuild clears the warning back to Ready.
+
 ## [1.5.15]
 
 ### Fixed
