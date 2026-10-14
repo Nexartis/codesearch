@@ -336,6 +336,11 @@ pub struct RestoreExhaustedError {
     pub backoff: String,
 }
 
+/// True when `e` is the typed restore-exhausted outcome.
+pub(crate) fn is_restore_exhausted(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<RestoreExhaustedError>().is_some()
+}
+
 /// Solutions whose rebuild retry loop is currently waiting out a restore.
 /// find_impact reads this through
 /// [`SymbolIndexer::restore_pending`] to attach one caller-facing warning

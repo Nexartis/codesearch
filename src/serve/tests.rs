@@ -3572,6 +3572,84 @@ fn csharp_notifier_partial_on_succeeded_with_warnings() {
     );
 }
 
+/// A rebuild abandoned because `dotnet restore` never finished within the
+/// retry cap leaves the previous index live — so the notifier must render
+/// a WARNING (Partial, yellow `C#⚠`, with the abandonment detail), never a
+/// red Error: a hung restore is an environment condition, not a broken
+/// index.
+#[test]
+fn csharp_notifier_renders_restore_exhaustion_as_partial_not_error() {
+    let state = ServeState::new(ReposConfig::default(), None);
+    let notifier = state.make_csharp_notifier("bayr");
+
+    notifier(SymbolRebuildSignal::Started);
+    notifier(SymbolRebuildSignal::Abandoned(
+        "dotnet restore for this solution did not finish within 3 attempts \
+         (backoff 60s + 120s) — rebuild abandoned, the previous index stays live (issue #225)"
+            .to_string(),
+    ));
+    assert_eq!(
+        state.csharp_index_status.get("bayr").map(|e| *e.value()),
+        Some(CSharpIndexStatus::Partial),
+        "restore exhaustion is a warning — the previous index stays live"
+    );
+    let detail = state
+        .csharp_index_error
+        .get("bayr")
+        .map(|e| e.value().clone())
+        .expect("the abandonment reason must be the info-panel detail");
+    assert!(
+        detail.contains("did not finish within 3 attempts"),
+        "{detail}"
+    );
+
+    // A later clean rebuild clears the warning again.
+    notifier(SymbolRebuildSignal::Succeeded {
+        index_warnings: Vec::new(),
+    });
+    assert_eq!(
+        state.csharp_index_status.get("bayr").map(|e| *e.value()),
+        Some(CSharpIndexStatus::Ready)
+    );
+    assert!(!state.csharp_index_error.contains_key("bayr"));
+}
+
+/// The failure classifier must keep the three outcomes apart — and check
+/// restore-exhaustion FIRST: the typed error carries its own contract
+/// (LMDB untouched, previous index live) that the corruption matcher must
+/// not override. Reordering the checks or flipping the restore arm back to
+/// Error ships the red-error regression with a green suite.
+#[test]
+fn symbol_rebuild_failure_classification_keeps_restore_exhaustion_a_warning() {
+    let exhausted: anyhow::Error = csharp::RestoreExhaustedError {
+        attempts: 3,
+        backoff: "60s + 120s".to_string(),
+    }
+    .into();
+    assert_eq!(
+        classify_symbol_rebuild_failure(&format!("{exhausted:#}"), &exhausted, true),
+        SymbolRebuildFailureKind::RestoreExhausted,
+        "a C# restore-exhausted rebuild must classify as the warning path"
+    );
+    // Not C#: the restore gate is C#-only, the same error falls through.
+    assert_eq!(
+        classify_symbol_rebuild_failure(&format!("{exhausted:#}"), &exhausted, false),
+        SymbolRebuildFailureKind::Generic
+    );
+    // Corruption keeps its own path for a non-exhausted error.
+    let corrupt: anyhow::Error = anyhow::anyhow!("heed -> MDB_BAD_VALSIZE");
+    assert_eq!(
+        classify_symbol_rebuild_failure(&format!("{corrupt:#}"), &corrupt, true),
+        SymbolRebuildFailureKind::LmdbCorruption
+    );
+    // Everything else stays a red Error.
+    let generic: anyhow::Error = anyhow::anyhow!("helper exited with 1");
+    assert_eq!(
+        classify_symbol_rebuild_failure(&format!("{generic:#}"), &generic, true),
+        SymbolRebuildFailureKind::Generic
+    );
+}
+
 /// `repo_statuses_lightweight()` must carry the Partial status AND its
 /// detail message — that pair is what renders the red `C#⚠` and the info
 /// panel's failure line.
