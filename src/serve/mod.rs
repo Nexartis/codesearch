@@ -3753,24 +3753,31 @@ impl ServeState {
                 .map(|c| c.load(Ordering::Relaxed))
                 .unwrap_or(0);
 
-            // C# index status: a running build, else the cached value, else a probe
-            let csharp_index = resolve_csharp_status(
-                self.csharp_index_status.get(alias).map(|e| *e.value()),
-                indexing,
-                || {
-                    // Probe: helper available + index exists → Ready
-                    let registry = &self.symbol_registry;
-                    let has_helper = registry
+            // The repo-level indexing flag only shows as a language's `Indexing`
+            // where that language applies; elsewhere (e.g. a Rust-only repo) the
+            // symbol column keeps its normal None/probe result. A cached status
+            // exists only for repos where a rebuild ran, so it also counts.
+            let cached_csharp = self.csharp_index_status.get(alias).map(|e| *e.value());
+            let csharp_building = indexing
+                && (cached_csharp.is_some()
+                    || self
+                        .symbol_registry
                         .get(LANG_CSHARP)
-                        .map(|i| i.is_available())
-                        .unwrap_or(false);
-                    if has_helper && registry.has_index_for(LANG_CSHARP, &db_path) {
-                        CSharpIndexStatus::Ready
-                    } else {
-                        CSharpIndexStatus::None
-                    }
-                },
-            );
+                        .map(|i| i.applies_to(path))
+                        .unwrap_or(false));
+            let csharp_index = resolve_csharp_status(cached_csharp, csharp_building, || {
+                // Probe: helper available + index exists → Ready
+                let registry = &self.symbol_registry;
+                let has_helper = registry
+                    .get(LANG_CSHARP)
+                    .map(|i| i.is_available())
+                    .unwrap_or(false);
+                if has_helper && registry.has_index_for(LANG_CSHARP, &db_path) {
+                    CSharpIndexStatus::Ready
+                } else {
+                    CSharpIndexStatus::None
+                }
+            });
 
             let csharp_error = if matches!(
                 csharp_index,
@@ -3789,7 +3796,12 @@ impl ServeState {
             // exists → Ready; otherwise None. The TUI icon reflects "an index
             // exists", which is exactly what matters for discoverability.
             let registry = &self.symbol_registry;
-            let typescript_index = if indexing {
+            let ts_building = indexing
+                && registry
+                    .get(LANG_TYPESCRIPT)
+                    .map(|i| i.applies_to(path) && i.is_available())
+                    .unwrap_or(false);
+            let typescript_index = if ts_building {
                 CSharpIndexStatus::Indexing
             } else {
                 let has_ts_helper = registry

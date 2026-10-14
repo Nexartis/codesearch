@@ -3630,6 +3630,35 @@ fn repo_statuses_lightweight_carries_partial_with_detail() {
     );
 }
 
+/// A running index must show as `Indexing` only for the languages that apply
+/// to the repo: a Rust-only repo keeps `None` in both symbol columns.
+#[test]
+#[serial]
+fn indexing_marks_only_applicable_languages_in_status() {
+    let (_tmp, repo_path, bare) = state_with_repo("langrepo");
+    let state = std::sync::Arc::new(bare);
+    assert!(state.begin_indexing("langrepo", IndexingOwner::Reindex));
+
+    let row = |state: &ServeState| {
+        state
+            .repo_statuses_lightweight()
+            .into_iter()
+            .find(|(alias, _)| alias == "langrepo")
+            .expect("langrepo row")
+            .1
+    };
+
+    let info = row(&state);
+    assert_eq!(info.status, RepoStateLabel::Indexing);
+    assert_eq!(info.csharp_index, CSharpIndexStatus::None);
+    assert_eq!(info.typescript_index, CSharpIndexStatus::None);
+
+    std::fs::write(repo_path.join("App.sln"), "").unwrap();
+    assert_eq!(row(&state).csharp_index, CSharpIndexStatus::Indexing);
+
+    state.end_indexing("langrepo", IndexingOwner::Reindex);
+}
+
 /// The serve-tui `i` overlay reads the DURABLE warnings from the on-disk
 /// meta (survives a restart, unlike the in-memory status) and prefixes them
 /// with the language. A repo whose meta carries no warnings yields none.
