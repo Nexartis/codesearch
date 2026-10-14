@@ -2744,6 +2744,73 @@ fn evicting_idle_repo_clears_frozen_csharp_error_state() {
     );
 }
 
+/// A build longer than the idle timeout must not leave the repo "idle" the
+/// instant it finishes: the reaper skips an indexing repo AND restarts its idle
+/// clock, so the first sweep after the build still finds it fresh.
+///
+/// Regression guard: the reaper used to skip indexing repos without touching
+/// `last_access`, so a 30+ minute SCIP/index run ended with the repo already
+/// past the timeout and the very next sweep evicted it.
+#[tokio::test]
+#[serial]
+async fn idle_reaper_restarts_the_idle_clock_of_an_indexing_repo() {
+    let _env = crate::testing::EnvRestore::set(&[
+        (crate::constants::REPO_IDLE_TIMEOUT_ENV, "60"),
+        (crate::constants::MAX_INDEXING_SECS_ENV, "600"),
+    ]);
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = crate::cache::safe_canonicalize(tmp.path())
+        .unwrap()
+        .join(DB_DIR_NAME);
+    let OpenedStores::Write(stores) = state
+        .try_open_stores("longbuild", &db_path, true, false, None)
+        .expect("open must succeed")
+    else {
+        panic!("brand-new repo must open Write");
+    };
+    state
+        .repos
+        .insert("longbuild".to_string(), RepoState::Warm { stores });
+    let long_ago = || {
+        Instant::now()
+            .checked_sub(Duration::from_secs(120))
+            .expect("monotonic clock at least 2 minutes old")
+    };
+    state
+        .last_access
+        .insert("longbuild".to_string(), long_ago());
+    assert!(state.begin_indexing("longbuild", IndexingOwner::Reindex));
+
+    state.evict_idle_repos();
+    assert!(
+        state.repos.contains_key("longbuild"),
+        "a repo past the idle timeout must not be evicted while it is indexing"
+    );
+    let age = state.last_access.get("longbuild").unwrap().elapsed();
+    assert!(
+        age < Duration::from_secs(60),
+        "a sweep that sees the repo indexing must restart its idle clock, age was {age:?}"
+    );
+
+    state.end_indexing("longbuild", IndexingOwner::Reindex);
+    state.evict_idle_repos();
+    assert!(
+        state.repos.contains_key("longbuild"),
+        "the first sweep after the build must find the repo fresh, not idle"
+    );
+
+    // Control: once the idle period really passes, the reaper still evicts.
+    state
+        .last_access
+        .insert("longbuild".to_string(), long_ago());
+    state.evict_idle_repos();
+    assert!(
+        !state.repos.contains_key("longbuild"),
+        "a repo idle past the timeout with no build running must still be evicted"
+    );
+}
+
 /// The model a serve query is embedded with is read from the routed repo's own
 /// index metadata — never assumed to be the hub-wide default.
 ///
@@ -3242,6 +3309,80 @@ async fn indexing_marker_heartbeat_survives_past_max() {
         !state.is_indexing("hb"),
         "end_indexing must clear the marker"
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn symbol_marker_guard_keeps_the_marker_alive_until_dropped() {
+    // Regression: the SCIP rebuild is one opaque blocking call with no
+    // per-batch heartbeat, so its Symbol marker aged out at MAX_INDEXING_SECS
+    // and the reaper evicted the repo mid-build. The guard renews it for the
+    // whole run and ends it (and the heartbeat) on drop.
+    let _env = crate::testing::EnvRestore::set(&[(crate::constants::MAX_INDEXING_SECS_ENV, "1")]);
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+
+    // Control: a bare Symbol marker expires at the threshold.
+    assert!(state.begin_indexing("ctrl", IndexingOwner::Symbol));
+    let guard = IndexingMarkerGuard::begin(
+        &state,
+        "guarded",
+        IndexingOwner::Symbol,
+        Duration::from_millis(100),
+    );
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        !state.is_indexing("ctrl"),
+        "an unrenewed Symbol marker must expire at the threshold"
+    );
+    assert!(
+        state.is_indexing("guarded"),
+        "the guard's heartbeat must keep the marker alive past the threshold"
+    );
+
+    drop(guard);
+    assert!(
+        !state.is_indexing("guarded"),
+        "dropping the guard must end the marker"
+    );
+    // A heartbeat tick racing the drop must not resurrect the marker.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !state.active_reindexes.contains_key("guarded"),
+        "the heartbeat must stop with the guard"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn symbol_marker_guard_is_inert_while_another_owner_holds_the_alias() {
+    // Nested rebuilds run under the Reindex marker: the guard must neither
+    // add a Symbol marker nor end anyone else's on drop.
+    let _env = crate::testing::EnvRestore::set(&[(crate::constants::MAX_INDEXING_SECS_ENV, "600")]);
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+
+    assert!(state.begin_indexing("nested", IndexingOwner::Reindex));
+    let guard = IndexingMarkerGuard::begin(
+        &state,
+        "nested",
+        IndexingOwner::Symbol,
+        Duration::from_millis(50),
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let owners: Vec<IndexingOwner> = state
+        .active_reindexes
+        .get("nested")
+        .unwrap()
+        .keys()
+        .copied()
+        .collect();
+    assert_eq!(owners, vec![IndexingOwner::Reindex]);
+
+    drop(guard);
+    assert!(
+        state.is_indexing("nested"),
+        "an inert guard must leave the holder's marker alone"
+    );
+    state.end_indexing("nested", IndexingOwner::Reindex);
 }
 
 #[tokio::test]

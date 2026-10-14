@@ -38,10 +38,10 @@ use crate::constants::{
     ALLOWED_HOSTS_ENV, ALLOWED_ROOTS_ENV, CHUNK_PATH, CSHARP_PREWARM_ENABLED_ENV,
     CSHARP_PREWARM_MAX_SYMBOLS, CSHARP_SCIP_CONCURRENCY_DEFAULT, CSHARP_SCIP_CONCURRENCY_ENV,
     DB_DIR_NAME, DEFAULT_SERVE_PORT, DISABLE_HOST_VALIDATION_ENV, EXPLORE_PATH, FIND_IMPACT_PATH,
-    FIND_PATH, HEALTHZ_PATH, HEALTH_PATH, INDEXING_PATH, LANG_CSHARP, LANG_TYPESCRIPT,
-    MAX_INDEXING_SECS, MAX_INDEXING_SECS_ENV, MCP_ENDPOINT_PATH, PERSIST_DEBOUNCE_SECS,
-    REAPER_INTERVAL_SECS, REMOTES_PATH, REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SEARCH_PATH,
-    SERVE_API_KEY_ENV, SERVE_PORT_ENV, STATUS_PATH,
+    FIND_PATH, HEALTHZ_PATH, HEALTH_PATH, INDEXING_MARKER_HEARTBEAT_SECS, INDEXING_PATH,
+    LANG_CSHARP, LANG_TYPESCRIPT, MAX_INDEXING_SECS, MAX_INDEXING_SECS_ENV, MCP_ENDPOINT_PATH,
+    PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS, REMOTES_PATH, REPO_IDLE_TIMEOUT_ENV,
+    REPO_IDLE_TIMEOUT_SECS, SEARCH_PATH, SERVE_API_KEY_ENV, SERVE_PORT_ENV, STATUS_PATH,
 };
 use crate::db_discovery::repos::{config_dir, ReposConfig};
 use crate::index::{
@@ -270,6 +270,9 @@ pub(crate) enum IndexingOwner {
     Symbol,
 }
 
+/// Per-alias indexing markers: owner → when it last started or renewed.
+type ActiveReindexes = DashMap<String, std::collections::HashMap<IndexingOwner, Instant>>;
+
 /// A tracked background indexing task.
 ///
 /// `db_path` travels with the entry so the DB directory of a repo that was
@@ -376,7 +379,7 @@ pub(crate) struct ServeState {
     /// capture a cheap clone that **shares** the underlying map (a bare
     /// `DashMap::clone()` is a deep copy and would silently disconnect the
     /// file-watcher callback from this field).
-    active_reindexes: Arc<DashMap<String, std::collections::HashMap<IndexingOwner, Instant>>>,
+    active_reindexes: Arc<ActiveReindexes>,
     /// Per-repo change count since serve started (incremented by index/reindex operations).
     repo_changes: DashMap<String, AtomicU64>,
     /// Per-repo last tool call: (tool_name, timestamp).
@@ -848,6 +851,18 @@ impl ServeState {
             .entry(alias.to_string())
             .or_default()
             .insert(owner, Instant::now());
+    }
+
+    /// Refresh `owner`'s marker only while it still exists. Unlike
+    /// [`Self::renew_indexing`] it never re-inserts, so a heartbeat tick that
+    /// races `end_indexing` cannot resurrect a finished marker (which would
+    /// block the reaper and every `begin_indexing` for a full timeout).
+    fn refresh_indexing_if_held(&self, alias: &str, owner: IndexingOwner) {
+        if let Some(mut owners) = self.active_reindexes.get_mut(alias) {
+            if let Some(ts) = owners.get_mut(&owner) {
+                *ts = Instant::now();
+            }
+        }
     }
 
     /// True iff an error chain indicates LMDB storage-format corruption —
@@ -4080,25 +4095,30 @@ impl ServeState {
     ///
     /// Closes DB handles, stops FSW, and releases memory. The repo will be
     /// automatically re-opened (and re-warmed) on the next query.
-    /// Active reindexes are never evicted.
+    /// Active reindexes are never evicted, and their idle clock restarts on
+    /// every sweep they are seen indexing.
     pub(crate) fn evict_idle_repos(&self) {
         let timeout = self.idle_timeout();
         let now = std::time::Instant::now();
 
-        // Collect aliases to evict (can't mutate DashMap while iterating)
-        let to_evict: Vec<String> = self
+        // Snapshot first: refreshing `last_access` below must not run while the
+        // map is being iterated (an insert on a read-locked shard deadlocks).
+        let snapshot: Vec<(String, Instant)> = self
             .last_access
             .iter()
-            .filter(|entry| {
-                let alias = entry.key();
-                // Don't evict repos that are being reindexed
-                if self.is_indexing(alias) {
-                    return false;
-                }
-                now.duration_since(*entry.value()) >= timeout
-            })
-            .map(|entry| entry.key().clone())
+            .map(|entry| (entry.key().clone(), *entry.value()))
             .collect();
+        let mut to_evict: Vec<String> = Vec::new();
+        for (alias, last) in &snapshot {
+            if self.is_indexing(alias) {
+                // Never evict a repo mid-build, and restart its idle clock: a
+                // build longer than the timeout would otherwise leave the repo
+                // "idle" the instant it finishes and evict it on the next sweep.
+                self.touch_access(alias);
+            } else if now.duration_since(*last) >= timeout {
+                to_evict.push(alias.clone());
+            }
+        }
 
         // Log reaper status even when nothing to evict (for debugging idle eviction)
         if !self.last_access.is_empty() {
@@ -4633,6 +4653,59 @@ async fn doctor_handler(
     AxumJson(json!({ "results": results })).into_response()
 }
 
+/// Holds `owner`'s indexing marker for `alias` and keeps it fresh until
+/// dropped, however the run exits (success, error, panic, cancelled future).
+///
+/// A flow with no per-batch progress hook (the SCIP rebuild is one opaque
+/// blocking call) would otherwise age out at `MAX_INDEXING_SECS`, letting the
+/// idle reaper evict the repo mid-build.
+struct IndexingMarkerGuard {
+    state: Arc<ServeState>,
+    alias: String,
+    owner: IndexingOwner,
+    /// `Some` only when this guard acquired the marker; an inert guard (another
+    /// owner already holds the alias) neither renews nor ends anything.
+    heartbeat: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl IndexingMarkerGuard {
+    /// Must be called inside a tokio runtime (the heartbeat is a spawned task).
+    fn begin(
+        state: &Arc<ServeState>,
+        alias: &str,
+        owner: IndexingOwner,
+        heartbeat_every: Duration,
+    ) -> Self {
+        let heartbeat = state.begin_indexing(alias, owner).then(|| {
+            let state = Arc::clone(state);
+            let alias = alias.to_string();
+            tokio::spawn(async move {
+                let start = tokio::time::Instant::now() + heartbeat_every;
+                let mut tick = tokio::time::interval_at(start, heartbeat_every);
+                loop {
+                    tick.tick().await;
+                    state.refresh_indexing_if_held(&alias, owner);
+                }
+            })
+        });
+        Self {
+            state: Arc::clone(state),
+            alias: alias.to_string(),
+            owner,
+            heartbeat,
+        }
+    }
+}
+
+impl Drop for IndexingMarkerGuard {
+    fn drop(&mut self) {
+        if let Some(heartbeat) = self.heartbeat.take() {
+            heartbeat.abort();
+            self.state.end_indexing(&self.alias, self.owner);
+        }
+    }
+}
+
 /// Trigger a symbol index rebuild for a repo in one language (C#, TypeScript).
 ///
 /// Reuses the shared `SymbolIndexerRegistry` from `ServeState`, looks up the
@@ -4699,16 +4772,21 @@ async fn trigger_symbol_rebuild(
     // for the same alias simultaneously, each path ends only its own marker,
     // so neither can flip the TUI back to Warm/Open while the other still
     // runs. (Stale entries from a crashed task self-heal via `is_indexing`.)
-    // The return value is deliberately ignored: nested callers (the reindex
-    // and add-repo background tasks) legitimately hold the alias's Reindex
-    // marker while triggering this.
-    let _ = state.begin_indexing(alias, IndexingOwner::Symbol);
+    // Nested callers (the reindex and add-repo background tasks) legitimately
+    // hold the alias's Reindex marker while triggering this; the guard is then
+    // inert and that marker covers the run.
+    let marker = IndexingMarkerGuard::begin(
+        state,
+        alias,
+        IndexingOwner::Symbol,
+        Duration::from_secs(INDEXING_MARKER_HEARTBEAT_SECS),
+    );
     let rp = project_path.to_path_buf();
     let dp = db_path.to_path_buf();
     let alias_owned = alias.to_string();
     let lang_owned = lang.to_string();
     let registry = state.symbol_registry.clone();
-    match tokio::task::spawn_blocking(move || {
+    let rebuilt = tokio::task::spawn_blocking(move || {
         let Some(indexer) = registry.get(&lang_owned) else {
             return Err(anyhow::anyhow!(
                 "No symbol indexer registered for '{lang_owned}'"
@@ -4721,8 +4799,11 @@ async fn trigger_symbol_rebuild(
         }
         indexer.rebuild(&rp, &dp, RebuildScope::Full)
     })
-    .await
-    {
+    .await;
+    // Released before the outcome handling: format recovery enqueued below
+    // reindexes through `begin_indexing`, which a live Symbol marker rejects.
+    drop(marker);
+    match rebuilt {
         Ok(Ok(summary)) => {
             tracing::info!(
                 "✅ Symbol rebuild complete for '{}': {} symbols, {} refs in {}ms",
@@ -4731,7 +4812,6 @@ async fn trigger_symbol_rebuild(
                 summary.references_stored,
                 summary.duration_ms
             );
-            state.end_indexing(&alias_owned, IndexingOwner::Symbol);
             if is_csharp {
                 let (status, detail) = csharp_success_outcome(&summary.index_warnings);
                 state
@@ -4754,7 +4834,6 @@ async fn trigger_symbol_rebuild(
             // SCIP puts wrap their errors (table + key size), and plain `{}`
             // would hide the `MDB_*` code the classifier below matches on.
             let msg = format!("{e:#}");
-            state.end_indexing(&alias_owned, IndexingOwner::Symbol);
             if is_csharp {
                 state
                     .csharp_index_error
@@ -4824,7 +4903,6 @@ async fn trigger_symbol_rebuild(
                 alias_owned,
                 e
             );
-            state.end_indexing(&alias_owned, IndexingOwner::Symbol);
             if is_csharp {
                 state
                     .csharp_index_error
