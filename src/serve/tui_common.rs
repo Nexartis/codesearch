@@ -52,7 +52,8 @@ use crossterm::event::{KeyCode, KeyEvent};
 #[derive(Debug, Clone)]
 pub struct RepoRow {
     pub alias: String,
-    /// Human-readable status: "open", "warm", "readonly", "idle", "indexing", "error", "no_index"
+    /// Human-readable status: "open", "warm", "readonly", "idx" (wire "idle"/"closed":
+    /// index on disk, repo unloaded), "indexing", "error", "no_index"
     pub status: String,
     /// C# index status: "none", "ready", "indexing", "error" (empty also treated as none)
     pub csharp_index: String,
@@ -1523,7 +1524,7 @@ fn status_cell_spec(status: &str, csharp: &str) -> (String, Style) {
             }
         }
         "idle" | "closed" => (
-            "○ idle       ".to_string(),
+            "○ idx        ".to_string(),
             Style::default().fg(Color::Gray),
         ),
         "error" => (
@@ -1579,7 +1580,7 @@ fn detail_status_style(status: &str, csharp: &str) -> (String, Color) {
             _ => ("Warm".to_string(), Color::Yellow),
         },
         "readonly" => ("Readonly".to_string(), Color::Cyan),
-        "idle" | "closed" => ("Idle".to_string(), Color::Gray),
+        "idle" | "closed" => ("Idx".to_string(), Color::Gray),
         "indexing" => match csharp {
             "indexing" => (
                 "Index C#…".to_string(),
@@ -1636,9 +1637,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn status_cell_renders_idle_and_legacy_closed_as_gray() {
+    fn status_cell_renders_idle_and_legacy_closed_as_idx() {
         let expected = (
-            "○ idle       ".to_string(),
+            "○ idx        ".to_string(),
             Style::default().fg(Color::Gray),
         );
         assert_eq!(status_cell_spec("idle", "ready"), expected);
@@ -1646,14 +1647,14 @@ mod tests {
     }
 
     #[test]
-    fn detail_status_style_maps_idle_and_legacy_closed_to_idle_label() {
+    fn detail_status_style_maps_idle_and_legacy_closed_to_idx_label() {
         assert_eq!(
             detail_status_style("idle", ""),
-            ("Idle".to_string(), Color::Gray)
+            ("Idx".to_string(), Color::Gray)
         );
         assert_eq!(
             detail_status_style("closed", ""),
-            ("Idle".to_string(), Color::Gray)
+            ("Idx".to_string(), Color::Gray)
         );
     }
 
