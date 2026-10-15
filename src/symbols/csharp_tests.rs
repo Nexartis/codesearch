@@ -2,8 +2,9 @@
 //! per repo convention.
 
 use super::csharp::{
-    drain_pipe_to_tracing, is_helper_warning_line, is_restore_pending, restore_pending_flag_clear,
-    restore_pending_flag_set, RestorePendingError, HELPER_RESTORE_PENDING_EXIT,
+    drain_pipe_to_tracing, is_helper_warning_line, is_restore_pending, kill_live_helper_children,
+    restore_pending_flag_clear, restore_pending_flag_set, LiveHelperChild, RestorePendingError,
+    HELPER_RESTORE_PENDING_EXIT,
 };
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -553,5 +554,39 @@ fn helper_restore_pending_exit_matches_csharp_exit_codes() {
     assert_eq!(
         parsed, HELPER_RESTORE_PENDING_EXIT,
         "C# ExitCodes.RestorePending ({parsed}) and Rust HELPER_RESTORE_PENDING_EXIT ({HELPER_RESTORE_PENDING_EXIT}) must stay in sync"
+    );
+}
+
+/// serve shutdown must kill in-flight helper children: an orphaned
+/// scip-csharp holds the helper exe locked for minutes (deploy blocker).
+/// The registry is PID-generic, so a stand-in long-running child verifies
+/// the real kill path (taskkill /T /F on Windows, kill -9 elsewhere).
+#[test]
+fn shutdown_kills_registered_helper_children() {
+    #[cfg(windows)]
+    let mut child = std::process::Command::new("cmd")
+        .args(["/c", "ping", "-n", "30", "127.0.0.1"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("stand-in child spawned");
+    #[cfg(not(windows))]
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("stand-in child spawned");
+
+    let pid = child.id();
+    {
+        let _live = LiveHelperChild::register(&child);
+        kill_live_helper_children();
+    }
+
+    let status = child.wait().expect("child waited");
+    assert!(
+        !status.success(),
+        "a killed helper child must not report success (pid {pid})"
     );
 }

@@ -583,6 +583,61 @@ impl Default for CSharpSymbolIndexer {
     }
 }
 
+/// PIDs of live one-shot scip-csharp helper children (index, find-refs,
+/// batch-find-refs). serve shutdown kills whatever is still registered: a
+/// rebuild outliving its host holds the helper exe locked for minutes (the
+/// deploy blocker) and keeps computing for a dead client.
+static LIVE_HELPER_PIDS: std::sync::LazyLock<std::sync::Mutex<HashSet<u32>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+
+/// RAII registration of a spawned helper child in [`LIVE_HELPER_PIDS`];
+/// dropped after the child is waited, so only genuinely in-flight PIDs
+/// remain registered.
+pub(crate) struct LiveHelperChild(u32);
+
+impl LiveHelperChild {
+    pub(crate) fn register(child: &std::process::Child) -> Self {
+        let pid = child.id();
+        if let Ok(mut set) = LIVE_HELPER_PIDS.lock() {
+            set.insert(pid);
+        }
+        Self(pid)
+    }
+}
+
+impl Drop for LiveHelperChild {
+    fn drop(&mut self) {
+        if let Ok(mut set) = LIVE_HELPER_PIDS.lock() {
+            set.remove(&self.0);
+        }
+    }
+}
+
+/// Kill every still-registered helper child. Called on serve shutdown —
+/// statics are not dropped at process exit, so the RAII guard alone cannot
+/// cover the 'q'/Ctrl-C path. A PID whose process already exited fails the
+/// kill harmlessly.
+pub(crate) fn kill_live_helper_children() {
+    let pids: Vec<u32> = match LIVE_HELPER_PIDS.lock() {
+        Ok(mut set) => set.drain().collect(),
+        Err(_) => return,
+    };
+    for pid in &pids {
+        #[cfg(windows)]
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .output();
+        #[cfg(not(windows))]
+        let _ = Command::new("kill").arg("-9").arg(pid.to_string()).output();
+    }
+    if !pids.is_empty() {
+        tracing::info!(
+            "🛑 Killed {} in-flight scip-csharp helper child(ren) on shutdown",
+            pids.len()
+        );
+    }
+}
+
 impl CSharpSymbolIndexer {
     pub fn new() -> Self {
         Self {
@@ -882,6 +937,9 @@ impl CSharpSymbolIndexer {
         let mut child = cmd
             .spawn()
             .with_context(|| format!("Failed to execute scip-csharp at {}", helper.display()))?;
+        // Deregistered when the guard drops at the end of this fn (after
+        // wait), so shutdown only ever kills genuinely in-flight helpers.
+        let _live_helper = LiveHelperChild::register(&child);
 
         let captured_warnings: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -997,6 +1055,7 @@ impl CSharpSymbolIndexer {
                 helper.display()
             )
         })?;
+        let _live_helper = LiveHelperChild::register(&child);
 
         let stderr_handle = child.stderr.take().map(|stderr| {
             let label = solution_short.clone();
@@ -1541,6 +1600,7 @@ impl CSharpSymbolIndexer {
                 helper.display()
             )
         })?;
+        let _live_helper = LiveHelperChild::register(&child);
 
         let stderr_handle = child.stderr.take().map(|stderr| {
             let label = solution_short.clone();

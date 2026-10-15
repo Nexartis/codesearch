@@ -6985,6 +6985,13 @@ pub async fn run_serve(
         }
     }
 
+    // Kill in-flight helper children (one-shot rebuilds + resident
+    // workspaces): an orphaned scip-csharp holds the helper exe locked for
+    // minutes after 'q' — the deploy blocker — and keeps computing for a
+    // dead host.
+    csharp::kill_live_helper_children();
+    crate::symbols::resident::WORKSPACE_POOL.kill_all();
+
     // Wait for the TUI task to finish cleanup (restore terminal).
     // The TUI's Drop guard restores the terminal, so we need to give it
     // a moment before the process exits.
