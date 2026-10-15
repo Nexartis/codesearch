@@ -734,15 +734,26 @@ pub const SCIP_KEY_FORMAT_KEY: &str = "key_format";
 /// list out of a partially loaded solution may be missing callers.
 pub const SCIP_INDEX_WARNINGS_KEY: &str = "index_warnings";
 
-/// LMDB metadata key stamping which codesearch build produced the symbol
-/// index (full `CARGO_PKG_VERSION_FULL`, so every rebuilt binary differs).
-/// The C# rebuild gate treats an index whose stamp is absent or differs from
-/// [`INDEX_BUILDER_VERSION`] as stale: after a deploy, serve rebuilds the
-/// indexes itself at startup instead of waiting for a manual command.
+/// LMDB metadata key stamping which index-builder generation produced the
+/// index (chunk file-meta cache and SCIP symbol meta alike).
+/// The rebuild gates treat an index whose stamp is absent or differs from
+/// [`INDEX_BUILDER_VERSION`] as stale: after a conventions change, serve
+/// rebuilds the indexes itself at startup instead of waiting for a manual
+/// command.
 pub const SCIP_INDEX_BUILDER_VERSION_KEY: &str = "index_builder_version";
 
 /// The value written for [`SCIP_INDEX_BUILDER_VERSION_KEY`] by this binary.
-pub const INDEX_BUILDER_VERSION: &str = env!("CARGO_PKG_VERSION_FULL");
+///
+/// A HAND-BUMPED generation marker, deliberately NOT tied to the package
+/// version: the patch version bumps on every merged PR, and a per-build
+/// stamp wiped every repo's chunk cache and symbol indexes at each binary
+/// swap (field incident 14–15 Oct 2026: ten patch bumps in one day meant a
+/// full fleet re-embed per restart, and the long commit windows let the
+/// Windows AV/Search-Indexer lock race kill builds, leaving repos
+/// registered with 0 chunks). Bump this ONLY when the chunker or SCIP
+/// conventions change shape — not for code or dependency changes that do
+/// not alter what gets written.
+pub const INDEX_BUILDER_VERSION: &str = "2026-10.1";
 
 /// Current value written for [`SCIP_KEY_FORMAT_KEY`]. Bump whenever the
 /// canonical SCIP symbol key format produced by a language helper changes

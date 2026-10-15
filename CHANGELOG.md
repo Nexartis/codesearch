@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.5.29]
+
+### Fixed
+
+- **Index caches are no longer wiped on every binary swap.** The chunk file-meta cache and the SCIP symbol meta were stamped with the full package version (`CARGO_PKG_VERSION_FULL`), which the bump-bot moves on every merged PR — so every rebuilt binary treated every repo's indexes as foreign and re-embedded/re-built the whole fleet at each serve restart (field incident 14–15 Oct 2026: ten patch bumps in one day). The stamp is now a hand-bumped generation marker (`2026-10.1`) that changes ONLY when chunker or SCIP conventions actually change; one final full rebuild migrates existing caches. The transient Windows FTS-commit lock race (AV/Search-Indexer holding fresh Tantivy segment files) also gets a second, longer redrive (5s then 20s, was a single 5s pass) and now covers the warmup incremental refresh as well — the two paths whose builds died in the field, leaving repos registered with 0 chunks.
+
 ## [1.5.16]
 
 ### Fixed

@@ -429,6 +429,21 @@ fn builder_version_mismatch_invalidates_the_store() {
     assert!(needs_reindex);
 }
 
+/// The chunk-cache stamp must be a hand-bumped generation marker, never the
+/// package version: the bump-bot moves the patch version on every merged
+/// PR, and a per-build stamp wiped the whole fleet's chunk caches on every
+/// binary swap (field incident 14–15 Oct 2026 — full fleet re-embeds per
+/// restart, AV lock races killing builds, repos left at 0 chunks).
+#[test]
+fn builder_version_stamp_is_a_generation_marker_not_the_package_version() {
+    let stamp = crate::constants::INDEX_BUILDER_VERSION;
+    assert!(
+        !stamp.contains('+'),
+        "stamp must not carry build metadata: {stamp}"
+    );
+    assert_ne!(stamp, env!("CARGO_PKG_VERSION_FULL"));
+}
+
 /// A pre-stamp store (no builder_version field at all) is treated the same
 /// way: serde's default is an empty string, which never matches the current
 /// version.
