@@ -45,6 +45,12 @@ pub const CONFIG_DIR_NAME: &str = ".codesearch";
 /// Name of the file metadata database
 pub const FILE_META_DB_NAME: &str = "file_meta.json";
 
+/// Rename attempts when publishing the file metadata (AV/Search indexer can hold the file)
+pub const FILE_META_SAVE_RENAME_ATTEMPTS: u32 = 5;
+
+/// Delay between file metadata rename attempts, in milliseconds
+pub const FILE_META_SAVE_RENAME_DELAY_MS: u64 = 100;
+
 /// Subdirectory name for embedding models within the global config dir
 const MODELS_SUBDIR: &str = "models";
 

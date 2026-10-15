@@ -137,6 +137,36 @@ public sealed class ReferenceResolver
     }
 
     /// <summary>
+    /// Picks the workspace counterpart of <paramref name="target"/> among the
+    /// similar-symbol candidates: the exact signature match wins (the first
+    /// candidate may be another overload), a lone candidate is accepted, and
+    /// anything else returns <paramref name="target"/> with
+    /// <paramref name="fellBack"/> set.
+    /// </summary>
+    internal static ISymbol PickWorkspaceSymbol(ISymbol target, IEnumerable<ISymbol> similar, out bool fellBack)
+    {
+        var candidates = similar.ToList();
+        var signature = target.ToDisplayString(SymbolDisplayFormat.CSharpErrorMessageFormat);
+
+        var exact = candidates.FirstOrDefault(c =>
+            c.ToDisplayString(SymbolDisplayFormat.CSharpErrorMessageFormat) == signature);
+        if (exact is not null)
+        {
+            fellBack = false;
+            return exact;
+        }
+
+        if (candidates.Count == 1)
+        {
+            fellBack = false;
+            return candidates[0];
+        }
+
+        fellBack = true;
+        return target;
+    }
+
+    /// <summary>
     /// Resolves references for one symbol. Returns the occurrences plus a
     /// warning per survived failure — a caught FindReferencesAsync exception
     /// must degrade the answer's honesty, not just its size.
@@ -157,20 +187,36 @@ public sealed class ReferenceResolver
             // while the calls were visible to text search). Re-resolve the
             // symbol inside the containing project's workspace compilation
             // first; fall back to the foreign symbol when no counterpart
-            // exists.
+            // exists. Multi-target projects share an AssemblyName, so every
+            // matching project is tried until one yields a counterpart.
             var workspaceSymbol = targetSymbol;
+            var resolved = false;
             var assemblyName = targetSymbol.ContainingAssembly?.Name;
-            var project = solution.Projects.FirstOrDefault(p =>
-                string.Equals(p.AssemblyName, assemblyName, StringComparison.OrdinalIgnoreCase));
-            if (project is not null)
+            foreach (var project in solution.Projects)
             {
+                if (!string.Equals(project.AssemblyName, assemblyName, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
                 var compilation = await project.GetCompilationAsync().ConfigureAwait(false);
-                if (compilation is not null)
-                {
-                    var similar = SymbolFinder
-                        .FindSimilarSymbols(targetSymbol, compilation);
-                    workspaceSymbol = similar.FirstOrDefault() ?? targetSymbol;
-                }
+                if (compilation is null)
+                    continue;
+
+                var picked = PickWorkspaceSymbol(
+                    targetSymbol,
+                    SymbolFinder.FindSimilarSymbols(targetSymbol, compilation),
+                    out var fellBack);
+                if (fellBack)
+                    continue;
+
+                workspaceSymbol = picked;
+                resolved = true;
+                break;
+            }
+
+            if (!resolved)
+            {
+                Console.Error.WriteLine(
+                    $"[INFO] No workspace counterpart for {targetSymbol.Name}; resolving references with the detached symbol");
             }
 
             var refResults = await SymbolFinder

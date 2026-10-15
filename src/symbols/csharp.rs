@@ -607,8 +607,11 @@ impl CSharpSymbolIndexer {
         }
 
         let resolved = self.resolve_helper_path();
-        let mut lock = self.helper_path.lock().unwrap();
-        *lock = Some(resolved.clone()); // cache both Some and None
+        {
+            let mut lock = self.helper_path.lock().unwrap();
+            *lock = Some(resolved.clone()); // cache both Some and None
+        }
+        // After the guard is released: the version probe spawns a subprocess.
         if let Some(ref path) = resolved {
             self.log_helper_version_once(path);
         }
