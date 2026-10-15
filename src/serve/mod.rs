@@ -3050,14 +3050,25 @@ impl ServeState {
             let alias_hb = alias.to_string();
             Arc::new(move || state.renew_indexing(&alias_hb, IndexingOwner::Warmup))
         };
-        let refreshed = IndexManager::perform_incremental_refresh_with_stores(
-            &path,
-            &db_path,
-            &stores,
-            &CancellationToken::new(),
-            Some(&pool),
-            Some(&heartbeat),
-        )
+        // Same transient-FTS redrive as the add/reindex paths: the warmup
+        // commit is just as exposed to the AV/Search-Indexer lock race, and
+        // a warmup failure without a retry leaves the repo re-embedded but
+        // uncommitted (field incident: a warmup refresh, 15 Oct 2026).
+        const FTS_TRANSIENT_BACKOFFS: [std::time::Duration; 2] = [
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(20),
+        ];
+        let refreshed = IndexManager::retry_on_transient_fts(&FTS_TRANSIENT_BACKOFFS, || async {
+            IndexManager::perform_incremental_refresh_with_stores(
+                &path,
+                &db_path,
+                &stores,
+                &CancellationToken::new(),
+                Some(&pool),
+                Some(&heartbeat),
+            )
+            .await
+        })
         .await;
         self.end_indexing(alias, IndexingOwner::Warmup);
         if let Err(e) = refreshed {

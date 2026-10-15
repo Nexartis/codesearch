@@ -1287,11 +1287,12 @@ impl IndexManager {
     ///
     /// A failure of the transient Windows FTS commit race (an indexer holds
     /// a freshly created Tantivy segment file while the commit opens it —
-    /// os error 5/32/33) redrives the WHOLE pass once after a 5s backoff:
+    /// os error 5/32/33) redrives the WHOLE pass, backing off 5s then 20s:
     /// a full pass is idempotent (clear + rebuild), while a commit retry on
     /// the same writer is never safe (a half-joined pipeline must not be
-    /// recommitted — see `FtsStore::commit_once`). This is what killed the
-    /// field incidents: two worktree adds and one full reindex.
+    /// recommitted — see `FtsStore::commit_once`). Field incidents died on
+    /// a single 5s redrive while the AV still held the file; the second,
+    /// longer backoff covers that window.
     pub async fn force_reindex_with_stores(
         codebase_path: &Path,
         db_path: &Path,
@@ -1300,7 +1301,11 @@ impl IndexManager {
         cancel_token: &CancellationToken,
         embedding_pool: Option<&Arc<EmbeddingServicePool>>,
     ) -> Result<()> {
-        Self::retry_once_on_transient_fts(std::time::Duration::from_secs(5), || async {
+        const FTS_TRANSIENT_BACKOFFS: [std::time::Duration; 2] = [
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(20),
+        ];
+        Self::retry_on_transient_fts(&FTS_TRANSIENT_BACKOFFS, || async {
             Self::force_reindex_with_stores_once(
                 codebase_path,
                 db_path,
@@ -1314,29 +1319,34 @@ impl IndexManager {
         .await
     }
 
-    /// Redrive `attempt` once when its error is the transient Windows FTS
-    /// commit race. Any other error (and a second transient failure) is
-    /// returned untouched — bounded, never a loop.
-    pub(crate) async fn retry_once_on_transient_fts<T, Fut, F>(
-        backoff: std::time::Duration,
+    /// Redrive `attempt` on the transient Windows FTS commit race, one extra
+    /// pass per entry in `backoffs`. Any other error (and a transient failure
+    /// that outlives the last backoff) is returned untouched — bounded, never
+    /// a loop.
+    pub(crate) async fn retry_on_transient_fts<T, Fut, F>(
+        backoffs: &[std::time::Duration],
         mut attempt: F,
     ) -> Result<T>
     where
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
-        match attempt().await {
-            Ok(v) => Ok(v),
-            Err(e) if crate::fts::FtsStore::is_transient_fts_commit_error(&format!("{e:#}")) => {
-                warn!(
-                    "Transient FTS commit failure ({e:#}) — retrying the full pass once in {}s",
-                    backoff.as_secs().max(1)
-                );
-                tokio::time::sleep(backoff).await;
-                attempt().await
+        for backoff in backoffs {
+            match attempt().await {
+                Ok(v) => return Ok(v),
+                Err(e)
+                    if crate::fts::FtsStore::is_transient_fts_commit_error(&format!("{e:#}")) =>
+                {
+                    warn!(
+                        "Transient FTS commit failure ({e:#}) — redriving the full pass in {}s",
+                        backoff.as_secs().max(1)
+                    );
+                    tokio::time::sleep(*backoff).await;
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) => Err(e),
         }
+        attempt().await
     }
 
     async fn force_reindex_with_stores_once(
@@ -3453,18 +3463,22 @@ mod tests {
             .expect("the refresh must release its job permit");
     }
 
-    /// The transient-FTS retry redrives the WHOLE pass exactly once: a
-    /// transient-shaped error is retried (the field case — the first pass
-    /// fails on the AV holding a new segment file, the retry lands), a
-    /// non-transient error is returned without a second attempt, and a
-    /// second transient failure gives up — bounded, never a loop.
+    /// The transient-FTS retry redrives the WHOLE pass, one extra pass per
+    /// backoff entry: a transient-shaped error is retried (the field case —
+    /// the first pass fails on the AV holding a new segment file, the retry
+    /// lands), a non-transient error is returned without a second attempt,
+    /// and a transient failure that outlives the last backoff gives up —
+    /// bounded, never a loop.
     #[tokio::test]
-    async fn retry_once_on_transient_fts_redrives_once_and_only_once() {
-        let ms = std::time::Duration::from_millis(1);
+    async fn retry_on_transient_fts_redrives_per_backoff_then_gives_up() {
+        let ms = [
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(1),
+        ];
 
         // Transient once → retried, succeeds, exactly two attempts.
         let mut attempts = 0u32;
-        let out: Result<u32> = IndexManager::retry_once_on_transient_fts(ms, || {
+        let out: Result<u32> = IndexManager::retry_on_transient_fts(&ms, || {
             let done = attempts >= 1;
             attempts += 1;
             async move {
@@ -3483,7 +3497,7 @@ mod tests {
 
         // Non-transient → returned immediately, one attempt.
         let mut attempts = 0u32;
-        let out: Result<()> = IndexManager::retry_once_on_transient_fts(ms, || {
+        let out: Result<()> = IndexManager::retry_on_transient_fts(&ms, || {
             attempts += 1;
             async { Err(anyhow::anyhow!("schema mismatch")) }
         })
@@ -3491,15 +3505,33 @@ mod tests {
         assert!(out.is_err());
         assert_eq!(attempts, 1);
 
-        // Transient twice → gives up after the second attempt.
+        // Transient three times (initial + two backoffs) → gives up after
+        // the third attempt; a lock outliving both backoffs stays loud.
         let mut attempts = 0u32;
-        let out: Result<()> = IndexManager::retry_once_on_transient_fts(ms, || {
+        let out: Result<()> = IndexManager::retry_on_transient_fts(&ms, || {
             attempts += 1;
             async { Err(anyhow::anyhow!("os error 32")) }
         })
         .await;
         assert!(out.is_err());
-        assert_eq!(attempts, 2);
+        assert_eq!(attempts, 3);
+
+        // Transient twice then clean → the second backoff saves the pass.
+        let mut attempts = 0u32;
+        let out: Result<u32> = IndexManager::retry_on_transient_fts(&ms, || {
+            let done = attempts >= 2;
+            attempts += 1;
+            async move {
+                if done {
+                    Ok(7)
+                } else {
+                    Err(anyhow::anyhow!("os error 5"))
+                }
+            }
+        })
+        .await;
+        assert_eq!(out.unwrap(), 7);
+        assert_eq!(attempts, 3);
     }
 
     /// The db directory must carry FILE_ATTRIBUTE_HIDDEN after a read-write
