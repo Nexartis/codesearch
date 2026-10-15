@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.5.30]
+
+### Fixed
+
+- **File metadata is persisted once per index batch instead of once per pass.** The vector and FTS stores already commit per batch, but the file-meta cache was only written at the very end of a refresh pass — a serve restart (or a failed FTS commit) mid-pass left the meta empty while chunks existed, and the next open then wiped the whole store and re-embedded everything again. The meta now follows the stores' own commit granularity, and `save()` writes atomically (tmp + rename) so a crash mid-write can never truncate the file.
+
 ## [1.5.29]
 
 ### Fixed

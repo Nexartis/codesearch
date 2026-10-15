@@ -1211,6 +1211,12 @@ impl IndexManager {
                         file_meta_store.update_file(&file.path, &key, vec![])?;
                     }
                 }
+
+                // Persist per batch: vector and FTS already commit per batch,
+                // so the meta must follow or a crash/restart mid-pass leaves
+                // meta empty while chunks exist — the next open then wipes
+                // the whole store (the B1 guard) and re-embeds everything.
+                file_meta_store.save(db_path)?;
             }
 
             // Build the HNSW index once, after every batch has been inserted.
