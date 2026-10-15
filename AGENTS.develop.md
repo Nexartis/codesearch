@@ -236,11 +236,13 @@ Never `unwrap_or_default()` a store error on a search path — "no results" and 
 
 | Branch | Description |
 |---|---|
+| `fix/scip-restore-vs-msbuild-fallback` | scip-csharp: VS-MSBuild restore fallback + capability-aware MSBuild registration when the CLI SDK set cannot target the repo TFM |
 
 ---
 
 ## Changelog highlights (recent)
 
+- **v1.5.31 (pending)** — scip-csharp VS-MSBuild restore fallback: NETSDK1045-class CLI SDK gaps (hollow SDK dir, net10-only-in-VS) retry via vswhere + `MSBuild -t:restore`, and MSBuild registration picks a VS instance when no CLI SDK can target the repo
 - **v1.5.31 (pending)** — serve TUI status: `Indexing` only for real text indexing (pure SCIP rebuilds drive the C#/TS columns only); resting repos read `Idle` again
 - **v1.5.16 (pending)** — C# restore-pending retries 20×60s → 3 attempts with exponential backoff; restore exhaustion renders as yellow C#⚠ partial on every serve path instead of a red error
 - **v1.5.6 (pending)** — scip-csharp demotes MSBuild check advisories + BuildHost shutdown chatter from index warnings

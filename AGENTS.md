@@ -263,5 +263,5 @@ Older entries: see `CHANGELOG.md`.
 VS-MSBuild restore fallback in scip-csharp: when `dotnet restore` fails with SDK-resolution errors (NETSDK1045-class) because the CLI-visible SDK set cannot target the repo TFM, locate the newest VS MSBuild via vswhere and retry the solution restore once with `MSBuild -t:restore`. On success the full solution has assets; on failure/timeout existing per-project fallback (or pending-marker) applies. Motivated by HUSQ worktree incident 2026-10-15: VS-bundled net10 SDK invisible to CLI dotnet.
 
 1. [x] Stage 1: detection + fallback in helpers/csharp (MsbuildRestore.cs + wiring in Program.cs). Deliberate behavior change: SDK-instance pick is now the HIGHEST qualifying SDK (was first-enumerated, an undocumented order) — matches the original "register the highest available MSBuild" intent; single-SDK machines unaffected.
-2. [ ] Stage 2: unit tests (SDK-failure detection, vswhere output parsing)
-3. [ ] Stage 3: CHANGELOG + AGENTS.develop.md highlights + validation
+2. [x] Stage 2: unit tests (SDK-failure detection, vswhere output parsing)
+3. [x] Stage 3: CHANGELOG + AGENTS.develop.md highlights + validation
