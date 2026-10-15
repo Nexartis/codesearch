@@ -76,9 +76,25 @@ internal static class MsbuildRestore
             {
                 return null;
             }
-            var stdout = process.StandardOutput.ReadToEnd();
-            process.WaitForExit(VsWhereWaitMs);
-            var path = ParseFirstVswherePath(stdout);
+            // Drain async, THEN bounded-wait — and KILL on timeout: unlike a
+            // restore (never killed — its work must survive), vswhere is a
+            // local metadata probe whose death costs one failed probe. The
+            // kill also closes the pipes, so the stdout read cannot block.
+            var stdoutTask = process.StandardOutput.ReadToEndAsync();
+            _ = process.StandardError.ReadToEndAsync();
+            if (!process.WaitForExit(VsWhereWaitMs))
+            {
+                try
+                {
+                    process.Kill(entireProcessTree: true);
+                }
+                catch
+                {
+                    // Already exiting — nothing to bound anymore.
+                }
+                return null;
+            }
+            var path = ParseFirstVswherePath(stdoutTask.GetAwaiter().GetResult());
             return path is not null && File.Exists(path) ? path : null;
         }
         catch
