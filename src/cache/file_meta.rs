@@ -349,7 +349,13 @@ impl FileMetaStore {
     pub fn save(&self, db_path: &Path) -> Result<()> {
         let meta_path = db_path.join(Self::FILENAME);
         let content = serde_json::to_string_pretty(self)?;
-        fs::write(meta_path, content)?;
+        // Atomic replace (tmp + rename): the store is now saved once per
+        // index batch, so a crash mid-write must never leave a truncated
+        // file — a truncated store parses as broken on the next open and
+        // would trip the empty-meta wipe guard.
+        let tmp_path = db_path.join(format!("{}.tmp", Self::FILENAME));
+        fs::write(&tmp_path, content)?;
+        fs::rename(&tmp_path, &meta_path)?;
         Ok(())
     }
 
