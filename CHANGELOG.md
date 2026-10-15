@@ -20,6 +20,10 @@ finalized in place with a date — no renaming/migration step needed.
 
 - **File metadata is persisted once per index batch instead of once per pass.** The vector and FTS stores already commit per batch, but the file-meta cache was only written at the very end of a refresh pass — a serve restart (or a failed FTS commit) mid-pass left the meta empty while chunks existed, and the next open then wiped the whole store and re-embedded everything again. The meta now follows the stores' own commit granularity, and `save()` writes atomically (tmp + rename) so a crash mid-write can never truncate the file.
 
+### Changed
+
+- **find_impact position queries that resolve to no symbol now return an error with a hint.** Previously they returned an empty references list, which looked like "no callers".
+
 ## [1.5.29]
 
 ### Fixed

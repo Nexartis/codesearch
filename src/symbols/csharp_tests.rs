@@ -3,7 +3,7 @@
 
 use super::csharp::{
     drain_pipe_to_tracing, is_helper_warning_line, is_restore_pending, restore_pending_flag_clear,
-    restore_pending_flag_set, RestorePendingError,
+    restore_pending_flag_set, RestorePendingError, HELPER_RESTORE_PENDING_EXIT,
 };
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -524,4 +524,34 @@ fn restore_pending_flag_round_trips_through_the_trait_method() {
 
     restore_pending_flag_clear(&db_path);
     assert!(!indexer.restore_pending(&db_path));
+}
+
+#[test]
+fn helper_restore_pending_exit_matches_csharp_exit_codes() {
+    // A drifted exit code would demote restore-pending to a generic helper failure.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/helpers/csharp/RestoreGate.cs");
+    let source = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("cannot read {path} to check HELPER_RESTORE_PENDING_EXIT: {e}"));
+    let line = source
+        .lines()
+        .find(|l| l.contains("const int RestorePending"))
+        .unwrap_or_else(|| {
+            panic!("{path} has no `const int RestorePending` line to compare with HELPER_RESTORE_PENDING_EXIT")
+        });
+    let raw = line
+        .split_once('=')
+        .and_then(|(_, rhs)| rhs.split_once(';'))
+        .map(|(value, _)| value.trim())
+        .unwrap_or_else(|| {
+            panic!(
+                "cannot find `= <value>;` in {line:?} to compare with HELPER_RESTORE_PENDING_EXIT"
+            )
+        });
+    let parsed: i32 = raw.parse().unwrap_or_else(|e| {
+        panic!("C# RestorePending value {raw:?} is not an integer ({e}); compare with HELPER_RESTORE_PENDING_EXIT")
+    });
+    assert_eq!(
+        parsed, HELPER_RESTORE_PENDING_EXIT,
+        "C# ExitCodes.RestorePending ({parsed}) and Rust HELPER_RESTORE_PENDING_EXIT ({HELPER_RESTORE_PENDING_EXIT}) must stay in sync"
+    );
 }
