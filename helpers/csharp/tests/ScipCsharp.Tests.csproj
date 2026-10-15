@@ -47,6 +47,7 @@
     <Compile Include="..\ReferenceResolver.cs" Link="ReferenceResolver.cs" />
     <Compile Include="..\RestorePolicy.cs" Link="RestorePolicy.cs" />
     <Compile Include="..\RestoreGate.cs" Link="RestoreGate.cs" />
+    <Compile Include="..\MsbuildRestore.cs" Link="MsbuildRestore.cs" />
   </ItemGroup>
 
   <!-- Exclude fixture source files from compilation -->
