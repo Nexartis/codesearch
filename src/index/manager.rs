@@ -1536,6 +1536,9 @@ impl IndexManager {
     /// indicator (`Started`/`Succeeded`/`Failed`). Non-applicable languages
     /// (no `.sln` / no `tsconfig.json`) or an unavailable helper are skipped
     /// without touching any status — mirroring the debounce path.
+    ///
+    /// Serializes with the other two C# rebuild tasks via the shared `rebuild_guard`.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_branch_change_symbol_rebuild(
         symbol_registry: Arc<SymbolIndexerRegistry>,
         repo_path: PathBuf,
@@ -1544,8 +1547,12 @@ impl IndexManager {
         csharp_notifier: Option<CSharpRebuildNotifier>,
         indexing_cb: Option<IndexingStatusCallback>,
         cancel_token: CancellationToken,
-    ) {
+        rebuild_guard: Arc<std::sync::Mutex<()>>,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::task::spawn_blocking(move || {
+            // Two rebuilds on one LMDB db must not overlap.
+            let _rebuild_guard = rebuild_guard.lock().unwrap_or_else(|p| p.into_inner());
+
             // Resolve applicable + available indexers up front so we only toggle
             // the "Indexing" label when there is real work to do.
             let csharp = symbol_registry
@@ -1614,7 +1621,7 @@ impl IndexManager {
             if let Some(ref cb) = indexing_cb {
                 cb(false);
             }
-        });
+        })
     }
 
     /// Run a `RebuildScope::Full` rebuild for one language's indexer, log the
@@ -1772,7 +1779,7 @@ impl IndexManager {
             // a FULL rebuild, not the per-project incremental (issue #225).
             let mut restore_inputs_changed = false;
             let mut restore_input_last_event_time: Option<std::time::Instant> = None;
-            // Serializes the detached C# rebuild tasks (incremental + restore-input full).
+            // Serializes the detached symbol rebuild tasks (incremental, restore-input full, branch-change full).
             let symbol_rebuild_guard = Arc::new(std::sync::Mutex::new(()));
 
             // Symbol indexer debounce: .ts/.tsx/.mts/.cts files are buffered separately
@@ -1841,7 +1848,7 @@ impl IndexManager {
                             // Trigger a fire-and-forget FULL symbol rebuild for every
                             // language that applies, so `find_impact` reflects the new
                             // branch instead of silently serving stale references.
-                            Self::spawn_branch_change_symbol_rebuild(
+                            drop(Self::spawn_branch_change_symbol_rebuild(
                                 symbol_registry.clone(),
                                 path.clone(),
                                 db_path.clone(),
@@ -1849,7 +1856,8 @@ impl IndexManager {
                                 csharp_notifier.clone(),
                                 indexing_cb.clone(),
                                 cancel_token.clone(),
-                            );
+                                symbol_rebuild_guard.clone(),
+                            ));
                         }
                     }
                 }
@@ -4353,6 +4361,43 @@ mod tests {
         assert!(
             vs.get_chunk(duplicate_id).unwrap().is_none(),
             "the untracked duplicate chunk must be swept"
+        );
+    }
+
+    /// The branch-change full rebuild must queue behind the shared guard so it
+    /// cannot overlap the incremental or restore-input rebuilds on one LMDB db.
+    #[tokio::test]
+    async fn branch_change_symbol_rebuild_waits_for_shared_guard() {
+        let temp = tempdir().unwrap();
+        let guard = Arc::new(std::sync::Mutex::new(()));
+        let held = guard.lock().unwrap();
+
+        let handle = IndexManager::spawn_branch_change_symbol_rebuild(
+            Arc::new(SymbolIndexerRegistry::new()),
+            temp.path().to_path_buf(),
+            temp.path().join("db"),
+            "test".to_string(),
+            None,
+            None,
+            CancellationToken::new(),
+            guard.clone(),
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !handle.is_finished(),
+            "rebuild must block while the shared guard is held"
+        );
+
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+            .await
+            .expect("rebuild must finish once the guard is released")
+            .expect("rebuild task must not panic");
+
+        assert!(
+            guard.try_lock().is_ok(),
+            "guard must be released after the rebuild"
         );
     }
 }
