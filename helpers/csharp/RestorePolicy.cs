@@ -17,11 +17,12 @@ internal static class RestorePolicy
     private const int DefaultRestoreTimeoutSeconds = 300;
 
     /// <summary>
-    /// True when at least one project lacks <c>obj/project.assets.json</c> or
-    /// has one older than its .csproj (a package reference or target framework
-    /// was edited since the last restore). False means every project has fresh
-    /// assets and restore can be skipped entirely — the steady state of an
-    /// actively developed repo.
+    /// True when at least one project lacks <c>obj/project.assets.json</c>, has
+    /// one older than its .csproj (a package reference or target framework was
+    /// edited since the last restore), or has one older than an applicable
+    /// shared restore input (see <see cref="AnySharedInputNewerThan"/>). False
+    /// means every project has fresh assets and restore can be skipped entirely
+    /// — the steady state of an actively developed repo.
     /// </summary>
     public static bool NeedsRestore(IEnumerable<string> projectRelativePaths, string solutionDir)
     {
@@ -34,13 +35,77 @@ internal static class RestorePolicy
             {
                 return true;
             }
-            if (File.GetLastWriteTimeUtc(projectPath) > File.GetLastWriteTimeUtc(assetsPath))
+            var assetsWritten = File.GetLastWriteTimeUtc(assetsPath);
+            if (File.GetLastWriteTimeUtc(projectPath) > assetsWritten)
+            {
+                return true;
+            }
+            if (AnySharedInputNewerThan(projectDir, assetsWritten))
             {
                 return true;
             }
         }
         return false;
     }
+
+    /// <summary>
+    /// True when a shared restore input that applies to
+    /// <paramref name="projectDir"/> was modified after the assets were written.
+    /// MSBuild/NuGet discover these by walking up from the project directory,
+    /// and editing one changes the resolved dependency graph without touching
+    /// the .csproj — under central package management or imported build config
+    /// a .csproj-only comparison would treat the assets as fresh, skip restore,
+    /// and load a stale asset graph. Absent files never trigger a restore.
+    /// </summary>
+    private static bool AnySharedInputNewerThan(string projectDir, DateTime assetsWritten)
+    {
+        // Per-project lock file sits beside the .csproj.
+        if (IsNewerThan(Path.Combine(projectDir, PackagesLockName), assetsWritten))
+        {
+            return true;
+        }
+
+        // Directory.Build.props / Directory.Packages.props: MSBuild and NuGet
+        // import the NEAREST one found walking up, so once a name is matched a
+        // higher directory can no longer supply it.
+        var nearestPending = new HashSet<string>(NearestInputNames, StringComparer.OrdinalIgnoreCase);
+
+        for (var dir = new DirectoryInfo(projectDir); dir is not null; dir = dir.Parent)
+        {
+            // NuGet.config files are merged from every ancestor directory.
+            if (IsNewerThan(Path.Combine(dir.FullName, NuGetConfigName), assetsWritten))
+            {
+                return true;
+            }
+
+            foreach (var name in NearestInputNames)
+            {
+                if (!nearestPending.Contains(name) || !File.Exists(Path.Combine(dir.FullName, name)))
+                {
+                    continue;
+                }
+                nearestPending.Remove(name);
+                if (IsNewerThan(Path.Combine(dir.FullName, name), assetsWritten))
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static bool IsNewerThan(string path, DateTime reference) =>
+        File.Exists(path) && File.GetLastWriteTimeUtc(path) > reference;
+
+    private const string NuGetConfigName = "NuGet.config";
+    private const string PackagesLockName = "packages.lock.json";
+
+    private static readonly string[] NearestInputNames =
+    {
+        "Directory.Packages.props",
+        "Directory.Build.props",
+    };
 
     /// <summary>
     /// Restore wait timeout in seconds: <c>CODESEARCH_RESTORE_TIMEOUT_SECS</c>

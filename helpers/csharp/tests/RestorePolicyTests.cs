@@ -72,6 +72,26 @@ public class RestorePolicyTests : IDisposable
         Assert.True(RestorePolicy.NeedsRestore(new[] { @"src\Acme.Core\Acme.Core.csproj" }, _solutionDir));
     }
 
+    /// <summary>
+    /// Central package management / imported build config can change the
+    /// resolved dependency graph without touching any .csproj, so a shared
+    /// input newer than the assets must force a restore even when every .csproj
+    /// is older than its obj/project.assets.json.
+    /// </summary>
+    [Fact]
+    public void StaleSharedRestoreInputTriggersRestore()
+    {
+        var projectPath = AddProject(@"src\Acme.Core\Acme.Core.csproj", withAssets: true);
+        var assetsPath = Path.Combine(Path.GetDirectoryName(projectPath)!, "obj", "project.assets.json");
+
+        // A Directory.Packages.props at the solution root, newer than the assets.
+        var packagesProps = Path.Combine(_solutionDir, "Directory.Packages.props");
+        File.WriteAllText(packagesProps, "<Project />");
+        File.SetLastWriteTimeUtc(packagesProps, File.GetLastWriteTimeUtc(assetsPath).AddMinutes(5));
+
+        Assert.True(RestorePolicy.NeedsRestore(new[] { @"src\Acme.Core\Acme.Core.csproj" }, _solutionDir));
+    }
+
     [Fact]
     public void EmptyProjectListSkipsRestore()
     {

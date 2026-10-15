@@ -499,13 +499,15 @@ impl CodesearchService {
         let mode = request.mode.as_deref().unwrap_or("auto");
         let structural_intent = detect_structural_intent(&request.query);
 
-        // Which repo (alias) owns each surviving chunk id, recorded at
-        // fan-out and chunk-resolution time. The flat fan-out merge drops the
-        // store of origin, so without this map a group=all response cannot
-        // attribute a hit to its repo — `project=` results are prefixed
-        // "alias/path", group results must be too.
-        let mut alias_by_chunk: std::collections::HashMap<u32, String> =
-            std::collections::HashMap::new();
+        // Repo ownership is carried WITH each result, not reconstructed from a
+        // chunk-id-only map. Every fan-out hit and every chunk resolved from a
+        // store has its alias baked into its path the moment the owning store
+        // (alias) is known. Chunk ids are allocated per store and collide
+        // across repos, so keying ownership by `u32` alone silently mislabels
+        // (or drops) the result of one repo when two share a local id — the
+        // reason a `group=` response could point at the wrong repo. Attributing
+        // at creation keeps group results ("alias/path") consistent with the
+        // `project=` routing without ever trusting a non-unique id.
 
         // === Lexical mode: FTS only across all stores ===
         if mode == "lexical" {
@@ -559,11 +561,10 @@ impl CodesearchService {
                     limit,
                     &stores,
                     aliases,
+                    alias_roots,
                     &mut lexical_warnings,
-                    &mut alias_by_chunk,
                 )
                 .await;
-            prefix_paths_with_alias(&mut results, &alias_by_chunk, alias_roots);
 
             if let Some(target_kind) = structural_intent {
                 boost_kind(&mut results, target_kind);
@@ -651,11 +652,17 @@ impl CodesearchService {
                             "internal error: no query embedding resolved for repo '{alias}'"
                         )
                     })?;
-                    let found = store
+                    let mut found = store
                         .search(embedding, limit * 5)
                         .context("Error searching vector store")?;
-                    for r in &found {
-                        alias_by_chunk.insert(r.id, alias.to_string());
+                    // Attribute each hit to its own repo here, while the owning
+                    // store (alias) is known: chunk ids are only unique within a
+                    // store, so deferring to a chunk-id-keyed map would collapse
+                    // hits from different repos that share a local id.
+                    if let Some(root) = alias_roots.get(alias) {
+                        for r in &mut found {
+                            r.path = prefix_path_with_alias(&r.path, Some(alias), root);
+                        }
                     }
                     Ok(found)
                 },
@@ -726,7 +733,6 @@ impl CodesearchService {
                     results.push(r);
                 }
             }
-            prefix_paths_with_alias(&mut results, &alias_by_chunk, alias_roots);
             return self.build_semantic_response(
                 results,
                 request,
@@ -819,8 +825,8 @@ impl CodesearchService {
                         f.rrf_score,
                         &stores,
                         aliases,
+                        alias_roots,
                         &mut search_warnings,
-                        &mut alias_by_chunk,
                     )
                     .await
                 {
@@ -833,8 +839,6 @@ impl CodesearchService {
         if let Some(target_kind) = structural_intent {
             boost_kind(&mut mapped, target_kind);
         }
-
-        prefix_paths_with_alias(&mut mapped, &alias_by_chunk, alias_roots);
 
         self.build_semantic_response(
             mapped,
@@ -855,8 +859,8 @@ impl CodesearchService {
         score: f32,
         stores: &[Arc<SharedStores>],
         aliases: &[String],
+        alias_roots: &std::collections::HashMap<String, String>,
         warnings: &mut Vec<String>,
-        alias_by_chunk: &mut std::collections::HashMap<u32, String>,
     ) -> Option<crate::vectordb::SearchResult> {
         for (idx, store_arc) in stores.iter().enumerate() {
             let store = match bounded_vector_read(&store_arc.vector_store).await {
@@ -871,16 +875,21 @@ impl CodesearchService {
                 note_store_failure(warnings, aliases, idx, "chunk lookup", e);
             }
             if let Ok(Some(chunk)) = looked_up {
-                // Record the owning alias with the content actually chosen:
-                // path attribution below must match this very chunk, and the
-                // probe order here is what decided it.
-                if let Some(alias) = aliases.get(idx) {
-                    alias_by_chunk.insert(chunk_id, alias.clone());
-                }
+                // Attribute the path to the store this content was actually
+                // read from — the probe order here is what decided the owner.
+                let path = match (
+                    aliases.get(idx),
+                    aliases.get(idx).and_then(|a| alias_roots.get(a)),
+                ) {
+                    (Some(alias), Some(root)) => {
+                        prefix_path_with_alias(&chunk.path, Some(alias.as_str()), root)
+                    }
+                    _ => chunk.path,
+                };
                 return Some(crate::vectordb::SearchResult {
                     id: chunk_id,
                     content: chunk.content,
-                    path: chunk.path,
+                    path,
                     start_line: chunk.start_line,
                     end_line: chunk.end_line,
                     kind: chunk.kind,
@@ -906,8 +915,8 @@ impl CodesearchService {
         limit: usize,
         stores: &[Arc<SharedStores>],
         aliases: &[String],
+        alias_roots: &std::collections::HashMap<String, String>,
         warnings: &mut Vec<String>,
-        alias_by_chunk: &mut std::collections::HashMap<u32, String>,
     ) -> Vec<crate::vectordb::SearchResult> {
         let mut results = Vec::new();
         for fts in fts_results.iter().take(limit) {
@@ -929,15 +938,21 @@ impl CodesearchService {
                     note_store_failure(warnings, aliases, idx, "chunk lookup", e);
                 }
                 if let Ok(Some(chunk)) = looked_up {
-                    // Same as resolve_chunk_from_stores: attribute the alias of
+                    // Same as resolve_chunk_from_stores: attribute the path to
                     // the store this content was actually read from.
-                    if let Some(alias) = aliases.get(idx) {
-                        alias_by_chunk.insert(fts.chunk_id, alias.clone());
-                    }
+                    let path = match (
+                        aliases.get(idx),
+                        aliases.get(idx).and_then(|a| alias_roots.get(a)),
+                    ) {
+                        (Some(alias), Some(root)) => {
+                            prefix_path_with_alias(&chunk.path, Some(alias.as_str()), root)
+                        }
+                        _ => chunk.path,
+                    };
                     results.push(crate::vectordb::SearchResult {
                         id: fts.chunk_id,
                         content: chunk.content,
-                        path: chunk.path,
+                        path,
                         start_line: chunk.start_line,
                         end_line: chunk.end_line,
                         kind: chunk.kind,
@@ -1206,27 +1221,6 @@ impl CodesearchService {
                 }
                 Vec::new()
             }
-        }
-    }
-}
-
-/// Prefix group-fan-out result paths with the repo alias each chunk was
-/// recorded from, mirroring the `project=` routing ("alias/repo-relative").
-///
-/// Results whose alias was not recorded (every survivor is recorded at
-/// fan-out or resolution time, so this indicates an internal slip) keep their
-/// raw path — `build_semantic_response` still normalizes it.
-fn prefix_paths_with_alias(
-    results: &mut [crate::vectordb::SearchResult],
-    alias_by_chunk: &std::collections::HashMap<u32, String>,
-    alias_roots: &std::collections::HashMap<String, String>,
-) {
-    for r in results.iter_mut() {
-        let Some(alias) = alias_by_chunk.get(&r.id) else {
-            continue;
-        };
-        if let Some(root) = alias_roots.get(alias) {
-            r.path = prefix_path_with_alias(&r.path, Some(alias), root);
         }
     }
 }
