@@ -89,9 +89,10 @@ internal static class WorkspaceNoise
     /// <summary>
     /// True when a restore or load diagnostic is a NuGet source that cannot
     /// be reached or authenticated ("Unable to load the service index for
-    /// source ...", "Unable to find package X ... in source(s)"). A host
-    /// environment problem, not a code defect; the restore fallback already
-    /// reports the affected projects. Pure and null-tolerant.
+    /// source ..."). A host environment problem, not a code defect; the
+    /// restore fallback already reports the affected projects. "Unable to
+    /// find package" is deliberately not matched: it means a package is
+    /// really missing and the project loads degraded. Pure and null-tolerant.
     /// </summary>
     public static bool IsNuGetSourceFailure(string? message)
     {
@@ -100,7 +101,6 @@ internal static class WorkspaceNoise
             return false;
         }
         return message.Contains("Unable to load the service index for source", StringComparison.OrdinalIgnoreCase)
-            || message.Contains("Unable to find package", StringComparison.OrdinalIgnoreCase)
             || message.Contains("Error occurred while getting package vulnerability data", StringComparison.OrdinalIgnoreCase);
     }
 

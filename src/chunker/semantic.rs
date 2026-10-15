@@ -1231,6 +1231,72 @@ main "$@"
     }
 
     #[test]
+    fn test_chunk_php_fallback() {
+        // PHP has a tree-sitter grammar but no extractor, so it falls back
+        // to fallback_chunk (sliding window) like Shell does.
+        let mut chunker = SemanticChunker::new(100, 2000, 10);
+
+        let php_source = r#"<?php
+
+namespace App\Services;
+
+class OrderService
+{
+    public function createOrder(array $items): int
+    {
+        return count($items);
+    }
+
+    public function cancelOrder(int $orderId): bool
+    {
+        return $orderId > 0;
+    }
+}
+
+function formatPrice(float $amount): string
+{
+    return number_format($amount, 2);
+}
+"#;
+
+        let path = Path::new("Service.php");
+
+        // Verify language detection
+        assert_eq!(
+            crate::file::Language::from_path(path),
+            crate::file::Language::Php,
+            ".php files should be detected as PHP language"
+        );
+
+        let chunks = chunker
+            .chunk_semantic(crate::file::Language::Php, path, php_source)
+            .unwrap();
+
+        // Should produce chunks (via fallback)
+        assert!(
+            !chunks.is_empty(),
+            "PHP files should produce chunks via fallback, got 0"
+        );
+
+        // All chunks should be Block kind (fallback chunking)
+        assert!(
+            chunks.iter().all(|c| c.kind == ChunkKind::Block),
+            "Fallback chunks should all be Block kind"
+        );
+
+        // Chunks should cover the PHP content
+        let all_content: String = chunks.iter().map(|c| c.content.as_str()).collect();
+        assert!(
+            all_content.contains("createOrder"),
+            "Chunks should contain createOrder method"
+        );
+        assert!(
+            all_content.contains("cancelOrder"),
+            "Chunks should contain cancelOrder method"
+        );
+    }
+
+    #[test]
     fn test_context_breadcrumbs() {
         let mut chunker = SemanticChunker::new(100, 2000, 10);
 

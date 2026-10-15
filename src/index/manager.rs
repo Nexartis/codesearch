@@ -1772,6 +1772,8 @@ impl IndexManager {
             // a FULL rebuild, not the per-project incremental (issue #225).
             let mut restore_inputs_changed = false;
             let mut restore_input_last_event_time: Option<std::time::Instant> = None;
+            // Serializes the detached C# rebuild tasks (incremental + restore-input full).
+            let symbol_rebuild_guard = Arc::new(std::sync::Mutex::new(()));
 
             // Symbol indexer debounce: .ts/.tsx/.mts/.cts files are buffered separately
             // and flushed after SCIP_TYPESCRIPT_DEBOUNCE_MS of quiet time. Unlike C#'s
@@ -2063,7 +2065,11 @@ impl IndexManager {
                             // separate from the text-index callback used for
                             // branch-change refreshes above.
                             let indexing_cb_scip = indexing_cb.clone();
+                            let guard = symbol_rebuild_guard.clone();
                             tokio::task::spawn_blocking(move || {
+                                // Two rebuilds on one LMDB db must not overlap.
+                                let _rebuild_guard =
+                                    guard.lock().unwrap_or_else(|p| p.into_inner());
                                 if let Some(indexer) = reg.get(LANG_CSHARP) {
                                     if !indexer.applies_to(&rp) {
                                         info!(
@@ -2275,7 +2281,11 @@ impl IndexManager {
                             let repo_label = repo_label.clone();
                             let notifier = csharp_notifier.clone();
                             let indexing_cb_scip = indexing_cb.clone();
+                            let guard = symbol_rebuild_guard.clone();
                             tokio::task::spawn_blocking(move || {
+                                // Two rebuilds on one LMDB db must not overlap.
+                                let _rebuild_guard =
+                                    guard.lock().unwrap_or_else(|p| p.into_inner());
                                 if let Some(indexer) = reg.get(LANG_CSHARP) {
                                     if !indexer.applies_to(&rp) {
                                         info!(
@@ -3516,7 +3526,7 @@ mod tests {
         let mut attempts = 0u32;
         let out: Result<()> = IndexManager::retry_on_transient_fts(&ms, || {
             attempts += 1;
-            async { Err(anyhow::anyhow!("os error 32")) }
+            async { Err(anyhow::anyhow!("FTS commit failed: os error 32")) }
         })
         .await;
         assert!(out.is_err());
@@ -3531,7 +3541,7 @@ mod tests {
                 if done {
                     Ok(7)
                 } else {
-                    Err(anyhow::anyhow!("os error 5"))
+                    Err(anyhow::anyhow!("FTS commit failed: os error 5"))
                 }
             }
         })

@@ -6,7 +6,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use crate::constants::FILE_META_DB_NAME;
+use crate::constants::{
+    FILE_META_DB_NAME, FILE_META_SAVE_RENAME_ATTEMPTS, FILE_META_SAVE_RENAME_DELAY_MS,
+};
 
 // ─── CANONICAL PATH POLICY ────────────────────────────────────────────────────
 //
@@ -355,8 +357,23 @@ impl FileMetaStore {
         // would trip the empty-meta wipe guard.
         let tmp_path = db_path.join(format!("{}.tmp", Self::FILENAME));
         fs::write(&tmp_path, content)?;
-        fs::rename(&tmp_path, &meta_path)?;
-        Ok(())
+        // Windows: an indexer can briefly hold the target (os error 5/32).
+        let mut attempt = 1;
+        loop {
+            match fs::rename(&tmp_path, &meta_path) {
+                Ok(()) => return Ok(()),
+                Err(e) if attempt >= FILE_META_SAVE_RENAME_ATTEMPTS => {
+                    let _ = fs::remove_file(&tmp_path);
+                    return Err(e.into());
+                }
+                Err(_) => {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        FILE_META_SAVE_RENAME_DELAY_MS,
+                    ));
+                }
+            }
+        }
     }
 
     /// Migrate stored paths to normalized format.
