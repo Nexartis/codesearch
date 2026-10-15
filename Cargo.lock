@@ -713,7 +713,7 @@ dependencies = [
 
 [[package]]
 name = "codesearch"
-version = "1.5.28"
+version = "1.5.29"
 dependencies = [
  "anyhow",
  "arroy",
