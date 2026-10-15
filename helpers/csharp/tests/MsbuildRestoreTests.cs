@@ -209,6 +209,22 @@ public class MsbuildRestoreTests : IDisposable
         Assert.Null(MsbuildRestore.RequiredSdkMajorFloor(Path.Combine(_root, "absent.sln")));
     }
 
+    [Fact]
+    public void NetFrameworkSpellingsDoNotRaiseTheFloor()
+    {
+        // net48/net472 (extension-less) must not become a "48" floor: an
+        // SDK loads them from reference assemblies, and a 48 floor would
+        // flip healthy SDK+VS machines to the VS instance for no reason.
+        // The pre-fix regex (^net(\d+)(?:\.|$)) matched net48 as major 48.
+        var net48Only = WriteSolution(("src\\Legacy\\Legacy.csproj", "net48"));
+
+        Assert.Null(MsbuildRestore.RequiredSdkMajorFloor(net48Only));
+
+        var mixed = WriteSolution(("src\\Mixed\\Mixed.csproj", "net48;net10.0"));
+
+        Assert.Equal(10, MsbuildRestore.RequiredSdkMajorFloor(mixed));
+    }
+
     private static void WriteGlobalJson(string path, string version)
     {
         var content = version.StartsWith('{')

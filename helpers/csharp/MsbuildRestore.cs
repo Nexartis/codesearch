@@ -246,7 +246,11 @@ internal static class MsbuildRestore
     /// so a <c>net8.0;net10.0</c> multi-target floors at 10 (unlike the EOL
     /// skip-guard, whose first-TFM stance serves a different purpose).
     /// netstandard/netcoreapp deliberately do not match — they load under
-    /// any modern SDK, and EOL ones are skipped anyway.
+    /// any modern SDK, and EOL ones are skipped anyway. The minor dot is
+    /// REQUIRED: the extension-less .NET Framework spellings (net48,
+    /// net472) must not raise the floor — an SDK loads those from reference
+    /// assemblies, and a "48" floor would flip healthy SDK+VS machines to
+    /// the VS instance for no reason.
     /// </summary>
     private static int? TargetFrameworkMajor(string? projectText)
     {
@@ -263,7 +267,7 @@ internal static class MsbuildRestore
         int? floor = null;
         foreach (var raw in match.Groups[1].Value.Split(';'))
         {
-            var version = System.Text.RegularExpressions.Regex.Match(raw.Trim(), @"^net(\d+)(?:\.|$)");
+            var version = System.Text.RegularExpressions.Regex.Match(raw.Trim(), @"^net(\d+)\.");
             if (version.Success && int.TryParse(version.Groups[1].Value, out var major)
                 && (floor is null || major > floor))
             {
