@@ -950,7 +950,12 @@ async fn add_repo_handler_registers_brand_new_repo_without_rollback() {
 /// serve-wide default's dimension (`codesearch serve --model X`), not the
 /// built-in 384-dim default. This is the write-side counterpart of the per-repo
 /// query-model contract.
+///
+/// `#[serial]`: the handler reads `CODESEARCH_ALLOWED_ROOTS`, so this test
+/// must exclude the mutating `allowed_roots_tests` group — the 403 flake
+/// named in that module's comment is a serial-vs-non-serial race.
 #[tokio::test]
+#[serial]
 async fn add_repo_handler_uses_serve_default_model_for_new_index() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_path = tmp.path().join("defaulted");
@@ -997,8 +1002,10 @@ async fn add_repo_handler_uses_serve_default_model_for_new_index() {
 
 /// The serve-wide default must NOT override an index that already records its
 /// own model: re-adding a repo whose `.codesearch.db` is still on disk keeps the
-/// recorded model and dimension.
+/// recorded model and dimension. `#[serial]` for the same allowed-roots read
+/// as its sibling above.
 #[tokio::test]
+#[serial]
 async fn add_repo_handler_keeps_recorded_model_over_serve_default() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_path = tmp.path().join("existing");
@@ -3849,11 +3856,13 @@ fn repo_statuses_lightweight_carries_partial_with_detail() {
     );
 }
 
-/// A running index must show as `Indexing` only for the languages that apply
-/// to the repo: a Rust-only repo keeps `None` in both symbol columns.
+/// Owner-scoped status: a TEXT reindex lights the general `Indexing` label
+/// and never the symbol columns; a SYMBOL marker lights the applicable
+/// language column only and leaves the general label on the repo's resting
+/// state. A Rust-only repo keeps `None` in both symbol columns either way.
 #[test]
 #[serial]
-fn indexing_marks_only_applicable_languages_in_status() {
+fn indexing_labels_are_owner_scoped_in_status() {
     let (_tmp, repo_path, bare) = state_with_repo("langrepo");
     let state = std::sync::Arc::new(bare);
     assert!(state.begin_indexing("langrepo", IndexingOwner::Reindex));
@@ -3872,17 +3881,83 @@ fn indexing_marks_only_applicable_languages_in_status() {
     assert_eq!(info.csharp_index, CSharpIndexStatus::None);
     assert_eq!(info.typescript_index, CSharpIndexStatus::None);
 
+    // A .sln alone does not make a text reindex a C# rebuild: the C# column
+    // lights only when a symbol marker is present.
     std::fs::write(repo_path.join("App.sln"), "").unwrap();
-    assert_eq!(row(&state).csharp_index, CSharpIndexStatus::Indexing);
+    assert_eq!(row(&state).csharp_index, CSharpIndexStatus::None);
 
     state.end_indexing("langrepo", IndexingOwner::Reindex);
+    // An on-disk db makes the resting state Idle (not NoIndex).
+    std::fs::create_dir_all(repo_path.join(DB_DIR_NAME)).unwrap();
+    assert!(state.begin_indexing("langrepo", IndexingOwner::Symbol));
+    let info = row(&state);
+    assert_eq!(info.csharp_index, CSharpIndexStatus::Indexing);
+    assert_eq!(
+        info.status,
+        RepoStateLabel::Idle,
+        "a pure SCIP rebuild must not light the general Indexing label"
+    );
+
+    state.end_indexing("langrepo", IndexingOwner::Symbol);
+}
+
+/// TS twin of the owner-scoping test above: with a resolvable helper env
+/// override, a SYMBOL marker lights the TS column while the general label
+/// rests; a TEXT reindex never lights the TS column, tsconfig or not.
+/// `#[serial]` + `EnvRestore`: the helper override is process env.
+#[test]
+#[serial]
+fn typescript_column_is_symbol_owner_scoped() {
+    let (_tmp, repo_path, bare) = state_with_repo("tsrepo");
+    let state = std::sync::Arc::new(bare);
+    std::fs::create_dir_all(repo_path.join(DB_DIR_NAME)).unwrap();
+    std::fs::write(repo_path.join("tsconfig.json"), "{}").unwrap();
+    // The env override must point at a regular file; content is never run.
+    let helper = repo_path.join("fake-scip-typescript");
+    std::fs::write(&helper, "").unwrap();
+    let helper_env = crate::constants::SCIP_TYPESCRIPT_HELPER_ENV;
+    let helper_path = helper.display().to_string();
+
+    let row = |state: &ServeState| {
+        state
+            .repo_statuses_lightweight()
+            .into_iter()
+            .find(|(alias, _)| alias == "tsrepo")
+            .expect("tsrepo row")
+            .1
+    };
+
+    assert!(state.begin_indexing("tsrepo", IndexingOwner::Reindex));
+    {
+        let _env = crate::testing::EnvRestore::set(&[(helper_env, helper_path.as_str())]);
+        let info = row(&state);
+        assert_eq!(info.status, RepoStateLabel::Indexing);
+        assert_eq!(
+            info.typescript_index,
+            CSharpIndexStatus::None,
+            "a text reindex must not light the TS column"
+        );
+    }
+    state.end_indexing("tsrepo", IndexingOwner::Reindex);
+
+    assert!(state.begin_indexing("tsrepo", IndexingOwner::Symbol));
+    let _env = crate::testing::EnvRestore::set(&[(helper_env, helper_path.as_str())]);
+    let info = row(&state);
+    assert_eq!(info.typescript_index, CSharpIndexStatus::Indexing);
+    assert_eq!(
+        info.status,
+        RepoStateLabel::Idle,
+        "a pure SCIP rebuild must not light the general Indexing label"
+    );
+    state.end_indexing("tsrepo", IndexingOwner::Symbol);
 }
 
 /// A queued phase-2 rebuild holds no active_reindexes marker yet: the C#
-/// cache pre-mark alone must carry the row (label Indexing, not Idle) so a
-/// waiting repo doesn't read as idle while its rebuild is pending.
+/// cache pre-mark alone must light the C# COLUMN (queued work stays visible)
+/// while the general label stays on the repo's resting state — a pure SCIP
+/// pass never made the text index busy.
 #[test]
-fn queued_rebuild_pre_mark_keeps_the_repo_label_indexing() {
+fn queued_rebuild_pre_mark_shows_in_the_csharp_column_only() {
     let (_tmp, repo_path, bare) = state_with_repo("queuedrepo");
     let state = std::sync::Arc::new(bare);
     std::fs::create_dir_all(repo_path.join(DB_DIR_NAME)).unwrap();
@@ -3902,8 +3977,12 @@ fn queued_rebuild_pre_mark_keeps_the_repo_label_indexing() {
     };
 
     let info = row();
-    assert_eq!(info.status, RepoStateLabel::Indexing);
     assert_eq!(info.csharp_index, CSharpIndexStatus::Indexing);
+    assert_eq!(
+        info.status,
+        RepoStateLabel::Idle,
+        "a queued symbol rebuild must not light the general Indexing label"
+    );
 
     // Completed rebuilds overwrite the cache; without pending work the same
     // closed repo reads Idle again.

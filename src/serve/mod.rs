@@ -188,7 +188,7 @@ impl RepoStateLabel {
             Self::Open => "Open".green().bold(),
             Self::Warm => "Warm".yellow(),
             Self::Readonly => "Readonly".cyan(),
-            Self::Idle => "Idx".dimmed(),
+            Self::Idle => "Idle".dimmed(),
             Self::Indexing => "Indexing".magenta().bold(),
             Self::Error => "Error".red().bold(),
             Self::NoIndex => "No Index".dimmed(),
@@ -1193,6 +1193,29 @@ impl ServeState {
             self.reap_finished_index_task(alias);
         }
         any_left
+    }
+
+    /// Any TEXT-indexing owner (warmup, watcher, reindex) holds a marker for
+    /// `alias`. Only these flows rewrite the text index, so only these own
+    /// the general "Indexing" status; a symbol-only marker keeps the repo on
+    /// its resting state and drives the language columns instead.
+    ///
+    /// Read-only by design: call after [`Self::is_indexing`], which evicts
+    /// stale markers, so a dead marker cannot light the status here.
+    fn has_text_indexing_marker(&self, alias: &str) -> bool {
+        self.active_reindexes
+            .get(alias)
+            .map(|owners| owners.keys().any(|o| *o != IndexingOwner::Symbol))
+            .unwrap_or(false)
+    }
+
+    /// A symbol (SCIP) rebuild holds its marker for `alias` — drives the
+    /// C#/TS columns, never the general status.
+    fn has_symbol_indexing_marker(&self, alias: &str) -> bool {
+        self.active_reindexes
+            .get(alias)
+            .map(|owners| owners.contains_key(&IndexingOwner::Symbol))
+            .unwrap_or(false)
     }
 
     /// Reap the tracked index task for `alias` once its handle has finished.
@@ -3784,7 +3807,14 @@ impl ServeState {
             let db_path = path.join(DB_DIR_NAME);
             let db_exists = db_path.exists();
 
-            let indexing = self.is_indexing(alias);
+            // Evict stale markers first (side effect the owner-scoped reads
+            // below rely on); the any-owner boolean itself is no longer the
+            // label key.
+            self.is_indexing(alias);
+            // Owner-scoped: only text-indexing flows light the general
+            // "Indexing" label; symbol rebuilds own the language columns.
+            let text_indexing = self.has_text_indexing_marker(alias);
+            let symbol_indexing = self.has_symbol_indexing_marker(alias);
 
             let changes = match self.repos.get(alias) {
                 Some(entry) => match entry.value() {
@@ -3819,7 +3849,7 @@ impl ServeState {
             // symbol column keeps its normal None/probe result. A cached status
             // exists only for repos where a rebuild ran, so it also counts.
             let cached_csharp = self.csharp_index_status.get(alias).map(|e| *e.value());
-            let csharp_building = indexing
+            let csharp_building = symbol_indexing
                 && (cached_csharp.is_some()
                     || self
                         .symbol_registry
@@ -3857,7 +3887,7 @@ impl ServeState {
             // exists → Ready; otherwise None. The TUI icon reflects "an index
             // exists", which is exactly what matters for discoverability.
             let registry = &self.symbol_registry;
-            let ts_building = indexing
+            let ts_building = symbol_indexing
                 && registry
                     .get(LANG_TYPESCRIPT)
                     .map(|i| i.applies_to(path) && i.is_available())
@@ -3876,12 +3906,13 @@ impl ServeState {
                 }
             };
 
-            // A queued rebuild holds no active_reindexes marker yet (phase-2
-            // pre-marks the C# cache; LMDB format recovery owns its outcome
-            // the same way), so the label must also follow a resolved
-            // Indexing status — otherwise a waiting repo reads as idle while
-            // its rebuild is pending.
-            let label = if indexing || csharp_index == CSharpIndexStatus::Indexing {
+            // Only TEXT-indexing flows light the general label. A queued or
+            // running symbol rebuild (phase-2 pre-mark, watcher SCIP pass)
+            // shows in the C#/TS columns only — a pure SCIP pass never made
+            // the text index busy, and "Indexing" there read as "the normal
+            // index is stuck". Both owner reads run after is_indexing's
+            // stale eviction.
+            let label = if text_indexing {
                 RepoStateLabel::Indexing
             } else {
                 match self.repos.get(alias) {
@@ -3982,7 +4013,7 @@ impl ServeState {
                 RepoStateLabel::Open => "Open",
                 RepoStateLabel::Warm => "Warm",
                 RepoStateLabel::Readonly => "Readonly",
-                RepoStateLabel::Idle => "Idx",
+                RepoStateLabel::Idle => "Idle",
                 RepoStateLabel::Indexing => "Indexing",
                 RepoStateLabel::Error => "Error",
                 RepoStateLabel::NoIndex => "No Index",

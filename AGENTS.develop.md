@@ -241,6 +241,7 @@ Never `unwrap_or_default()` a store error on a search path — "no results" and 
 
 ## Changelog highlights (recent)
 
+- **v1.5.31 (pending)** — serve TUI status: `Indexing` only for real text indexing (pure SCIP rebuilds drive the C#/TS columns only); resting repos read `Idle` again
 - **v1.5.16 (pending)** — C# restore-pending retries 20×60s → 3 attempts with exponential backoff; restore exhaustion renders as yellow C#⚠ partial on every serve path instead of a red error
 - **v1.5.6 (pending)** — scip-csharp demotes MSBuild check advisories + BuildHost shutdown chatter from index warnings
 - **v1.5.15 (pending)** — CLI add/reindex refuse to build locally when the serve reports the alias already indexing (409 two-writer case); other delegation failures keep the local fallback
