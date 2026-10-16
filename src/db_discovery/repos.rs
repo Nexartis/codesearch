@@ -1240,6 +1240,13 @@ pub(crate) fn git_remote_url(path: &Path) -> Option<String> {
             .arg("-C")
             .arg(path)
             .args(["config", "--get", "remote.origin.url"])
+            // A caller running under git (e.g. a push hook) exports GIT_DIR /
+            // GIT_WORK_TREE, which would override `-C` and read the WRONG
+            // repo's remote. Scrub them so discovery keys off `path` alone.
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_OBJECT_DIRECTORY")
             .output()
         {
             Ok(o) => {

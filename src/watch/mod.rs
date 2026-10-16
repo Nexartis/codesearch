@@ -585,6 +585,12 @@ impl GitHeadWatcher {
             match Command::new("git")
                 .current_dir(&self.git_root)
                 .args(["rev-parse", "HEAD"])
+                // Ambient GIT_DIR/GIT_WORK_TREE (e.g. from a push hook) would
+                // override current_dir; key the watcher off git_root alone.
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_OBJECT_DIRECTORY")
                 .output()
             {
                 Ok(o) => {
@@ -660,7 +666,15 @@ mod tests {
         const MAX_ATTEMPTS: u64 = 5;
         let mut output = None;
         for attempt in 0..MAX_ATTEMPTS {
-            match Command::new("git").args(args).current_dir(cwd).output() {
+            match Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_OBJECT_DIRECTORY")
+                .output()
+            {
                 Ok(o) => {
                     output = Some(o);
                     break;

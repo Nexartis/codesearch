@@ -1368,6 +1368,10 @@ impl ServeState {
                 .arg("-1")
                 .arg("--format=%ct")
                 .arg("HEAD")
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_OBJECT_DIRECTORY")
                 .output()
             {
                 if out.status.success() {

@@ -137,7 +137,14 @@ impl TestRepo {
 
     /// Run a git command in the repository.
     fn run_git(cwd: &std::path::Path, args: &[&str]) -> anyhow::Result<()> {
-        let output = Command::new("git").args(args).current_dir(cwd).output()?;
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .output()?;
 
         if !output.status.success() {
             return Err(anyhow::anyhow!(

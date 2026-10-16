@@ -1911,6 +1911,10 @@ fn git_hooks_dir(repo_path: &std::path::Path) -> Option<PathBuf> {
         .arg("-C")
         .arg(repo_path)
         .args(["rev-parse", "--path-format=absolute", "--git-path", "hooks"])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
         .output()
         .ok()?;
     if !output.status.success() {
