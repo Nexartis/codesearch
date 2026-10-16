@@ -16,6 +16,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// is honoured within a few seconds even during heavy CPU work.
 pub static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// Grace for blocking tasks after serve returns; anything still running is
+/// abandoned with the process.
+pub const RUNTIME_SHUTDOWN_GRACE_SECS: u64 = 5;
+
 /// Check whether a graceful shutdown has been requested (CTRL-C).
 #[inline]
 pub fn is_shutdown_requested() -> bool {
@@ -41,6 +45,12 @@ pub const CONFIG_DIR_NAME: &str = ".codesearch";
 /// Name of the file metadata database
 pub const FILE_META_DB_NAME: &str = "file_meta.json";
 
+/// Rename attempts when publishing the file metadata (AV/Search indexer can hold the file)
+pub const FILE_META_SAVE_RENAME_ATTEMPTS: u32 = 5;
+
+/// Delay between file metadata rename attempts, in milliseconds
+pub const FILE_META_SAVE_RENAME_DELAY_MS: u64 = 100;
+
 /// Subdirectory name for embedding models within the global config dir
 const MODELS_SUBDIR: &str = "models";
 
@@ -59,18 +69,50 @@ pub const DEFAULT_LOG_MAX_FILES: usize = 5;
 /// Default log retention period in days
 pub const DEFAULT_LOG_RETENTION_DAYS: u64 = 5;
 
-/// Get the global models cache directory (~/.codesearch/models/).
+/// Environment variable relocating the entire global codesearch root.
+///
+/// When set to a non-empty absolute path, every global artifact — repos.json,
+/// the embedding-models cache, serve logs, serve_url, the global
+/// .codesearchignore and extensions.json — resolves under it instead of
+/// `~/.codesearch`. This is the single knob for machines that keep large
+/// artifacts off the home directory. Per-file overrides such as
+/// [`REPOS_CONFIG_ENV`] and [`EXTENSION_MAP_ENV`] still win when set.
+pub const CODESEARCH_HOME_ENV: &str = "CODESEARCH_HOME";
+
+/// Resolve the global codesearch root directory.
+///
+/// Returns `$CODESEARCH_HOME` when set and non-empty (it must be absolute — a
+/// relative value would silently resolve against the current working
+/// directory and fragment state between runs), otherwise `~/.codesearch`.
+/// All global-path accessors derive from this single point, so one hook
+/// relocates everything.
+pub fn codesearch_home() -> anyhow::Result<PathBuf> {
+    if let Ok(dir) = std::env::var(CODESEARCH_HOME_ENV) {
+        let dir = dir.trim();
+        if !dir.is_empty() {
+            let path = PathBuf::from(dir);
+            if !path.is_absolute() {
+                anyhow::bail!(
+                    "{} must be an absolute path, got: {}",
+                    CODESEARCH_HOME_ENV,
+                    dir
+                );
+            }
+            return Ok(path);
+        }
+    }
+    dirs::home_dir()
+        .map(|home| home.join(CONFIG_DIR_NAME))
+        .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))
+}
+
+/// Get the global models cache directory (`<codesearch_home>/models/`).
 ///
 /// This centralizes embedding model downloads so they are shared across all
-/// databases instead of being duplicated per-project. The directory is created
-/// if it does not exist.
-///
-/// Falls back to a temp directory if the home directory cannot be determined.
+/// databases instead of being duplicated per-project. Relocated wholesale via
+/// [`CODESEARCH_HOME_ENV`]. The directory is created if it does not exist.
 pub fn get_global_models_cache_dir() -> anyhow::Result<PathBuf> {
-    let base =
-        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
-
-    let models_dir = base.join(CONFIG_DIR_NAME).join(MODELS_SUBDIR);
+    let models_dir = codesearch_home()?.join(MODELS_SUBDIR);
 
     if !models_dir.exists() {
         std::fs::create_dir_all(&models_dir).map_err(|e| {
@@ -85,13 +127,17 @@ pub fn get_global_models_cache_dir() -> anyhow::Result<PathBuf> {
     Ok(models_dir)
 }
 
-/// Get the global cache directory (~/.codesearch/).
+/// Get the global cache directory (`<codesearch_home>/`).
 ///
 /// Used for client/auto mode logging when no local DB is available.
-/// The directory is created if it does not exist.
+/// Relocated wholesale via [`CODESEARCH_HOME_ENV`]. The directory is created
+/// if it does not exist.
 pub fn get_global_cache_dir() -> PathBuf {
-    let base = dirs::home_dir().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let cache_dir = base.join(CONFIG_DIR_NAME);
+    let cache_dir = codesearch_home().unwrap_or_else(|_| {
+        std::env::current_dir()
+            .unwrap_or_default()
+            .join(CONFIG_DIR_NAME)
+    });
     if !cache_dir.exists() {
         let _ = std::fs::create_dir_all(&cache_dir);
     }
@@ -101,18 +147,19 @@ pub fn get_global_cache_dir() -> PathBuf {
 /// Name of the global codesearchignore file in ~/.codesearch/
 pub const GLOBAL_CODESEARCHIGNORE_FILE: &str = ".codesearchignore";
 
-/// Get the path to the global .codesearchignore file (~/.codesearch/.codesearchignore).
+/// Get the path to the global .codesearchignore file
+/// (`<codesearch_home>/.codesearchignore`).
 ///
 /// This file uses the same gitignore syntax and is applied to all indexed repos,
 /// providing a way to set ignore rules without modifying repo-local files.
 /// Repo-local `.codesearchignore` and `.gitignore` take precedence.
+/// Relocated wholesale via [`CODESEARCH_HOME_ENV`].
 ///
-/// Returns `None` only if the home directory cannot be determined.
+/// Returns `None` only if the root cannot be resolved.
 pub fn global_codesearchignore_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| {
-        home.join(CONFIG_DIR_NAME)
-            .join(GLOBAL_CODESEARCHIGNORE_FILE)
-    })
+    codesearch_home()
+        .ok()
+        .map(|root| root.join(GLOBAL_CODESEARCHIGNORE_FILE))
 }
 
 /// Name of the global extension→language map file in ~/.codesearch/
@@ -132,15 +179,17 @@ pub const EXTENSION_MAP_ENV: &str = "CODESEARCH_EXTENSION_MAP";
 /// the binary. User overrides take precedence over the built-in extension table.
 ///
 /// The path resolves to `$CODESEARCH_EXTENSION_MAP` when set and non-empty,
-/// otherwise `~/.codesearch/extensions.json`. Returns `None` only when neither
-/// the env var nor the home directory is available.
+/// otherwise `<codesearch_home>/extensions.json`. Returns `None` only when
+/// neither the env var nor a resolvable root is available.
 pub fn global_extension_map_path() -> Option<PathBuf> {
     if let Ok(p) = std::env::var(EXTENSION_MAP_ENV) {
         if !p.is_empty() {
             return Some(PathBuf::from(p));
         }
     }
-    dirs::home_dir().map(|home| home.join(CONFIG_DIR_NAME).join(GLOBAL_EXTENSION_MAP_FILE))
+    codesearch_home()
+        .ok()
+        .map(|root| root.join(GLOBAL_EXTENSION_MAP_FILE))
 }
 
 /// Name of the repos configuration file
@@ -504,19 +553,27 @@ pub const REMOTE_ROW_REFRESH_SECS: u64 = 5;
 /// cancellation between insert and remove silently leaks the entry, leaving
 /// the TUI stuck on "Indexing" forever.
 ///
-/// Rather than chase every leak path, entries older than this threshold are
+/// Rather than chase every leak path, a marker older than this threshold is
 /// treated as absent by all read sites (`repo_statuses_lightweight`,
-/// `evict_idle_repos`, and the reindex 409 guard) and lazily evicted. This
-/// makes the system self-healing regardless of the leak cause.
+/// `evict_idle_repos`, and the reindex 409 guard) and lazily evicted — but
+/// only when no tracked indexing task for the alias is still alive. A live
+/// task (queued on the job gate, or in a long uninterruptible build) renews
+/// its marker instead, so a backlog drains rather than being cancelled as
+/// "leaked"; the system stays self-healing for genuinely dead tasks without
+/// killing slow ones.
 ///
 /// 30 minutes is deliberately generous: a force reindex of a very large repo
 /// or a full scip-csharp solution rebuild can legitimately take many minutes.
-/// Any session stuck beyond that is almost certainly leaked.
 /// Override with `CODESEARCH_MAX_INDEXING_SECS`.
 pub const MAX_INDEXING_SECS: u64 = 30 * 60; // 30 minutes
 
 /// Environment variable to override the maximum indexing duration.
 pub const MAX_INDEXING_SECS_ENV: &str = "CODESEARCH_MAX_INDEXING_SECS";
+
+/// How often a flow without its own progress callback (the SCIP symbol
+/// rebuild) renews its indexing marker so it never ages out at
+/// `MAX_INDEXING_SECS` mid-run. Must stay well below that threshold.
+pub const INDEXING_MARKER_HEARTBEAT_SECS: u64 = 60;
 
 /// How long an MCP handler may wait for the vector-store read lock before
 /// giving up with a "store busy" error.
@@ -634,6 +691,27 @@ pub const HELPERS_SUBDIR: &str = "helpers";
 /// Debounce time in milliseconds for .cs file changes triggering a symbol rebuild.
 pub const SCIP_CSHARP_DEBOUNCE_MS: u64 = 60_000; // 60 seconds
 
+/// Environment variable overriding the restore-pending retry interval in
+/// seconds (issue #225). Values ≤ 0 or unparseable fall back to the
+/// built-in interval (a zero interval would hot-spin the helper); tests
+/// use 1 to exercise the retry loop in seconds instead of minutes.
+pub const SCIP_RESTORE_RETRY_INTERVAL_SECS_ENV: &str = "CODESEARCH_RESTORE_RETRY_INTERVAL_SECS";
+
+/// File names whose change invalidates NuGet restore state: the serve file
+/// watcher fires a FULL C# symbol rebuild when any of these changes, not
+/// just the per-project incremental (.cs) rebuild — a central-package-
+/// management bump invalidates every project at once (issue #225). Must
+/// stay in sync with the C# helper's `RestoreInputs` (helpers/csharp/
+/// RestorePolicy.cs), which gates the workspace load on the same names.
+/// Compared case-insensitively by the watcher.
+pub const CSHARP_RESTORE_INPUT_FILES: &[&str] = &[
+    "Directory.Packages.props",
+    "Directory.Build.props",
+    "Directory.Build.targets",
+    "NuGet.config",
+    "global.json",
+];
+
 /// LMDB database name for the SCIP symbols table.
 pub const SCIP_SYMBOLS_DB_NAME: &str = "scip_symbols";
 
@@ -654,6 +732,34 @@ pub const SCIP_HEAD_SHA_KEY: &str = "head_sha";
 /// change to the canonical key format forces exactly one rebuild instead of
 /// old-format keys being served as fresh.
 pub const SCIP_KEY_FORMAT_KEY: &str = "key_format";
+
+/// LMDB metadata key holding a JSON array of index-level completeness
+/// warnings from the last rebuild (workspace/MSBuild failures the helper
+/// survived while still producing an index). Absent or empty = built clean.
+/// Surfaced on every `find_impact` answer from that index — a reference
+/// list out of a partially loaded solution may be missing callers.
+pub const SCIP_INDEX_WARNINGS_KEY: &str = "index_warnings";
+
+/// LMDB metadata key stamping which index-builder generation produced the
+/// index (chunk file-meta cache and SCIP symbol meta alike).
+/// The rebuild gates treat an index whose stamp is absent or differs from
+/// [`INDEX_BUILDER_VERSION`] as stale: after a conventions change, serve
+/// rebuilds the indexes itself at startup instead of waiting for a manual
+/// command.
+pub const SCIP_INDEX_BUILDER_VERSION_KEY: &str = "index_builder_version";
+
+/// The value written for [`SCIP_INDEX_BUILDER_VERSION_KEY`] by this binary.
+///
+/// A HAND-BUMPED generation marker, deliberately NOT tied to the package
+/// version: the patch version bumps on every merged PR, and a per-build
+/// stamp wiped every repo's chunk cache and symbol indexes at each binary
+/// swap (field incident 14–15 Oct 2026: ten patch bumps in one day meant a
+/// full fleet re-embed per restart, and the long commit windows let the
+/// Windows AV/Search-Indexer lock race kill builds, leaving repos
+/// registered with 0 chunks). Bump this ONLY when the chunker or SCIP
+/// conventions change shape — not for code or dependency changes that do
+/// not alter what gets written.
+pub const INDEX_BUILDER_VERSION: &str = "2026-10.1";
 
 /// Current value written for [`SCIP_KEY_FORMAT_KEY`]. Bump whenever the
 /// canonical SCIP symbol key format produced by a language helper changes
@@ -891,8 +997,12 @@ pub const ALWAYS_SKIP_FILENAME_SUFFIXES: &[&str] = &[
     ".orig",
 ];
 
-/// Directories and files that should always be excluded from indexing
-/// These are added to both .gitignore and .codesearchignore automatically
+/// Directories and files that should always be excluded from indexing.
+///
+/// This list is applied purely in memory: the file walker filters these names
+/// during traversal and the watcher skips paths containing them. Nothing is
+/// written to `.gitignore` or `.codesearchignore`, and previously indexed
+/// content keeps appearing in search results until the next reindex.
 pub const ALWAYS_EXCLUDED: &[&str] = &[
     // Codesearch databases
     ".codesearch",
@@ -930,6 +1040,26 @@ pub const ALWAYS_EXCLUDED: &[&str] = &[
     "coverage",
     ".nyc_output",
     ".cache",
+    // Dependency lock files — generated by package managers, never source.
+    // Matched by exact filename so the walker and watcher exclude them even
+    // when the extension alone is not skipped (pnpm-lock.yaml,
+    // package-lock.json, npm-shrinkwrap.json, bun.lockb).
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "bun.lock",
+    "bun.lockb",
+    "deno.lock",
+    "Cargo.lock",
+    "go.sum",
+    "poetry.lock",
+    "Pipfile.lock",
+    "uv.lock",
+    "pdm.lock",
+    "composer.lock",
+    "Gemfile.lock",
+    "flake.lock",
 ];
 
 #[cfg(test)]
@@ -949,6 +1079,9 @@ mod tests {
     }
 
     #[test]
+    // Reads global-path accessors that resolve via CODESEARCH_HOME: must not
+    // overlap the serial tests that set/clear that env var in this binary.
+    #[serial_test::serial]
     fn global_codesearchignore_path_returns_home_codesearch_dir() {
         let path = global_codesearchignore_path();
         assert!(path.is_some(), "Should return Some when home dir exists");
@@ -962,6 +1095,98 @@ mod tests {
             path.file_name().unwrap(),
             GLOBAL_CODESEARCHIGNORE_FILE,
             "Filename should match GLOBAL_CODESEARCHIGNORE_FILE constant"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codesearch_home_relocates_all_global_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        // A developer machine with either per-file override exported would
+        // otherwise win over CODESEARCH_HOME and fail this test spuriously.
+        let _clear_specific =
+            crate::testing::EnvRestore::remove(&[REPOS_CONFIG_ENV, EXTENSION_MAP_ENV]);
+        let _set =
+            crate::testing::EnvRestore::set(&[(CODESEARCH_HOME_ENV, root.to_str().unwrap())]);
+
+        assert_eq!(codesearch_home().unwrap(), root);
+        assert_eq!(
+            get_global_models_cache_dir().unwrap(),
+            root.join(MODELS_SUBDIR),
+            "models cache must live under CODESEARCH_HOME"
+        );
+        assert!(root.join(MODELS_SUBDIR).exists());
+        assert_eq!(get_global_cache_dir(), root);
+        assert_eq!(
+            global_codesearchignore_path(),
+            Some(root.join(GLOBAL_CODESEARCHIGNORE_FILE))
+        );
+        assert_eq!(
+            global_extension_map_path(),
+            Some(root.join(GLOBAL_EXTENSION_MAP_FILE))
+        );
+        assert_eq!(
+            crate::db_discovery::repos::config_path().unwrap(),
+            root.join(REPOS_CONFIG_FILE),
+            "repos.json default must follow CODESEARCH_HOME"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn relative_codesearch_home_is_rejected() {
+        let _set = crate::testing::EnvRestore::set(&[(CODESEARCH_HOME_ENV, "relative/dir")]);
+
+        let err = codesearch_home().unwrap_err();
+        assert!(
+            err.to_string().contains("absolute"),
+            "error must mention the absolute-path requirement, got: {err}"
+        );
+        assert!(
+            get_global_models_cache_dir().is_err(),
+            "a bad root must not silently fall back to the default models dir"
+        );
+        assert_eq!(
+            global_codesearchignore_path(),
+            None,
+            "a bad root must not silently resolve the global ignore file"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn empty_or_unset_codesearch_home_falls_back_to_default() {
+        let expected = dirs::home_dir().unwrap().join(CONFIG_DIR_NAME);
+
+        let _empty = crate::testing::EnvRestore::set(&[(CODESEARCH_HOME_ENV, "")]);
+        assert_eq!(
+            codesearch_home().unwrap(),
+            expected,
+            "an empty override must fall back to ~/.codesearch"
+        );
+
+        let _unset = crate::testing::EnvRestore::remove(&[CODESEARCH_HOME_ENV]);
+        assert_eq!(codesearch_home().unwrap(), expected);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn specific_overrides_win_over_codesearch_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let map_path = tmp.path().join("my-extensions.json");
+        let repos_path = tmp.path().join("my-repos.json");
+        let _set = crate::testing::EnvRestore::set(&[
+            (CODESEARCH_HOME_ENV, tmp.path().to_str().unwrap()),
+            (EXTENSION_MAP_ENV, map_path.to_str().unwrap()),
+            (REPOS_CONFIG_ENV, repos_path.to_str().unwrap()),
+        ]);
+
+        assert_eq!(global_extension_map_path(), Some(map_path));
+        assert_eq!(
+            crate::db_discovery::repos::config_path().unwrap(),
+            repos_path,
+            "CODESEARCH_REPOS_CONFIG must win over CODESEARCH_HOME"
         );
     }
 }

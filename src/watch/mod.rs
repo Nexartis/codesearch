@@ -291,6 +291,21 @@ impl FileWatcher {
             }
         }
 
+        // C# restore inputs (Directory.Packages.props etc.) are not an
+        // indexable language, but the watcher must still see them: a change
+        // invalidates NuGet restore state for the whole solution and drives
+        // a full C# symbol rebuild (issue #225). Checked before the
+        // 0-byte/language gates — an empty NuGet.config is a meaningful
+        // restore input too.
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if crate::constants::CSHARP_RESTORE_INPUT_FILES
+                .iter()
+                .any(|f| name.eq_ignore_ascii_case(f))
+            {
+                return true;
+            }
+        }
+
         // Skip 0-byte files (empty build artifacts)
         if path.metadata().map(|m| m.len() == 0).unwrap_or(false) {
             return false;
@@ -570,6 +585,12 @@ impl GitHeadWatcher {
             match Command::new("git")
                 .current_dir(&self.git_root)
                 .args(["rev-parse", "HEAD"])
+                // Ambient GIT_DIR/GIT_WORK_TREE (e.g. from a push hook) would
+                // override current_dir; key the watcher off git_root alone.
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_OBJECT_DIRECTORY")
                 .output()
             {
                 Ok(o) => {
@@ -633,6 +654,8 @@ impl GitHeadWatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::EnvRestore;
+    use serial_test::serial;
     use std::fs;
     use std::process::Command;
     use tempfile::tempdir;
@@ -643,7 +666,15 @@ mod tests {
         const MAX_ATTEMPTS: u64 = 5;
         let mut output = None;
         for attempt in 0..MAX_ATTEMPTS {
-            match Command::new("git").args(args).current_dir(cwd).output() {
+            match Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_OBJECT_DIRECTORY")
+                .output()
+            {
                 Ok(o) => {
                     output = Some(o);
                     break;
@@ -672,9 +703,21 @@ mod tests {
         Ok(())
     }
 
+    /// Build a `FileWatcher` with the home directory pointed at an empty
+    /// temporary directory, so the developer's real
+    /// `~/.codesearch/.codesearchignore` cannot leak into the assertions.
+    /// CI has no such file, which is why the ambient dependency went unnoticed.
+    fn watcher_with_isolated_home(root: PathBuf) -> FileWatcher {
+        let home = tempdir().unwrap();
+        let home = home.path().to_string_lossy().into_owned();
+        let _guard = EnvRestore::set(&[("HOME", &home), ("USERPROFILE", &home)]);
+        FileWatcher::new(root)
+    }
+
     #[test]
+    #[serial]
     fn test_is_watchable() {
-        let watcher = FileWatcher::new(PathBuf::from("/tmp"));
+        let watcher = watcher_with_isolated_home(PathBuf::from("/tmp"));
 
         // Should NOT watch (ignored dirs)
         assert!(!watcher.is_watchable(Path::new("/tmp/.git/config")));
@@ -687,6 +730,13 @@ mod tests {
         assert!(!watcher.is_watchable(Path::new("/tmp/debug.log")));
         assert!(!watcher.is_watchable(Path::new("/tmp/image.png")));
         assert!(!watcher.is_watchable(Path::new("/tmp/data.bin")));
+
+        // Should NOT watch (dependency lock files — name-based, covers names
+        // whose extension alone is indexable like .yaml/.json/.lockb)
+        assert!(!watcher.is_watchable(Path::new("/tmp/pnpm-lock.yaml")));
+        assert!(!watcher.is_watchable(Path::new("/tmp/package-lock.json")));
+        assert!(!watcher.is_watchable(Path::new("/tmp/npm-shrinkwrap.json")));
+        assert!(!watcher.is_watchable(Path::new("/tmp/bun.lockb")));
 
         // SHOULD watch (code files)
         assert!(watcher.is_watchable(Path::new("/tmp/src/main.rs")));
@@ -705,7 +755,37 @@ mod tests {
         assert!(watcher.is_watchable(Path::new("/tmp/Makefile")));
     }
 
+    /// The restore-input admission gate: an EMPTY NuGet.config is a
+    /// meaningful restore input, so the name gate must sit BEFORE the
+    /// 0-byte skip — and .props is not an indexable language, so without the
+    /// gate the file would never reach the full-rebuild flush at all.
     #[test]
+    #[serial]
+    fn restore_inputs_are_watchable_even_empty_and_lookalikes_are_not() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        fs::write(root.join("NuGet.config"), "").unwrap();
+        fs::write(root.join("Directory.Packages.props.bak"), "x").unwrap();
+
+        let watcher = watcher_with_isolated_home(root.to_path_buf());
+
+        assert!(
+            watcher.is_watchable(&root.join("NuGet.config")),
+            "an empty nuget.config must stay watchable: the restore-input gate precedes the 0-byte skip"
+        );
+        assert!(
+            watcher.is_watchable(&root.join("Directory.Packages.props")),
+            ".props is not indexable — only the restore-input gate admits it"
+        );
+        assert!(
+            !watcher.is_watchable(&root.join("Directory.Packages.props.bak")),
+            ".bak lookalike must not pass the name gate"
+        );
+    }
+
+    #[test]
+    #[serial]
     fn test_gitignore_rules_respected() {
         let dir = tempdir().unwrap();
         let root = dir.path();
@@ -717,7 +797,7 @@ mod tests {
         )
         .unwrap();
 
-        let watcher = FileWatcher::new(root.to_path_buf());
+        let watcher = watcher_with_isolated_home(root.to_path_buf());
         assert!(watcher.gitignore.is_some(), "Should have loaded .gitignore");
 
         // Should NOT watch (gitignored patterns)
@@ -751,9 +831,10 @@ mod tests {
 
     #[test]
     #[ignore] // Requires actual filesystem events
+    #[serial]
     fn test_file_watcher() {
         let dir = tempdir().unwrap();
-        let mut watcher = FileWatcher::new(dir.path().to_path_buf());
+        let mut watcher = watcher_with_isolated_home(dir.path().to_path_buf());
 
         watcher.start(100).unwrap();
 
@@ -769,6 +850,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_codesearchignore_loaded_and_respected() {
         let dir = tempdir().unwrap();
         let root = dir.path();
@@ -776,7 +858,7 @@ mod tests {
         // Create repo-local .codesearchignore excluding tests/
         fs::write(root.join(".codesearchignore"), "tests/\n").unwrap();
 
-        let watcher = FileWatcher::new(root.to_path_buf());
+        let watcher = watcher_with_isolated_home(root.to_path_buf());
         assert!(
             watcher.gitignore.is_some(),
             "Should have loaded .codesearchignore"
@@ -793,6 +875,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_codesearchignore_overrides_gitignore() {
         let dir = tempdir().unwrap();
         let root = dir.path();
@@ -802,7 +885,7 @@ mod tests {
         fs::write(root.join(".gitignore"), "logs/\n").unwrap();
         fs::write(root.join(".codesearchignore"), "src/generated/\n").unwrap();
 
-        let watcher = FileWatcher::new(root.to_path_buf());
+        let watcher = watcher_with_isolated_home(root.to_path_buf());
         assert!(watcher.gitignore.is_some());
 
         // .gitignore pattern takes effect
@@ -823,11 +906,12 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_no_ignore_files_returns_none() {
         let dir = tempdir().unwrap();
         let root = dir.path();
 
-        let watcher = FileWatcher::new(root.to_path_buf());
+        let watcher = watcher_with_isolated_home(root.to_path_buf());
         assert!(
             watcher.gitignore.is_none(),
             "Should have no gitignore matcher when no ignore files exist"

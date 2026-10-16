@@ -460,6 +460,26 @@ pub enum Commands {
         #[arg(long)]
         idle_suspend_secs: Option<u64>,
 
+        /// Max concurrent repo indexing jobs (refresh / reindex / HNSW build)
+        /// this serve runs. Overrides CODESEARCH_INDEX_JOBS (default 1).
+        #[arg(long)]
+        index_jobs: Option<usize>,
+
+        /// ONNX intra-op threads per embedding session. Overrides
+        /// CODESEARCH_EMBED_THREADS (unset = ONNX default, all cores).
+        #[arg(long)]
+        embed_threads: Option<usize>,
+
+        /// Milliseconds to pause between background embedding mini-batches.
+        /// Overrides CODESEARCH_EMBED_PAUSE_MS (default 0).
+        #[arg(long)]
+        embed_pause_ms: Option<u64>,
+
+        /// Minimum free memory (MB) before a heavy indexing job may start.
+        /// Overrides CODESEARCH_MIN_FREE_MB (default 0 = disabled).
+        #[arg(long)]
+        min_free_mb: Option<u64>,
+
         /// For `tui` action: serve URL to connect to
         #[arg(long, default_value = DEFAULT_SERVE_URL)]
         url: String,
@@ -508,7 +528,7 @@ pub enum Commands {
 
     /// Download embedding models
     Setup {
-        /// Model to download (defaults to mxbai-embed-xsmall-v1)
+        /// Model to download (defaults to minilm-l6-q)
         #[arg(long)]
         model: Option<String>,
     },
@@ -985,19 +1005,28 @@ fn warn_if_heavier_model(model_type: ModelType) {
     }
 }
 
+/// Resolve a CLI `--model` flag to an optional [`ModelType`].
+///
+/// `None` (flag absent) stays `None` so runtime paths keep their per-query
+/// model resolution; an unknown name is rejected with the full valid-model
+/// list. Shared by every command that takes `--model`.
+pub(crate) fn parse_model_arg(model: Option<&str>) -> Result<Option<ModelType>> {
+    match model {
+        Some(name) => ModelType::parse(name).map(Some).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Unknown model '{name}' (valid models: {})",
+                ModelType::valid_short_names()
+            )
+        }),
+        None => Ok(None),
+    }
+}
+
 pub async fn run(cancel_token: CancellationToken) -> Result<()> {
     let cli = Cli::parse();
 
     // Parse model from CLI flag
-    let model_type = cli.model.as_ref().and_then(|m| ModelType::parse(m));
-    if cli.model.is_some() && model_type.is_none() {
-        eprintln!(
-            "Unknown model: '{}'. Available models:",
-            cli.model.as_deref().unwrap_or_default()
-        );
-        eprintln!("  {}", ModelType::valid_short_names());
-        std::process::exit(1);
-    }
+    let model_type = parse_model_arg(cli.model.as_deref())?;
 
     // Set quiet mode if requested
     if cli.quiet {
@@ -1087,18 +1116,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                         if let Some(peer_name) = &remote {
                             run_remote_add(peer_name, add_path).await
                         } else {
-                            let mt = model
-                                .as_deref()
-                                .and_then(|m| {
-                                    let parsed = ModelType::parse(m);
-                                    if parsed.is_none() {
-                                        eprintln!("Unknown model: '{}'. Available models:", m);
-                                        eprintln!("  {}", ModelType::valid_short_names());
-                                        std::process::exit(1);
-                                    }
-                                    parsed
-                                })
-                                .or(model_type);
+                            let mt = parse_model_arg(model.as_deref())?.or(model_type);
                             if let Some(mt) = mt {
                                 warn_if_heavier_model(mt);
                             }
@@ -1234,6 +1252,10 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             no_tui,
             keep_warm_url,
             idle_suspend_secs,
+            index_jobs,
+            embed_threads,
+            embed_pause_ms,
+            min_free_mb,
             url,
             api_key,
         } => {
@@ -1257,6 +1279,24 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                     // never overrides an existing index.
                     if let Some(mt) = model_type {
                         warn_if_heavier_model(mt);
+                    }
+                    // CLI overrides for the heavy-work limits. Serve is a single
+                    // long-lived process, so exporting the overrides here keeps a
+                    // single source of truth (the environment) for every
+                    // component that reads them (job gate, embedder, refresh
+                    // batching) without threading a config struct through each
+                    // constructor. Unset flags change nothing.
+                    if let Some(n) = index_jobs {
+                        std::env::set_var(crate::limits::INDEX_JOBS_ENV, n.to_string());
+                    }
+                    if let Some(n) = embed_threads {
+                        std::env::set_var(crate::limits::EMBED_THREADS_ENV, n.to_string());
+                    }
+                    if let Some(ms) = embed_pause_ms {
+                        std::env::set_var(crate::limits::EMBED_PAUSE_MS_ENV, ms.to_string());
+                    }
+                    if let Some(mb) = min_free_mb {
+                        std::env::set_var(crate::limits::MIN_FREE_MB_ENV, mb.to_string());
                     }
                     crate::serve::run_serve(
                         host,
@@ -1779,8 +1819,9 @@ fn codesearch_hook_block() -> String {
 # Only react to branch/worktree checkouts ($3 = 1). `git worktree add` fires
 # post-checkout with flag 1; a file checkout (`git checkout -- path`) fires with
 # flag 0 and must not re-register (it changes no repo location, just wastes a POST).
-if [ "$3" = "1" ] && [ -f "$HOME/.codesearch/serve_url" ]; then
-    __cs_url=$(cat "$HOME/.codesearch/serve_url")
+__cs_home="${CODESEARCH_HOME:-$HOME/.codesearch}"
+if [ "$3" = "1" ] && [ -f "$__cs_home/serve_url" ]; then
+    __cs_url=$(cat "$__cs_home/serve_url")
     if [ -n "$__cs_url" ]; then
         # Git Bash `pwd` yields an msys path (/c/...) that codesearch serve
         # cannot canonicalize (HTTP 400); `pwd -W` yields a native C:/ path.
@@ -1870,6 +1911,10 @@ fn git_hooks_dir(repo_path: &std::path::Path) -> Option<PathBuf> {
         .arg("-C")
         .arg(repo_path)
         .args(["rev-parse", "--path-format=absolute", "--git-path", "hooks"])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
         .output()
         .ok()?;
     if !output.status.success() {
@@ -2018,6 +2063,21 @@ mod tests {
     }
 
     #[test]
+    fn test_hook_block_resolves_serve_url_via_codesearch_home() {
+        let block = codesearch_hook_block();
+        // serve_url lives under the relocatable global root: the hook must
+        // fall back through CODESEARCH_HOME, mirroring codesearch_home().
+        assert!(
+            block.contains("${CODESEARCH_HOME:-$HOME/.codesearch}"),
+            "hook must honour CODESEARCH_HOME before ~/.codesearch"
+        );
+        assert!(
+            !block.contains("$HOME/.codesearch/serve_url"),
+            "no direct ~/.codesearch/serve_url path may remain"
+        );
+    }
+
+    #[test]
     fn test_full_hook_has_posix_shebang() {
         let hook = codesearch_full_hook();
         assert!(hook.starts_with("#!/bin/sh\n"));
@@ -2092,6 +2152,58 @@ mod tests {
             "re-running install must be a no-op once the block is present"
         );
         assert_eq!(after_second.matches(HOOK_BEGIN).count(), 1);
+    }
+
+    #[test]
+    fn test_serve_heavy_work_limit_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "codesearch",
+            "serve",
+            "--index-jobs",
+            "2",
+            "--embed-threads",
+            "4",
+            "--embed-pause-ms",
+            "25",
+            "--min-free-mb",
+            "4096",
+        ])
+        .expect("cli parse should succeed");
+        match cli.command {
+            Commands::Serve {
+                index_jobs,
+                embed_threads,
+                embed_pause_ms,
+                min_free_mb,
+                ..
+            } => {
+                assert_eq!(index_jobs, Some(2));
+                assert_eq!(embed_threads, Some(4));
+                assert_eq!(embed_pause_ms, Some(25));
+                assert_eq!(min_free_mb, Some(4096));
+            }
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn test_serve_heavy_work_limit_flags_default_to_none() {
+        let cli = Cli::try_parse_from(["codesearch", "serve"]).expect("cli parse should succeed");
+        match cli.command {
+            Commands::Serve {
+                index_jobs,
+                embed_threads,
+                embed_pause_ms,
+                min_free_mb,
+                ..
+            } => {
+                assert_eq!(index_jobs, None, "unset flags must leave env/defaults");
+                assert_eq!(embed_threads, None);
+                assert_eq!(embed_pause_ms, None);
+                assert_eq!(min_free_mb, None);
+            }
+            _ => panic!("expected Serve command"),
+        }
     }
 
     #[test]

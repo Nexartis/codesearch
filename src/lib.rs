@@ -10,6 +10,7 @@ pub mod federation;
 pub mod file;
 pub mod fts;
 pub mod index;
+pub mod limits;
 pub mod lmdb_registry;
 pub mod logger;
 pub mod mcp;

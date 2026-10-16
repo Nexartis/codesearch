@@ -61,6 +61,102 @@ pub(crate) fn is_helper_warning_line(line: &str) -> bool {
     line.contains("[WARN]") || line.contains("[Failure]")
 }
 
+/// The version token out of the helper's `--version` line
+/// ("scip-csharp 1.5.4" → "1.5.4"); anything unparseable → "unknown", which
+/// still logs (as a mismatch against the host version) instead of silently
+/// skipping the startup entry.
+pub(super) fn parse_helper_version(version_line: &str) -> String {
+    version_line
+        .split_whitespace()
+        .last()
+        .filter(|tok| tok.chars().next().is_some_and(|c| c.is_ascii_digit()))
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+/// Cap a line at `max` chars, cutting at the last whitespace inside the
+/// budget when there is one: a mid-word cut makes compilation-error
+/// specimens (the quoted CS0103 name) unreadable. A single token longer
+/// than the budget still takes the hard cap.
+fn cap_at_whitespace_boundary(line: &str, max: usize) -> String {
+    let cut = line
+        .char_indices()
+        .nth(max)
+        .map(|(i, _)| i)
+        .unwrap_or(line.len());
+    if cut == line.len() {
+        return line.to_string();
+    }
+    match line[..cut].rfind(char::is_whitespace) {
+        Some(pos) => line[..pos].to_string(),
+        None => line[..cut].to_string(),
+    }
+}
+
+/// Normalize one warning-severity helper stderr line into a concise,
+/// index-level completeness warning entry. MSBuild project-load failures
+/// (the class that silently strips cross-project references from the index)
+/// collapse to `<project-file>: <message>`; anything else passes through
+/// trimmed. `None` for non-warning lines.
+pub(crate) fn normalize_index_warning_line(line: &str) -> Option<String> {
+    if !is_helper_warning_line(line) {
+        return None;
+    }
+    // "[WARN] Workspace error: [Failure] Msbuild failed when processing the
+    // file '<path>' with message: <msg>" → "<file_name>: <msg>"
+    if let Some((_, rest)) = line.split_once("Msbuild failed when processing the file '") {
+        if let Some((path, tail)) = rest.split_once('\'') {
+            let file = path.rsplit(['/', '\\']).next().unwrap_or(path);
+            let msg = tail
+                .split_once("with message: ")
+                .map(|(_, m)| m)
+                .unwrap_or(tail)
+                .trim();
+            let msg: String = msg.chars().take(160).collect();
+            return Some(format!("{file}: {msg}"));
+        }
+    }
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(cap_at_whitespace_boundary(trimmed, 220))
+}
+
+/// Collapse the raw warning lines of one helper run into the capped,
+/// deduplicated list persisted as `index_warnings` meta. Order-preserving
+/// dedup because MSBuild repeats the same failure per project and per
+/// pass; capped because the list rides on every find_impact answer.
+pub(crate) fn summarize_index_warnings(lines: &[String], cap: usize) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<String> = lines
+        .iter()
+        .filter_map(|l| normalize_index_warning_line(l))
+        .filter(|w| seen.insert(w.clone()))
+        .collect();
+    if out.len() > cap {
+        let dropped = out.len() - cap;
+        out.truncate(cap);
+        out.push(format!("… and {dropped} more distinct warning(s)"));
+    }
+    out
+}
+
+/// The stored form of the summarized warnings: a stand-alone summary entry
+/// leads, because the list rides on every find_impact answer AND the TUI
+/// info panel and must be understandable alone.
+pub(crate) fn index_warnings_stored(entries: &[String]) -> Vec<String> {
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    let mut stored = vec![format!(
+        "The symbol index was built while the C# workspace reported {} distinct failure(s) — cross-project references may be missing from every answer. Failures `dotnet build` also reports are real and fixable in the repo (often a missing dotnet restore); failures only scip-csharp reports are tool-side — please report them and reindex.",
+        entries.len()
+    )];
+    stored.extend(entries.iter().cloned());
+    stored
+}
+
 /// Route one scip-csharp stderr line into tracing at the right severity.
 /// This is the ONLY sanctioned path for helper stderr: spawn helpers with
 /// `Stdio::piped()` and drain through here — never `Stdio::inherit()`,
@@ -132,6 +228,16 @@ const META_HEAD_SHA: &str = crate::constants::SCIP_HEAD_SHA_KEY;
 /// built with (see [`crate::constants::SCIP_KEY_FORMAT`]).
 const META_KEY_FORMAT: &str = crate::constants::SCIP_KEY_FORMAT_KEY;
 
+/// Key in the meta database holding the JSON array of index-level
+/// completeness warnings from the last rebuild (see
+/// [`summarize_index_warnings`]).
+const META_INDEX_WARNINGS: &str = crate::constants::SCIP_INDEX_WARNINGS_KEY;
+const META_BUILDER_VERSION: &str = crate::constants::SCIP_INDEX_BUILDER_VERSION_KEY;
+
+/// How many distinct index-level warnings are persisted (and thus surfaced
+/// per find_impact answer) before the list is capped with an overflow note.
+const INDEX_WARNINGS_CAP: usize = 10;
+
 /// Key in the meta database storing the count of indexed symbols.
 #[allow(dead_code)]
 const META_SYMBOL_COUNT: &str = "symbol_count";
@@ -149,6 +255,134 @@ const HELPER_BIN_NAME: &str = crate::constants::SCIP_CSHARP_HELPER_NAME;
 /// Debounce period for .cs file changes (seconds).
 #[allow(dead_code)]
 pub const CSHARP_REBUILD_DEBOUNCE_SECS: u64 = crate::constants::SCIP_CSHARP_DEBOUNCE_MS / 1000;
+
+/// Exit code scip-csharp uses for "a dotnet restore for this solution is
+/// still running" (issue #225): it printed one `[RESTORE-PENDING]` line,
+/// wrote no output file, and built no index.
+pub(crate) const HELPER_RESTORE_PENDING_EXIT: i32 = 75;
+
+/// Base of the exponential backoff between restore-pending retries of the
+/// same rebuild scope: retry N waits base × 2^(N-1).
+const RESTORE_PENDING_RETRY_BASE_INTERVAL_SECS: u64 = 60;
+
+/// Granularity of the restore wait's shutdown check.
+const RESTORE_PENDING_POLL_MS: u64 = 500;
+
+/// Restore-pending helper attempts before a rebuild gives up with LMDB
+/// untouched: initial attempt + 2 retries. Backoff 60s + 120s = 3 min of
+/// restore patience, far below the MAX_INDEXING_SECS (30 min)
+/// claim-takeover in serve so a still-running rebuild is never mistaken
+/// for a leaked one and double-driven.
+const RESTORE_PENDING_RETRY_MAX_ATTEMPTS: u32 = 3;
+
+/// Retry base seconds: `CODESEARCH_RESTORE_RETRY_INTERVAL_SECS` when set
+/// to a positive integer, otherwise the built-in 60. Zero and unparseable
+/// fall back to the default (a zero interval would hot-spin the helper);
+/// tests use 1 to exercise the retry loop in seconds.
+fn restore_pending_retry_interval_secs() -> u64 {
+    let raw = std::env::var(crate::constants::SCIP_RESTORE_RETRY_INTERVAL_SECS_ENV).ok();
+    raw.and_then(|v| v.parse::<u64>().ok())
+        .filter(|&secs| secs > 0)
+        .unwrap_or(RESTORE_PENDING_RETRY_BASE_INTERVAL_SECS)
+}
+
+/// Backoff before restore-pending retry number `attempts` (1-based, the
+/// count of pending exits so far): base × 2^(attempts-1), saturating.
+fn restore_pending_retry_delay_secs(attempts: u32) -> u64 {
+    restore_pending_retry_interval_secs().saturating_mul(1u64 << (attempts - 1).min(16))
+}
+
+/// Sleeps `total` in poll steps; returns `false` as soon as shutdown is
+/// requested. A rebuild parked here must not outlive quit: the runtime joins
+/// its blocking pool at teardown.
+fn sleep_unless_shutdown(total: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + total;
+    loop {
+        if crate::constants::is_shutdown_requested() {
+            return false;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return true;
+        }
+        thread::sleep(remaining.min(std::time::Duration::from_millis(RESTORE_PENDING_POLL_MS)));
+    }
+}
+
+/// Typed marker for the helper's RESTORE-PENDING exit: distinct from a
+/// generic failure so callers can leave LMDB untouched and retry instead of
+/// surfacing an error (issue #225).
+#[derive(Debug, thiserror::Error)]
+#[error("dotnet restore still running for this solution (restore pending)")]
+pub struct RestorePendingError;
+
+/// True when `e` is the typed restore-pending outcome.
+pub(super) fn is_restore_pending(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<RestorePendingError>().is_some()
+}
+
+/// Typed marker for the restore retry cap being exhausted: the previous
+/// index stays live and LMDB is untouched, so callers render a warning
+/// (stale-but-usable index), never a red error.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "dotnet restore for this solution did not finish within {attempts} attempts \
+     (backoff {backoff}) — rebuild abandoned, the previous index stays live \
+     (issue #225)"
+)]
+pub struct RestoreExhaustedError {
+    pub attempts: u32,
+    /// Concrete waits between attempts, e.g. "60s + 120s".
+    pub backoff: String,
+}
+
+/// True when `e` is the typed restore-exhausted outcome.
+pub(crate) fn is_restore_exhausted(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<RestoreExhaustedError>().is_some()
+}
+
+/// Solutions whose rebuild retry loop is currently waiting out a restore.
+/// find_impact reads this through
+/// [`SymbolIndexer::restore_pending`] to attach one caller-facing warning
+/// while answering from the previous index. Lifetime = the retry loop: set
+/// on the first pending exit, cleared when the loop ends either way.
+static RESTORE_PENDING_SOLUTIONS: std::sync::LazyLock<std::sync::Mutex<HashSet<PathBuf>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+
+pub(super) fn restore_pending_flag_set(db_path: &Path) {
+    match RESTORE_PENDING_SOLUTIONS.lock() {
+        Ok(mut set) => {
+            set.insert(db_path.to_path_buf());
+        }
+        Err(poisoned) => {
+            // A poisoned lock still holds every entry inserted before the
+            // panic — recover rather than drop the honesty signal.
+            poisoned.into_inner().insert(db_path.to_path_buf());
+        }
+    }
+}
+
+pub(super) fn restore_pending_flag_clear(db_path: &Path) {
+    match RESTORE_PENDING_SOLUTIONS.lock() {
+        Ok(mut set) => {
+            set.remove(db_path);
+        }
+        Err(poisoned) => {
+            poisoned.into_inner().remove(db_path);
+        }
+    }
+}
+
+/// Caller-facing warning find_impact attaches to every answer from an index
+/// whose rebuild is waiting out a restore.
+pub(crate) const RESTORE_PENDING_INDEX_WARNING: &str =
+    "dotnet restore in progress — index refresh pending; this answer comes from the previous index.";
+
+/// Per-symbol warning persisted when a lazy find-refs is refused mid-restore:
+/// rides the existing ref-warnings channel and is replaced by the next
+/// successful resolution, so a partial answer can never pass for complete.
+const RESTORE_PENDING_REF_WARNING: &str =
+    "restore in progress — references could not be resolved; this answer lists definitions only and is INCOMPLETE";
 
 // ── Temp-file RAII guard ──────────────────────────────────────────
 
@@ -297,23 +531,36 @@ fn read_ref_warnings(env: &TrackedEnv, rtxn: &heed::RoTxn<'_>, canonical: &str) 
 /// - `"csharp App . FieldDefinition#Validate()."` → `"Validate"`
 /// - `"csharp SmallSolution.Library . Calculator#Add(int, int)."` → `"Add"`
 /// - `"csharp . . . Namespace.TopLevel"` → `"TopLevel"`
-fn extract_simple_name(scip_symbol: &str) -> String {
-    // Strip trailing suffix chars: "Validate()." → "Validate", "MyService#" → "MyService"
-    let cleaned = scip_symbol
-        .trim_end_matches('.')
-        .trim_end_matches("()")
-        .trim_end_matches('#');
-    // Take last non-empty segment after '#' or '.'
-    let last_segment = cleaned
-        .rsplit(['#', '.'])
-        .find(|s| !s.trim().is_empty())
-        .unwrap_or(cleaned)
-        .trim();
-    // Strip method parameters (e.g. "Add(int, int)" → "Add")
-    last_segment
+///
+/// Parameter lists are stripped BEFORE segmenting: key format 2.0 writes
+/// fully-qualified parameter types (`SaveBatchAsync(int, System.Collections
+/// .Generic.IReadOnlyList<global::…>)`), and splitting on `.` first would
+/// land inside the parameters — the "Activity, int)" fragments that left
+/// every parameterized method unresolvable by fuzzy name.
+pub(crate) fn extract_simple_name(scip_symbol: &str) -> String {
+    // Method/field segment: after the last '#' (types without '#' keep the
+    // whole string — their name is the last '.'-segment below; a bare
+    // trailing '#' falls back to the pre-# text).
+    let after_hash = scip_symbol.rsplit('#').next().unwrap_or(scip_symbol);
+    let base = if after_hash.trim().is_empty() {
+        scip_symbol
+    } else {
+        after_hash
+    };
+    // Strip parameters FIRST, then the generic-arity marker: keys group all
+    // overloads and arities under one queryable name.
+    let name = base
         .split('(')
         .next()
-        .unwrap_or(last_segment)
+        .unwrap_or(base)
+        .split('`')
+        .next()
+        .unwrap_or(base);
+    let cleaned = name.trim().trim_end_matches('.').trim_end_matches('#');
+    cleaned
+        .rsplit('.')
+        .find(|s| !s.trim().is_empty())
+        .unwrap_or(cleaned)
         .trim()
         .to_string()
 }
@@ -333,6 +580,61 @@ pub struct CSharpSymbolIndexer {
 impl Default for CSharpSymbolIndexer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// PIDs of live one-shot scip-csharp helper children (index, find-refs,
+/// batch-find-refs). serve shutdown kills whatever is still registered: a
+/// rebuild outliving its host holds the helper exe locked for minutes (the
+/// deploy blocker) and keeps computing for a dead client.
+static LIVE_HELPER_PIDS: std::sync::LazyLock<std::sync::Mutex<HashSet<u32>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+
+/// RAII registration of a spawned helper child in [`LIVE_HELPER_PIDS`];
+/// dropped after the child is waited, so only genuinely in-flight PIDs
+/// remain registered.
+pub(crate) struct LiveHelperChild(u32);
+
+impl LiveHelperChild {
+    pub(crate) fn register(child: &std::process::Child) -> Self {
+        let pid = child.id();
+        if let Ok(mut set) = LIVE_HELPER_PIDS.lock() {
+            set.insert(pid);
+        }
+        Self(pid)
+    }
+}
+
+impl Drop for LiveHelperChild {
+    fn drop(&mut self) {
+        if let Ok(mut set) = LIVE_HELPER_PIDS.lock() {
+            set.remove(&self.0);
+        }
+    }
+}
+
+/// Kill every still-registered helper child. Called on serve shutdown —
+/// statics are not dropped at process exit, so the RAII guard alone cannot
+/// cover the 'q'/Ctrl-C path. A PID whose process already exited fails the
+/// kill harmlessly.
+pub(crate) fn kill_live_helper_children() {
+    let pids: Vec<u32> = match LIVE_HELPER_PIDS.lock() {
+        Ok(mut set) => set.drain().collect(),
+        Err(_) => return,
+    };
+    for pid in &pids {
+        #[cfg(windows)]
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .output();
+        #[cfg(not(windows))]
+        let _ = Command::new("kill").arg("-9").arg(pid.to_string()).output();
+    }
+    if !pids.is_empty() {
+        tracing::info!(
+            "🛑 Killed {} in-flight scip-csharp helper child(ren) on shutdown",
+            pids.len()
+        );
     }
 }
 
@@ -360,9 +662,89 @@ impl CSharpSymbolIndexer {
         }
 
         let resolved = self.resolve_helper_path();
-        let mut lock = self.helper_path.lock().unwrap();
-        *lock = Some(resolved.clone()); // cache both Some and None
+        {
+            let mut lock = self.helper_path.lock().unwrap();
+            *lock = Some(resolved.clone()); // cache both Some and None
+        }
+        // After the guard is released: the version probe spawns a subprocess.
+        if let Some(ref path) = resolved {
+            self.log_helper_version_once(path);
+        }
         resolved
+    }
+
+    /// Logs the resolved helper's self-reported version exactly once per
+    /// process. The mismatch class — a deployed helper older than the host
+    /// that spawns it, answering with pre-gate behaviour — is otherwise
+    /// invisible: the paths look right and every warning reads as a repo
+    /// problem. A mismatch is a WARNING, not a refusal: an old helper still
+    /// indexes, just without the current guarantees.
+    fn log_helper_version_once(&self, helper: &Path) {
+        static LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        if LOGGED.set(()).is_err() {
+            return;
+        }
+        let version = std::process::Command::new(helper)
+            .arg("--version")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| parse_helper_version(&String::from_utf8_lossy(&o.stdout)))
+            .unwrap_or_else(|| "unknown".to_string());
+        let host = env!("CARGO_PKG_VERSION");
+        if version == host {
+            tracing::info!(
+                "scip-csharp helper v{} at {} (matches codesearch v{})",
+                version,
+                helper.display(),
+                host
+            );
+        } else {
+            tracing::warn!(
+                "scip-csharp helper reports v{} at {} but codesearch is v{} — \
+                 redeploy (copy-to-common.ps1) or point {} at the matching helper; \
+                 behaviour may predate the current restore gate",
+                version,
+                helper.display(),
+                host,
+                HELPER_ENV_VAR
+            );
+        }
+    }
+
+    /// Writes the rebuild bookkeeping shared by every scope (full and
+    /// incremental): key-format stamp, index warnings (written or cleared)
+    /// and the builder-version stamp. Called from `rebuild`'s meta txn, so
+    /// meta always describes the newest build. `pub(crate)` so the producer
+    /// test drives the exact write the pipeline runs — a fake helper cannot
+    /// execute on Windows, where the validated filename must be a real PE.
+    pub(crate) fn write_rebuild_meta(
+        meta_db: &Database<Str, Str>,
+        wtxn: &mut heed::RwTxn,
+        index_warnings: &[String],
+    ) -> Result<()> {
+        // Unconditional: has_index refuses an index whose key-format stamp is
+        // absent or stale, so a key-format change forces exactly one rebuild.
+        meta_db.put(wtxn, META_KEY_FORMAT, crate::constants::SCIP_KEY_FORMAT)?;
+        // Index-level completeness warnings from this run — written or
+        // cleared on EVERY rebuild (full or incremental) so meta always
+        // describes the newest build.
+        let stored_warnings = index_warnings_stored(index_warnings);
+        if stored_warnings.is_empty() {
+            meta_db.delete(wtxn, META_INDEX_WARNINGS)?;
+        } else {
+            let json = serde_json::to_string(&stored_warnings).unwrap_or_else(|_| "[]".to_string());
+            meta_db.put(wtxn, META_INDEX_WARNINGS, json.as_str())?;
+        }
+        // Stamp the producing build: the rebuild gate treats an index from
+        // another (or an unknown) build as stale, so a deployed binary
+        // rebuilds the indexes it inherited itself at startup.
+        meta_db.put(
+            wtxn,
+            META_BUILDER_VERSION,
+            crate::constants::INDEX_BUILDER_VERSION,
+        )?;
+        Ok(())
     }
 
     fn resolve_helper_path(&self) -> Option<PathBuf> {
@@ -518,13 +900,20 @@ impl CSharpSymbolIndexer {
     // ── Helper invocation ──────────────────────────────────────────
 
     /// Invoke `scip-csharp index` and stream stderr to tracing.
+    ///
+    /// Returns the raw warning-severity stderr lines of the run — the input
+    /// to [`summarize_index_warnings`]. A helper that survives MSBuild
+    /// project-load failures exits 0 with a syntactically valid but
+    /// semantically partial index (definitions without cross-project
+    /// references); those failures land HERE so the rebuild can persist them
+    /// as index-level warnings instead of them living only in the log.
     fn invoke_index_helper(
         &self,
         helper: &Path,
         solution: &Path,
         output_path: &Path,
         project_filter: Option<&Path>,
-    ) -> Result<()> {
+    ) -> Result<Vec<String>> {
         let solution_short = solution
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
@@ -548,12 +937,21 @@ impl CSharpSymbolIndexer {
         let mut child = cmd
             .spawn()
             .with_context(|| format!("Failed to execute scip-csharp at {}", helper.display()))?;
+        // Deregistered when the guard drops at the end of this fn (after
+        // wait), so shutdown only ever kills genuinely in-flight helpers.
+        let _live_helper = LiveHelperChild::register(&child);
 
+        let captured_warnings: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let stderr_handle = child.stderr.take().map(|stderr| {
             let label = solution_short.clone();
+            let sink = std::sync::Arc::clone(&captured_warnings);
             thread::spawn(move || {
                 drain_pipe_to_tracing(stderr, |line| {
                     if !line.is_empty() {
+                        if is_helper_warning_line(line) {
+                            sink.lock().map(|mut v| v.push(line.to_string())).ok();
+                        }
                         emit_helper_stderr_line("scip-csharp", &label, line);
                     }
                 });
@@ -582,6 +980,12 @@ impl CSharpSymbolIndexer {
             let _ = h.join();
         }
 
+        if status.code() == Some(HELPER_RESTORE_PENDING_EXIT) {
+            // The helper printed [RESTORE-PENDING] and wrote nothing: map to
+            // the typed outcome, never a generic failure (issue #225).
+            return Err(anyhow::Error::new(RestorePendingError));
+        }
+
         if !status.success() {
             tracing::warn!(
                 "scip-csharp exited with {} for {}",
@@ -591,7 +995,13 @@ impl CSharpSymbolIndexer {
             // Don't bail — partial output is acceptable per AGENTS.md spec
         }
 
-        Ok(())
+        // A poisoned lock still holds every line pushed before the panic —
+        // recover rather than drop honesty signals on the floor.
+        let raw = match captured_warnings.lock() {
+            Ok(mut v) => std::mem::take(&mut *v),
+            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+        };
+        Ok(raw)
     }
 
     /// Invoke `scip-csharp find-refs` for a single symbol and return its
@@ -645,6 +1055,7 @@ impl CSharpSymbolIndexer {
                 helper.display()
             )
         })?;
+        let _live_helper = LiveHelperChild::register(&child);
 
         let stderr_handle = child.stderr.take().map(|stderr| {
             let label = solution_short.clone();
@@ -677,6 +1088,12 @@ impl CSharpSymbolIndexer {
         }
         if let Some(h) = stdout_handle {
             let _ = h.join();
+        }
+
+        if status.code() == Some(HELPER_RESTORE_PENDING_EXIT) {
+            // Typed restore-pending outcome: no output file exists to read
+            // and nothing may be cached from this run (issue #225).
+            return Err(anyhow::Error::new(RestorePendingError));
         }
 
         if !status.success() {
@@ -923,9 +1340,36 @@ impl CSharpSymbolIndexer {
                          find-refs for '{}'",
                         canonical
                     );
-                    self.invoke_find_refs_helper(&helper, &solution, canonical)?
+                    match self.invoke_find_refs_helper(&helper, &solution, canonical) {
+                        Ok(pair) => pair,
+                        Err(e) if is_restore_pending(&e) => {
+                            // Restore in flight: answer from what LMDB
+                            // already has (definitions only), persist the
+                            // honesty warning on the per-symbol channel
+                            // find_impact already reads, and cache NOTHING —
+                            // the next lookup after restore finishes misses
+                            // the cache, resolves properly and replaces the
+                            // warning (issue #225).
+                            {
+                                let mut wtxn = env.write_txn()?;
+                                store_ref_warnings(
+                                    &env,
+                                    &mut wtxn,
+                                    canonical,
+                                    &[RESTORE_PENDING_REF_WARNING.to_string()],
+                                )?;
+                                wtxn.commit()?;
+                            }
+                            return Ok(all_stored.into_iter().map(stored_to_symbol_ref).collect());
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
             };
+
+        // A real resolution proves assets are fresh again: lift the
+        // index-level pending flag if this lookup had set it.
+        restore_pending_flag_clear(db_path);
 
         // ── Write phase — cache the resolved references ────────────
         // Over the LMDB key limit: answer from the live resolution and skip the
@@ -1080,7 +1524,26 @@ impl CSharpSymbolIndexer {
         let _output_guard = TempFileGuard(output_path.clone());
 
         // Invoke batch-find-refs — symbols_file and output_path are cleaned up by guards
-        self.invoke_batch_find_refs_helper(&helper, &solution, &symbols_file, &output_path)?;
+        if let Err(e) =
+            self.invoke_batch_find_refs_helper(&helper, &solution, &symbols_file, &output_path)
+        {
+            if is_restore_pending(&e) {
+                // Prewarm is best-effort: skip this round, cache nothing.
+                // The next prewarm (or any lazy lookup) retries after the
+                // restore finished (issue #225).
+                tracing::warn!(
+                    "prewarm skipped for '{}': dotnet restore still running (restore pending)",
+                    solution.display()
+                );
+                return Ok(PrewarmSummary {
+                    total_symbols: total_available,
+                    resolved: 0,
+                    cached: 0,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+            return Err(e);
+        }
 
         // Parse and cache results
         let cached = self.parse_and_cache_batch_refs(db_path, &output_path)?;
@@ -1137,6 +1600,7 @@ impl CSharpSymbolIndexer {
                 helper.display()
             )
         })?;
+        let _live_helper = LiveHelperChild::register(&child);
 
         let stderr_handle = child.stderr.take().map(|stderr| {
             let label = solution_short.clone();
@@ -1169,6 +1633,12 @@ impl CSharpSymbolIndexer {
         }
         if let Some(h) = stdout_handle {
             let _ = h.join();
+        }
+
+        if status.code() == Some(HELPER_RESTORE_PENDING_EXIT) {
+            // Typed restore-pending outcome: no output file exists to parse
+            // and nothing may be cached from this run (issue #225).
+            return Err(anyhow::Error::new(RestorePendingError));
         }
 
         if !status.success() {
@@ -1350,8 +1820,77 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         ));
         let _output_guard = TempFileGuard(output_path.clone());
 
-        // Invoke helper with stderr streaming
-        self.invoke_index_helper(&helper, &solution, &output_path, project.as_deref())?;
+        // Invoke helper with stderr streaming; warning-severity lines become
+        // the index-level completeness warnings persisted below.
+        //
+        // ── Restore gate (issue #225) ─────────────────────────────────
+        // A RESTORE-PENDING exit means a dotnet restore for this solution is
+        // still running and the helper deliberately produced nothing.
+        // Indexing anyway would store a degraded, CS0246-noisy index into
+        // LMDB while the previous good index could have stayed live — so
+        // retry the SAME rebuild scope with a bounded backoff until the
+        // helper stops reporting pending, and on exhaustion give up with
+        // LMDB untouched: every LMDB write below sits after this loop.
+        let mut attempts: u32 = 0;
+        let mut marked_pending = false;
+        let raw_index_warnings = loop {
+            match self.invoke_index_helper(&helper, &solution, &output_path, project.as_deref()) {
+                Ok(raw) => {
+                    if marked_pending {
+                        restore_pending_flag_clear(db_path);
+                    }
+                    break raw;
+                }
+                Err(e) if is_restore_pending(&e) => {
+                    attempts += 1;
+                    // Idempotent set on EVERY pending exit: a later restore
+                    // can start while this loop is still waiting (an earlier
+                    // one resolved and cleared the flag via a lazy find-refs)
+                    // and the warning must survive that.
+                    restore_pending_flag_set(db_path);
+                    marked_pending = true;
+                    if attempts >= RESTORE_PENDING_RETRY_MAX_ATTEMPTS {
+                        restore_pending_flag_clear(db_path);
+                        let backoff = (1..RESTORE_PENDING_RETRY_MAX_ATTEMPTS)
+                            .map(|k| format!("{}s", restore_pending_retry_delay_secs(k)))
+                            .collect::<Vec<_>>()
+                            .join(" + ");
+                        bail!(RestoreExhaustedError {
+                            attempts: RESTORE_PENDING_RETRY_MAX_ATTEMPTS,
+                            backoff,
+                        });
+                    }
+                    let delay_secs = restore_pending_retry_delay_secs(attempts);
+                    tracing::warn!(
+                        "restore pending for '{}' — retrying the same rebuild scope in {}s \
+                         (attempt {}/{})",
+                        solution.display(),
+                        delay_secs,
+                        attempts,
+                        RESTORE_PENDING_RETRY_MAX_ATTEMPTS
+                    );
+                    if !sleep_unless_shutdown(std::time::Duration::from_secs(delay_secs)) {
+                        restore_pending_flag_clear(db_path);
+                        bail!(
+                            "rebuild cancelled while waiting for dotnet restore — shutdown \
+                             requested, previous index stays live"
+                        );
+                    }
+                }
+                Err(e) => {
+                    // A non-pending failure ends the retry loop: the flag
+                    // describes THIS loop's wait, so it must not outlive it
+                    // — otherwise find_impact would warn "restore in
+                    // progress" long after the loop gave up for another
+                    // reason (helper crash, solution deleted mid-wait).
+                    if marked_pending {
+                        restore_pending_flag_clear(db_path);
+                    }
+                    return Err(e);
+                }
+            }
+        };
+        let index_warnings = summarize_index_warnings(&raw_index_warnings, INDEX_WARNINGS_CAP);
 
         // Parse the JSON output
         let index_data = std::fs::read(&output_path)
@@ -1689,13 +2228,7 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         if let Some(sha) = super::current_git_head(repo_path) {
             meta_db.put(&mut wtxn, META_HEAD_SHA, sha.as_str())?;
         }
-        // Unconditional: has_index refuses an index whose key-format stamp is
-        // absent or stale, so a key-format change forces exactly one rebuild.
-        meta_db.put(
-            &mut wtxn,
-            META_KEY_FORMAT,
-            crate::constants::SCIP_KEY_FORMAT,
-        )?;
+        Self::write_rebuild_meta(&meta_db, &mut wtxn, &index_warnings)?;
 
         wtxn.commit()?;
 
@@ -1722,6 +2255,7 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             symbols_indexed: total_symbols,
             references_stored: total_defs, // definitions only; refs resolved lazily
             duration_ms,
+            index_warnings: index_warnings_stored(&index_warnings),
         })
     }
 
@@ -1801,6 +2335,13 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         read_ref_warnings(&env, &rtxn, canonical)
     }
 
+    fn restore_pending(&self, db_path: &Path) -> bool {
+        match RESTORE_PENDING_SOLUTIONS.lock() {
+            Ok(set) => set.contains(db_path),
+            Err(poisoned) => poisoned.into_inner().contains(db_path),
+        }
+    }
+
     fn index_age(&self, db_path: &Path) -> u64 {
         let env = match self.open_scip_env(db_path) {
             Ok(e) => e,
@@ -1844,6 +2385,65 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         let sha = meta_db.get(&rtxn, META_HEAD_SHA).ok().flatten()?;
         let sha = sha.trim().to_string();
         (!sha.is_empty()).then_some(sha)
+    }
+
+    /// Index-level completeness warnings from the last rebuild — the
+    /// workspace/MSBuild failures the helper survived. Non-empty means
+    /// reference lists from this index may be incomplete even when a
+    /// lookup succeeds (observed live: a worktree whose NuGet restore was
+    /// broken indexed every definition but zero cross-project references,
+    /// and every find_impact answer passed as clean). Plain LMDB read;
+    /// unreadable or absent metadata reads as clean (never blocks an answer).
+    fn index_warnings(&self, db_path: &Path) -> Vec<String> {
+        let env = match self.open_scip_env(db_path) {
+            Ok(e) => e,
+            Err(_) => return Vec::new(),
+        };
+        let rtxn = match env.read_txn() {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
+        };
+        let meta_db: Database<Str, Str> = match env.open_database(&rtxn, Some(SCIP_META_DB_NAME)) {
+            Ok(Some(db)) => db,
+            _ => return Vec::new(),
+        };
+        let json = match meta_db.get(&rtxn, META_INDEX_WARNINGS) {
+            Ok(Some(s)) => s,
+            _ => return Vec::new(),
+        };
+        serde_json::from_str(json).unwrap_or_default()
+    }
+
+    /// Which codesearch build produced this index — `None` when the stamp is
+    /// absent (pre-stamp index) or the meta is unreadable. The rebuild gate
+    /// compares against [`crate::constants::INDEX_BUILDER_VERSION`] and
+    /// rebuilds on mismatch: this binary never produced that index.
+    fn index_builder_version(&self, db_path: &Path) -> Option<String> {
+        let env = match self.open_scip_env(db_path) {
+            Ok(e) => e,
+            Err(_) => return None,
+        };
+        let rtxn = match env.read_txn() {
+            Ok(t) => t,
+            Err(_) => return None,
+        };
+        let meta_db: Database<Str, Str> = match env.open_database(&rtxn, Some(SCIP_META_DB_NAME)) {
+            Ok(Some(db)) => db,
+            _ => return None,
+        };
+        meta_db
+            .get(&rtxn, META_BUILDER_VERSION)
+            .ok()
+            .flatten()
+            .map(|s| s.to_string())
+    }
+
+    /// Same freshness check the rebuild gate applies (mod.rs: an absent or
+    /// foreign builder stamp reads as stale for C#, unlike adapters that do
+    /// not stamp at all — hence the override, not the trait default).
+    fn index_matches_builder(&self, db_path: &Path) -> bool {
+        self.index_builder_version(db_path).as_deref()
+            == Some(crate::constants::INDEX_BUILDER_VERSION)
     }
 
     /// Whether a SCIP index exists AND was built with the current key format.
@@ -1891,6 +2491,10 @@ impl SymbolIndexer for CSharpSymbolIndexer {
     /// and flip the TUI C# indicator red.
     fn applies_to(&self, repo_path: &Path) -> bool {
         Self::find_solution(repo_path).is_some()
+    }
+
+    fn applicability_hint(&self) -> &'static str {
+        "the scip-csharp adapter requires a .sln file in the repository root"
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -2319,7 +2923,25 @@ mod tests {
     /// fallback); `find-refs` writes a fixed warnings-bearing JSON to its
     /// `--output` path, mirroring a helper that survived a partial failure.
     const FAKE_HELPER_SRC: &str = r#"fn main() {
+    if std::env::var("CS_FAKE_HELPER_MODE").as_deref() == Ok("exit75") {
+        std::process::exit(75);
+    }
+    if std::env::var("CS_FAKE_HELPER_MODE").as_deref() == Ok("pend-then-fail") {
+        // First invocation pends (75), every later one fails generically (2):
+        // drives a mid-retry non-pending failure through the real loop.
+        let flag = std::env::var("CS_FAKE_PEND_FLAG")
+            .unwrap_or_else(|_| "pend-flag".into());
+        if std::path::Path::new(&flag).exists() {
+            std::process::exit(2);
+        }
+        std::fs::write(&flag, "x").unwrap();
+        std::process::exit(75);
+    }
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--version") {
+        println!("scip-csharp 0.0.0-fake");
+        return;
+    }
     if args.get(1).map(String::as_str) == Some("serve") {
         return;
     }
@@ -2484,6 +3106,307 @@ mod tests {
             warnings[0].contains("FindReferencesAsync failed"),
             "warning text must round-trip, got: {}",
             warnings[0]
+        );
+    }
+
+    // ── Restore gate (issue #225): producer-side coverage ───────────
+    //
+    // The exit-75 mapping, the retry exhaustion and the lazy find-refs
+    // pending branch, driven through the real fake-helper subprocess so
+    // deleting any of them fails here.
+
+    fn fake_helper_always_pending(dir: &Path) -> (PathBuf, crate::testing::EnvRestore) {
+        let helper_dir = dir.join("helper");
+        std::fs::create_dir(&helper_dir).unwrap();
+        let helper = build_fake_csharp_helper(&helper_dir);
+        let guard = crate::testing::EnvRestore::set(&[
+            (HELPER_ENV_VAR, helper.to_string_lossy().as_ref()),
+            ("CS_FAKE_HELPER_MODE", "exit75"),
+        ]);
+        (helper, guard)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn exit_75_from_every_helper_entry_maps_to_the_typed_pending_outcome() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (helper, _guard) = fake_helper_always_pending(dir.path());
+        let indexer = CSharpSymbolIndexer::new();
+        let solution = dir.path().join("FakeSolution.sln");
+        let output = dir.path().join("out.json");
+
+        let err = indexer
+            .invoke_index_helper(&helper, &solution, &output, None)
+            .unwrap_err();
+        assert!(
+            is_restore_pending(&err),
+            "index exit 75 must map to the typed outcome, got: {err:#}"
+        );
+
+        let err = indexer
+            .invoke_find_refs_helper(&helper, &solution, "csharp Ns . V#V().")
+            .unwrap_err();
+        assert!(
+            is_restore_pending(&err),
+            "find-refs exit 75 must map to the typed outcome, got: {err:#}"
+        );
+
+        let err = indexer
+            .invoke_batch_find_refs_helper(
+                &helper,
+                &solution,
+                &dir.path().join("symbols.txt"),
+                &output,
+            )
+            .unwrap_err();
+        assert!(
+            is_restore_pending(&err),
+            "batch exit 75 must map to the typed outcome, got: {err:#}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rebuild_bails_after_the_retry_cap_with_lmdb_untouched() {
+        use super::SymbolIndexer as _;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("db");
+        std::fs::write(dir.path().join("FakeSolution.sln"), "").unwrap();
+
+        let helper_dir = dir.path().join("helper");
+        std::fs::create_dir(&helper_dir).unwrap();
+        let helper = build_fake_csharp_helper(&helper_dir);
+        let _guard = crate::testing::EnvRestore::set(&[
+            (HELPER_ENV_VAR, helper.to_string_lossy().as_ref()),
+            ("CS_FAKE_HELPER_MODE", "exit75"),
+            // 1s base: 0 is filtered (fail-safe against a prod hot-spin),
+            // so the backoff runs 1s + 2s — the cap exhausts in ~3s, not 3 min.
+            (crate::constants::SCIP_RESTORE_RETRY_INTERVAL_SECS_ENV, "1"),
+        ]);
+
+        let indexer = CSharpSymbolIndexer::new();
+        let err = indexer
+            .rebuild(dir.path(), &db, RebuildScope::Full)
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&format!(
+                "did not finish within {RESTORE_PENDING_RETRY_MAX_ATTEMPTS} attempts"
+            )),
+            "cap exhaustion must name attempts and the abandonment, got: {msg}"
+        );
+        assert!(
+            msg.contains("backoff 1s + 2s"),
+            "the message must carry the concrete backoff waits, got: {msg}"
+        );
+        assert!(
+            err.downcast_ref::<RestoreExhaustedError>().is_some(),
+            "cap exhaustion must be the typed outcome, got: {err:#}"
+        );
+
+        // LMDB untouched: no rebuild meta written, and the pending flag that
+        // rode the retry loop is cleared on the way out.
+        assert_eq!(
+            indexer.index_age(&db),
+            u64::MAX,
+            "an abandoned rebuild must not write rebuild meta"
+        );
+        assert!(
+            !indexer.restore_pending(&db),
+            "the pending flag must be cleared when the retry loop gives up"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn restore_pending_backoff_doubles_from_the_configured_base() {
+        let _guard = crate::testing::EnvRestore::set(&[(
+            crate::constants::SCIP_RESTORE_RETRY_INTERVAL_SECS_ENV,
+            "1",
+        )]);
+        assert_eq!(restore_pending_retry_delay_secs(1), 1);
+        assert_eq!(restore_pending_retry_delay_secs(2), 2);
+        // Saturating shift cap: an absurd attempt count can never overflow.
+        assert_eq!(restore_pending_retry_delay_secs(1_000), 1 << 16);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rebuild_waiting_on_restore_returns_promptly_once_shutdown_is_requested() {
+        use super::SymbolIndexer as _;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("db");
+        std::fs::write(dir.path().join("FakeSolution.sln"), "").unwrap();
+        let helper_dir = dir.path().join("helper");
+        std::fs::create_dir(&helper_dir).unwrap();
+        let helper = build_fake_csharp_helper(&helper_dir);
+        let _guard = crate::testing::EnvRestore::set(&[
+            (HELPER_ENV_VAR, helper.to_string_lossy().as_ref()),
+            ("CS_FAKE_HELPER_MODE", "exit75"),
+        ]);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let repo = dir.path().to_path_buf();
+        let db_thread = db.clone();
+        std::thread::spawn(move || {
+            let res = CSharpSymbolIndexer::new().rebuild(&repo, &db_thread, RebuildScope::Full);
+            let _ = tx.send(res.map(|_| ()).map_err(|e| format!("{e:#}")));
+        });
+
+        // Arm the promptness clock only once the rebuild is actually parked
+        // in the restore wait: under full-suite load the helper spawn + LMDB
+        // open can outlast a fixed settle sleep, failing the test before the
+        // property under test ever engaged. The pending flag rides the retry
+        // loop, so it flips true exactly when the wait starts.
+        let indexer = CSharpSymbolIndexer::new();
+        let park_started = std::time::Instant::now();
+        loop {
+            assert!(
+                park_started.elapsed() < std::time::Duration::from_secs(30),
+                "rebuild never reached the restore wait"
+            );
+            if indexer.restore_pending(&db) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        crate::constants::SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+        let outcome = rx.recv_timeout(std::time::Duration::from_secs(10));
+        crate::constants::SHUTDOWN_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        match outcome {
+            Ok(Err(msg)) => assert!(msg.contains("shutdown"), "unexpected error: {msg}"),
+            Ok(Ok(())) => panic!("a rebuild waiting on restore must not succeed"),
+            Err(_) => {
+                panic!("rebuild still parked in the restore wait 10s after shutdown was requested")
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn runtime_teardown_finishes_a_restore_parked_blocking_task_within_grace() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.spawn_blocking(|| {
+            while super::sleep_unless_shutdown(std::time::Duration::from_secs(60)) {}
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        crate::constants::SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        runtime.shutdown_timeout(std::time::Duration::from_secs(
+            crate::constants::RUNTIME_SHUTDOWN_GRACE_SECS,
+        ));
+        let elapsed = started.elapsed();
+        crate::constants::SHUTDOWN_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(crate::constants::RUNTIME_SHUTDOWN_GRACE_SECS),
+            "teardown waited out the full grace ({elapsed:?}): the restore wait did not observe shutdown"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn lazy_find_refs_pending_persists_warning_and_caches_nothing() {
+        use super::SymbolIndexer as _;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("db");
+        std::fs::write(dir.path().join("FakeSolution.sln"), "").unwrap();
+        let key = "csharp Ns . V#Validate().";
+        {
+            let env = crate::symbols::get_shared_scip_env(&db).unwrap();
+            let mut wtxn = env.write_txn().unwrap();
+            let symbols: Database<Str, Bytes> = env
+                .open_database(&wtxn, Some(SCIP_DB_NAME))
+                .unwrap()
+                .unwrap();
+            symbols
+                .put(
+                    &mut wtxn,
+                    key,
+                    &serialize_refs(&[StoredReference {
+                        file: PathBuf::from("src/v.cs"),
+                        start_line: 1,
+                        end_line: 1,
+                        kind: "definition".into(),
+                    }])
+                    .unwrap(),
+                )
+                .unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        let (_helper, _guard) = fake_helper_always_pending(dir.path());
+        let indexer = CSharpSymbolIndexer::new();
+        let refs = indexer.find_references_for_key(&db, key).unwrap();
+
+        // Definitions survive (the previous index stays live)...
+        assert!(
+            refs.iter()
+                .all(|r| r.kind == "definition" && r.file == Path::new("src/v.cs")),
+            "only the stored definition may answer, got {refs:?}"
+        );
+        // ...the honesty warning is persisted on the per-symbol channel...
+        let warnings = indexer.lookup_warnings(&db, key);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "the pending warning must be persisted, got {warnings:?}"
+        );
+        assert!(warnings[0].contains("restore in progress"));
+        // ...and NOTHING is cached: the next lookup after restore finishes
+        // must miss the cache and resolve properly.
+        let env = crate::symbols::get_shared_scip_env(&db).unwrap();
+        let rtxn = env.read_txn().unwrap();
+        let cache: Database<Str, Bytes> = env
+            .open_database(&rtxn, Some(SCIP_REF_CACHE_DB_NAME))
+            .unwrap()
+            .unwrap();
+        assert!(
+            cache.get(&rtxn, key).unwrap().is_none(),
+            "a pending find-refs must not write the ref cache"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rebuild_non_pending_failure_mid_retry_clears_the_pending_flag() {
+        use super::SymbolIndexer as _;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("db");
+        std::fs::write(dir.path().join("FakeSolution.sln"), "").unwrap();
+        let flag_path = dir.path().join("pend-flag");
+
+        let helper_dir = dir.path().join("helper");
+        std::fs::create_dir(&helper_dir).unwrap();
+        let helper = build_fake_csharp_helper(&helper_dir);
+        let _guard = crate::testing::EnvRestore::set(&[
+            (HELPER_ENV_VAR, helper.to_string_lossy().as_ref()),
+            ("CS_FAKE_HELPER_MODE", "pend-then-fail"),
+            ("CS_FAKE_PEND_FLAG", flag_path.to_string_lossy().as_ref()),
+            (crate::constants::SCIP_RESTORE_RETRY_INTERVAL_SECS_ENV, "1"),
+        ]);
+
+        let indexer = CSharpSymbolIndexer::new();
+        let err = indexer
+            .rebuild(dir.path(), &db, RebuildScope::Full)
+            .unwrap_err();
+
+        // Attempt 1 pends (flag set), attempt 2 fails generically: the
+        // surfaced error is the generic one (never the typed pending
+        // outcome) and the flag must not outlive the loop that set it.
+        assert!(
+            !is_restore_pending(&err),
+            "the generic failure must surface, got: {err:#}"
+        );
+        assert!(
+            !indexer.restore_pending(&db),
+            "the pending flag must be cleared when the retry loop ends on a non-pending failure"
         );
     }
 }

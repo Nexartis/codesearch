@@ -319,6 +319,27 @@ impl FastEmbedder {
         model_type: ModelType,
         cache_dir: Option<&std::path::Path>,
     ) -> Result<Self> {
+        Self::init(model_type, cache_dir, false)
+    }
+
+    /// Create a new embedder with the fastembed download progress bar visible.
+    ///
+    /// Only `codesearch setup` wants this: it downloads hundreds of MB on
+    /// purpose, and a silent run looks like a hang. Runtime paths keep the
+    /// bar off so it does not corrupt TUI/serve output.
+    pub fn with_cache_dir_progress(
+        model_type: ModelType,
+        cache_dir: Option<&std::path::Path>,
+        show_download_progress: bool,
+    ) -> Result<Self> {
+        Self::init(model_type, cache_dir, show_download_progress)
+    }
+
+    fn init(
+        model_type: ModelType,
+        cache_dir: Option<&std::path::Path>,
+        show_download_progress: bool,
+    ) -> Result<Self> {
         // Set cache directory via environment variable if provided
         // Note: fastembed library uses FASTEMBED_CACHE_DIR (not FASTEMBED_CACHE_PATH)
         if let Some(cache_dir) = cache_dir {
@@ -332,31 +353,50 @@ impl FastEmbedder {
         // Arena allocator provides fast memory reuse during inference.
         let cpu_ep = CPU::default().with_arena_allocator(true).build();
 
-        let model = TextEmbedding::try_new(
-            TextInitOptions::new(model_type.to_fastembed_model())
-                .with_show_download_progress(false)
-                .with_execution_providers(vec![cpu_ep]),
-        )
-        .map_err(|e| anyhow!("Failed to initialize embedding model: {}", e))?;
+        let options = TextInitOptions::new(model_type.to_fastembed_model())
+            .with_show_download_progress(show_download_progress)
+            .with_execution_providers(vec![cpu_ep]);
+
+        // Cap ONNX intra-op threads when CODESEARCH_EMBED_THREADS is set.
+        // Unset leaves fastembed/ONNX Runtime at its default (all cores): one
+        // inference alone can saturate a large machine, which starves every
+        // other task on a shared box. See `crate::limits`.
+        let options = match crate::limits::embed_threads() {
+            Some(threads) => options.with_intra_threads(threads),
+            None => options,
+        };
+
+        let model = TextEmbedding::try_new(options)
+            .map_err(|e| anyhow!("Failed to initialize embedding model: {}", e))?;
 
         Ok(Self { model, model_type })
     }
-    /// Embed a batch of texts (processes in mini-batches to avoid OOM)
-    /// Uses adaptive batch size based on model dimensions
-    /// Can be overridden with CODESEARCH_BATCH_SIZE environment variable
-    pub fn embed_batch(&mut self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+    /// Mini-batch size for a single ONNX `embed` call: `CODESEARCH_BATCH_SIZE`
+    /// when set, otherwise adaptive by model dimensions.
+    ///
+    /// Shared by [`Self::embed_batch`] and the serve pool's interleaved batch
+    /// loop (`EmbeddingServicePool::embed_chunks_yielding`), so both agree on
+    /// how long one ONNX call (and therefore one lock acquisition) lasts.
+    pub fn effective_batch_size(model_type: ModelType) -> usize {
         // Check for env var override (tune with CODESEARCH_BATCH_SIZE=N)
-        let batch_size = if let Ok(env_size) = std::env::var("CODESEARCH_BATCH_SIZE") {
+        if let Ok(env_size) = std::env::var("CODESEARCH_BATCH_SIZE") {
             env_size.parse().unwrap_or(256)
         } else {
             // Adaptive batch size: without arena allocator, ONNX frees buffers after each batch
             // so larger batches are faster without accumulating memory.
-            match self.model_type.dimensions() {
+            match model_type.dimensions() {
                 d if d <= 384 => 256, // Small models (MiniLM etc.)
                 d if d <= 768 => 128, // Medium models (BGE-base, Jina etc.)
                 _ => 64,              // Large models (BGE-large, MxBai etc.)
             }
-        };
+        }
+    }
+
+    /// Embed a batch of texts (processes in mini-batches to avoid OOM)
+    /// Uses adaptive batch size based on model dimensions
+    /// Can be overridden with CODESEARCH_BATCH_SIZE environment variable
+    pub fn embed_batch(&mut self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+        let batch_size = Self::effective_batch_size(self.model_type);
         self.embed_batch_chunked(texts, batch_size)
     }
 

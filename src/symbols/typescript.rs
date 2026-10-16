@@ -611,6 +611,7 @@ impl SymbolIndexer for TypeScriptSymbolIndexer {
             symbols_indexed: total_symbols,
             references_stored: total_refs,
             duration_ms,
+            index_warnings: Vec::new(),
         })
     }
 
@@ -777,6 +778,10 @@ impl SymbolIndexer for TypeScriptSymbolIndexer {
     /// TypeScript adapter is only applicable when a top-level `tsconfig.json` exists.
     fn applies_to(&self, repo_path: &Path) -> bool {
         Self::find_tsconfig(repo_path).is_some()
+    }
+
+    fn applicability_hint(&self) -> &'static str {
+        "the scip-typescript adapter requires a top-level tsconfig.json (monorepo layouts are not resolved yet)"
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

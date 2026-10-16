@@ -45,20 +45,49 @@ use super::Result;
 /// POST-/reindex paths. Without `Started`, a watcher-triggered rebuild only
 /// ever reported its terminal state, so the C#-specific indicator never showed
 /// "Indexing" while the (35–84s) rebuild was actually running.
+#[derive(Debug, PartialEq)]
 pub enum SymbolRebuildSignal {
     /// A rebuild is about to run (helper available and project applies).
     Started,
-    /// Rebuild finished successfully.
-    Succeeded,
+    /// Rebuild finished successfully. Carries the index-level warnings the
+    /// rebuild survived (empty = clean) so the serve layer can render a
+    /// degraded index red instead of green — the watcher path is the common
+    /// path during active development, and a green indicator on an index
+    /// with missing cross-project references reads as "safe".
+    Succeeded { index_warnings: Vec<String> },
     /// Rebuild failed with the given message.
     Failed(String),
+    /// Rebuild was abandoned because `dotnet restore` never finished within
+    /// the retry cap: LMDB untouched, the previous index stays live. NOT a
+    /// failure — the serve layer renders a warning (yellow C#⚠), not a red
+    /// error.
+    Abandoned(String),
+}
+
+/// Terminal signal for a grouped incremental rebuild: a real failure
+/// (`last_error`) wins over an abandonment (`last_abandon`), which wins over
+/// success. Pure so the ordering is table-testable — the watcher-path
+/// counterpart of the serve layer's `classify_symbol_rebuild_failure`.
+pub(crate) fn grouped_rebuild_signal(
+    last_error: Option<String>,
+    last_abandon: Option<String>,
+    index_warnings: Vec<String>,
+) -> SymbolRebuildSignal {
+    if let Some(msg) = last_error {
+        SymbolRebuildSignal::Failed(msg)
+    } else if let Some(msg) = last_abandon {
+        SymbolRebuildSignal::Abandoned(msg)
+    } else {
+        SymbolRebuildSignal::Succeeded { index_warnings }
+    }
 }
 
 /// Callback invoked around each watcher-triggered C# symbol rebuild.
 ///
 /// Called with [`SymbolRebuildSignal::Started`] just before the rebuild runs,
-/// then exactly once more with [`SymbolRebuildSignal::Succeeded`] or
-/// [`SymbolRebuildSignal::Failed`] when it finishes.
+/// then exactly once more with [`SymbolRebuildSignal::Succeeded`],
+/// [`SymbolRebuildSignal::Failed`] or [`SymbolRebuildSignal::Abandoned`] when
+/// it finishes.
 ///
 /// The serve layer uses this to update `csharp_index_status` / `csharp_index_error`
 /// without coupling `IndexManager` to `ServeState`.
@@ -200,9 +229,76 @@ pub struct SharedStores {
     /// Counter for number of file changes processed (indexed + removed) since serve start.
     /// Incremented by FSW batches and incremental refreshes. Read by TUI/dashboard.
     pub changes_count: std::sync::atomic::AtomicU64,
+    /// Process-wide heavy-job gate. `Some` in serve mode (attached by
+    /// `ServeState::try_open_stores`), `None` in standalone CLI/MCP processes.
+    /// Every whole-repo refresh/reindex/build takes one permit from it; see
+    /// [`crate::limits`].
+    pub job_gate: Option<Arc<crate::limits::JobGate>>,
 }
 
+/// Mark the database directory hidden on Windows (the ".git" convention):
+/// the Search indexer skips hidden directories, and its scanner holding a
+/// freshly created Tantivy segment file is exactly the transient commit
+/// race [`IndexManager::force_reindex_with_stores`] retries around.
+/// Best-effort and idempotent — a missing or failing attrib never blocks
+/// indexing.
+#[cfg(windows)]
+fn hide_db_dir_on_windows(db_path: &Path) {
+    let _ = std::process::Command::new("attrib")
+        .arg("+H")
+        .arg(db_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+#[cfg(not(windows))]
+fn hide_db_dir_on_windows(_db_path: &Path) {}
+
 impl SharedStores {
+    /// Attach a process-wide heavy-job gate to these stores (serve mode).
+    pub fn with_job_gate(mut self, gate: Arc<crate::limits::JobGate>) -> Self {
+        self.job_gate = Some(gate);
+        self
+    }
+
+    /// Acquire one heavy-job permit, or `None` when no gate is attached
+    /// (standalone processes keep their previous unbounded behaviour).
+    ///
+    /// Hold the returned permit for the whole job: that is what bounds how
+    /// many repos chunk/embed/build at once. Queries never take this permit.
+    pub async fn acquire_job_permit(&self) -> Option<crate::limits::JobPermit> {
+        match self.job_gate.as_ref() {
+            Some(gate) => Some(gate.acquire().await),
+            None => None,
+        }
+    }
+
+    /// Cancellation-aware variant of [`Self::acquire_job_permit`].
+    ///
+    /// Returns [`crate::limits::JobAcquire::Cancelled`] when `cancel_token`
+    /// fires (or already fired) before a slot is granted, so the caller can
+    /// abort the job promptly and release its stores instead of parking on
+    /// the gate for the permit holder's whole run.
+    pub async fn acquire_job_permit_or_cancel(
+        &self,
+        cancel_token: &CancellationToken,
+    ) -> crate::limits::JobAcquire {
+        match self.job_gate.as_ref() {
+            Some(gate) => match gate.acquire_or_cancel(cancel_token).await {
+                Some(permit) => crate::limits::JobAcquire::Ready(Some(permit)),
+                None => crate::limits::JobAcquire::Cancelled,
+            },
+            None => {
+                if cancel_token.is_cancelled() {
+                    crate::limits::JobAcquire::Cancelled
+                } else {
+                    crate::limits::JobAcquire::Ready(None)
+                }
+            }
+        }
+    }
+
     /// Create new shared stores from the database path (read-write mode).
     ///
     /// This acquires a writer lock. If another process already has the lock,
@@ -218,6 +314,13 @@ impl SharedStores {
         std::fs::create_dir_all(db_path).with_context(|| {
             format!("Failed to create database directory {}", db_path.display())
         })?;
+        // The dot in ".codesearch.db" means nothing to Windows: the Search
+        // indexer crawls the folder like any other, and its scanner holding
+        // a freshly created Tantivy segment file is exactly the transient
+        // commit race `force_reindex_with_stores` retries around. The
+        // indexer skips hidden directories (the ".git" convention), so mark
+        // the folder hidden — idempotent, best-effort.
+        hide_db_dir_on_windows(db_path);
 
         // Try to acquire writer lock
         let lock = acquire_writer_lock(db_path);
@@ -238,6 +341,7 @@ impl SharedStores {
             writer_lock: lock,
             readonly: false,
             changes_count: std::sync::atomic::AtomicU64::new(0),
+            job_gate: None,
         })
     }
 
@@ -257,6 +361,7 @@ impl SharedStores {
             writer_lock: None,
             readonly: true,
             changes_count: std::sync::atomic::AtomicU64::new(0),
+            job_gate: None,
         })
     }
 
@@ -321,6 +426,47 @@ fn is_ts_extension(path: &Path) -> bool {
     )
 }
 
+/// Returns true when `path` is a C# restore input (file NAME match,
+/// case-insensitive): its change invalidates NuGet restore state and drives
+/// a FULL C# symbol rebuild rather than the per-project incremental.
+fn is_csharp_restore_input(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| {
+            crate::constants::CSHARP_RESTORE_INPUT_FILES
+                .iter()
+                .any(|f| name.eq_ignore_ascii_case(f))
+        })
+}
+
+/// Which symbol-rebuild debounce one watched file event feeds. Pure path
+/// decision shared by the modify/delete/rename FSW arms so the
+/// classification is table-testable without driving the async loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SymbolRebuildTrigger {
+    /// Per-project incremental (.cs) rebuild.
+    CSharpIncremental,
+    /// FULL solution rebuild: a restore-input change invalidates restore
+    /// state for every project at once (issue #225).
+    CSharpRestoreInput,
+    /// Full TypeScript rebuild (single tsconfig).
+    TypeScript,
+    /// Text-index only.
+    None,
+}
+
+fn classify_symbol_rebuild_event(path: &Path) -> SymbolRebuildTrigger {
+    if path.extension().and_then(|e| e.to_str()) == Some("cs") {
+        SymbolRebuildTrigger::CSharpIncremental
+    } else if is_csharp_restore_input(path) {
+        SymbolRebuildTrigger::CSharpRestoreInput
+    } else if is_ts_extension(path) {
+        SymbolRebuildTrigger::TypeScript
+    } else {
+        SymbolRebuildTrigger::None
+    }
+}
+
 /// Where an embed pass gets its `EmbeddingService`: the serve-wide pool
 /// (which already holds the persistent cache's LMDB env open) or a fresh
 /// service (CLI / standalone MCP, own process).
@@ -337,6 +483,18 @@ fn embed_service_choice(pool: Option<&Arc<EmbeddingServicePool>>) -> EmbeddingSo
         Some(p) => EmbeddingSource::Pool(Arc::clone(p)),
         None => EmbeddingSource::Fresh,
     }
+}
+
+/// True when the current refresh batch should stop accumulating files before
+/// reading the next one.
+///
+/// `consumed > 0` guarantees at least one file per batch, so a single file
+/// larger than `max_chunks` still makes progress; `max_chunks == 0` disables
+/// the cap entirely (the file-count batch size remains the only bound).
+/// Extracted as a pure predicate so its edges are unit-testable without
+/// loading ONNX.
+fn chunk_cap_reached(consumed: usize, accumulated_chunks: usize, max_chunks: usize) -> bool {
+    consumed > 0 && max_chunks > 0 && accumulated_chunks >= max_chunks
 }
 
 impl IndexManager {
@@ -601,6 +759,43 @@ impl IndexManager {
         embedding_pool: Option<&Arc<EmbeddingServicePool>>,
         heartbeat: Option<&IndexingHeartbeat>,
     ) -> Result<()> {
+        // Serialise this whole refresh behind the process-wide heavy-job gate
+        // (when one is attached): the permit is held across the file walk, the
+        // chunk/embed batches and the final HNSW build, so at most
+        // `CODESEARCH_INDEX_JOBS` repos do this at once. Queries never take it.
+        // Cancellation-aware: a queued job that was cancelled aborts here and
+        // drops its stores instead of parking for the holder's whole run.
+        let _job_permit = match stores.acquire_job_permit_or_cancel(cancel_token).await {
+            crate::limits::JobAcquire::Ready(permit) => permit,
+            crate::limits::JobAcquire::Cancelled => {
+                return Err(anyhow::anyhow!("indexing cancelled"));
+            }
+        };
+        Self::perform_incremental_refresh_inner(
+            codebase_path,
+            db_path,
+            stores,
+            cancel_token,
+            embedding_pool,
+            heartbeat,
+        )
+        .await
+    }
+
+    /// Gate-free body of [`Self::perform_incremental_refresh_with_stores`].
+    ///
+    /// Split out for `force_reindex_with_stores`, which holds the gate permit
+    /// across the destructive clear phase as well and must call this directly:
+    /// re-entering the public wrapper would re-acquire the gate and deadlock
+    /// under `CODESEARCH_INDEX_JOBS=1`.
+    async fn perform_incremental_refresh_inner(
+        codebase_path: &Path,
+        db_path: &Path,
+        stores: &SharedStores,
+        cancel_token: &CancellationToken,
+        embedding_pool: Option<&Arc<EmbeddingServicePool>>,
+        heartbeat: Option<&IndexingHeartbeat>,
+    ) -> Result<()> {
         use crate::cache::FileMetaStore;
         use crate::chunker::SemanticChunker;
         use crate::embed::EmbeddingService;
@@ -799,24 +994,43 @@ impl IndexManager {
         // sync. Batching bounds peak memory to O(batch), not O(total delta),
         // so a delta of any size is now safe — it just takes longer, spread
         // across sequential batches. See `INCREMENTAL_REFRESH_BATCH_SIZE`.
+        //
+        // A batch is additionally cut short once its accumulated chunks reach
+        // `CODESEARCH_MAX_CHUNKS_PER_BATCH` (when set): file count alone is a
+        // poor memory proxy when a few files can produce tens of thousands of
+        // chunks.
         if !changed_files.is_empty() {
             let batch_size = std::env::var(crate::constants::INCREMENTAL_REFRESH_BATCH_SIZE_ENV)
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
                 .filter(|&n| n > 0)
                 .unwrap_or(crate::constants::INCREMENTAL_REFRESH_BATCH_SIZE);
-            let total_batches = changed_files.len().div_ceil(batch_size);
+            let max_chunks = crate::limits::max_chunks_per_batch();
+            let embed_pause = crate::limits::embed_pause();
+            // Upper-bound estimate for the log line; the chunk cap can split
+            // this into more batches than the file count alone implies.
+            let estimated_batches = changed_files.len().div_ceil(batch_size);
             info!(
-                "🔄 Processing {} changed files in {} batch(es) of up to {} file(s) each...",
+                "🔄 Processing {} changed files in ~{} batch(es) of up to {} file(s) each \
+                 (chunk cap per batch: {})...",
                 changed_files.len(),
-                total_batches,
-                batch_size
+                estimated_batches,
+                batch_size,
+                if max_chunks == 0 {
+                    "none".to_string()
+                } else {
+                    max_chunks.to_string()
+                }
             );
 
             let cache_dir = crate::constants::get_global_models_cache_dir()?;
             let mut total_indexed = 0usize;
+            let mut cursor = 0usize;
+            let mut batch_idx = 0usize;
 
-            for (batch_idx, file_batch) in changed_files.chunks(batch_size).enumerate() {
+            while cursor < changed_files.len() {
+                let take = (changed_files.len() - cursor).min(batch_size);
+                let files_for_embed = changed_files[cursor..cursor + take].to_vec();
                 // Abort between batches if the repo was removed mid-index.
                 Self::ensure_indexing_active(cancel_token)?;
                 // A batch of a large delta can run for minutes — renew the
@@ -832,7 +1046,11 @@ impl IndexManager {
                 // so it never runs on a tokio worker thread. The `EmbeddingService`
                 // and `SemanticChunker` are built inside the closure because they
                 // are not needed on the async side and may not be `Send`.
-                let files_for_embed = file_batch.to_vec();
+                //
+                // The closure consumes as many of the offered files as fit the
+                // chunk cap (always at least one, so every iteration makes
+                // progress) and reports how many it took, so the outer loop's
+                // bookkeeping covers exactly the files that were processed.
                 let cache_dir_for_batch = cache_dir.clone();
                 let root_for_batch = codebase_path.to_path_buf();
                 // Clone the token into the blocking closure so a cancel arriving
@@ -840,18 +1058,30 @@ impl IndexManager {
                 // per-file, not only once the whole batch returns.
                 let batch_cancel = cancel_token.clone();
                 let embed_source = embed_service_choice(embedding_pool);
-                let embedded_chunks = tokio::task::spawn_blocking(
-                    move || -> Result<Vec<crate::embed::EmbeddedChunk>> {
+                let (embedded_chunks, consumed) = tokio::task::spawn_blocking(
+                    move || -> Result<(Vec<crate::embed::EmbeddedChunk>, usize)> {
                         let mut chunker = SemanticChunker::new(100, 2000, 10);
                         let mut all_chunks = Vec::new();
+                        let mut consumed = 0usize;
 
                         for file in &files_for_embed {
+                            // Stop once this batch has reached its chunk budget.
+                            // `consumed > 0` guarantees at least one file per
+                            // iteration even if that one file alone exceeds the
+                            // cap, so the outer loop always advances.
+                            if chunk_cap_reached(consumed, all_chunks.len(), max_chunks) {
+                                break;
+                            }
                             // Mid-embed cancellation point: abort inside the
                             // spawn_blocking task so we stop reading/chunking/
                             // embedding further files in this batch promptly.
                             if batch_cancel.is_cancelled() {
                                 return Err(anyhow::anyhow!("indexing cancelled"));
                             }
+                            // Count the file before the read: a read failure
+                            // still advances the outer cursor, so the loop can
+                            // never stall on an unreadable file.
+                            consumed += 1;
                             let content = match std::fs::read_to_string(&file.path) {
                                 Ok(c) => c,
                                 Err(_) => continue,
@@ -867,53 +1097,45 @@ impl IndexManager {
                         }
 
                         if all_chunks.is_empty() {
-                            return Ok(Vec::new());
+                            return Ok((Vec::new(), consumed));
                         }
 
-                        // NOTE: embed_chunks runs a single ONNX inference over
-                        // the whole batch atomically, so it is not interruptible
-                        // mid-call. Worst-case cancel latency is bounded to one
-                        // batch's embed (INCREMENTAL_REFRESH_BATCH_SIZE=200
-                        // files); the per-file check above bounds the read/chunk
-                        // phase that precedes it.
-                        match embed_source {
-                            // Serve process: the pool already holds the
-                            // persistent cache's LMDB env open — a fresh
-                            // EmbeddingService here is refused by the
-                            // process-global registry and would re-embed
-                            // everything without cache.
+                        // Serve process: the pool already holds the persistent
+                        // cache's LMDB env open — a fresh `EmbeddingService`
+                        // here is refused by the process-global registry and
+                        // would re-embed everything without cache.
+                        //
+                        // `embed_chunks_yielding` holds the per-model lock for
+                        // one ONNX mini-batch at a time (plus the configured
+                        // pause), so an interactive query embedding is not stuck
+                        // behind this whole file batch.
+                        let embedded = match embed_source {
                             EmbeddingSource::Pool(pool) => {
-                                let service = pool.get(embed_model)?;
-                                // Recover from poisoning: a panicked embed
-                                // service still yields a valid guard (the
-                                // batch's embed_chunks result is what carries
-                                // correctness); a poison here must not
-                                // hard-fail every later batch for the
-                                // process lifetime.
-                                let mut guard = service
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                guard.embed_chunks(all_chunks)
+                                pool.embed_chunks_yielding(embed_model, all_chunks, embed_pause)?
                             }
                             EmbeddingSource::Fresh => {
                                 let mut embedding_service = EmbeddingService::with_cache_dir(
                                     embed_model,
                                     Some(cache_dir_for_batch.as_path()),
                                 )?;
-                                embedding_service.embed_chunks(all_chunks)
+                                embedding_service.embed_chunks(all_chunks)?
                             }
-                        }
+                        };
+                        Ok((embedded, consumed))
                     },
                 )
                 .await
                 .map_err(|e| {
-                    anyhow::anyhow!(
-                        "chunk+embed task panicked (batch {}/{}): {}",
-                        batch_idx + 1,
-                        total_batches,
-                        e
-                    )
+                    anyhow::anyhow!("chunk+embed task panicked (batch {}): {}", batch_idx + 1, e)
                 })??;
+
+                // The closure always consumes at least one file; guard the
+                // cursor arithmetic against a future regression that would
+                // otherwise spin forever.
+                debug_assert!(consumed > 0, "refresh batch made no progress");
+                let file_batch = &changed_files[cursor..cursor + consumed];
+                cursor += consumed;
+                batch_idx += 1;
 
                 // A cancel arriving after embed completed but before we commit
                 // the batch to the stores must skip the insert + the final
@@ -922,9 +1144,8 @@ impl IndexManager {
 
                 if !embedded_chunks.is_empty() {
                     info!(
-                        "📦 Batch {}/{}: embedding {} chunks with model {}...",
-                        batch_idx + 1,
-                        total_batches,
+                        "📦 Batch {}: embedding {} chunks with model {}...",
+                        batch_idx,
                         embedded_chunks.len(),
                         embed_model.short_name()
                     );
@@ -990,6 +1211,12 @@ impl IndexManager {
                         file_meta_store.update_file(&file.path, &key, vec![])?;
                     }
                 }
+
+                // Persist per batch: vector and FTS already commit per batch,
+                // so the meta must follow or a crash/restart mid-pass leaves
+                // meta empty while chunks exist — the next open then wipes
+                // the whole store (the B1 guard) and re-embeds everything.
+                file_meta_store.save(db_path)?;
             }
 
             // Build the HNSW index once, after every batch has been inserted.
@@ -1007,7 +1234,7 @@ impl IndexManager {
 
             info!(
                 "✅ Indexed {} chunks across {} batch(es)",
-                total_indexed, total_batches
+                total_indexed, batch_idx
             );
         }
 
@@ -1063,7 +1290,72 @@ impl IndexManager {
     /// 2. Reindexes every file from scratch using the existing store handles
     ///
     /// No files are deleted, so there is no OS error 32 (file in use).
+    ///
+    /// A failure of the transient Windows FTS commit race (an indexer holds
+    /// a freshly created Tantivy segment file while the commit opens it —
+    /// os error 5/32/33) redrives the WHOLE pass, backing off 5s then 20s:
+    /// a full pass is idempotent (clear + rebuild), while a commit retry on
+    /// the same writer is never safe (a half-joined pipeline must not be
+    /// recommitted — see `FtsStore::commit_once`). Field incidents died on
+    /// a single 5s redrive while the AV still held the file; the second,
+    /// longer backoff covers that window.
     pub async fn force_reindex_with_stores(
+        codebase_path: &Path,
+        db_path: &Path,
+        stores: &SharedStores,
+        model_override: Option<ModelType>,
+        cancel_token: &CancellationToken,
+        embedding_pool: Option<&Arc<EmbeddingServicePool>>,
+    ) -> Result<()> {
+        const FTS_TRANSIENT_BACKOFFS: [std::time::Duration; 2] = [
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(20),
+        ];
+        Self::retry_on_transient_fts(&FTS_TRANSIENT_BACKOFFS, || async {
+            Self::force_reindex_with_stores_once(
+                codebase_path,
+                db_path,
+                stores,
+                model_override,
+                cancel_token,
+                embedding_pool,
+            )
+            .await
+        })
+        .await
+    }
+
+    /// Redrive `attempt` on the transient Windows FTS commit race, one extra
+    /// pass per entry in `backoffs`. Any other error (and a transient failure
+    /// that outlives the last backoff) is returned untouched — bounded, never
+    /// a loop.
+    pub(crate) async fn retry_on_transient_fts<T, Fut, F>(
+        backoffs: &[std::time::Duration],
+        mut attempt: F,
+    ) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        for backoff in backoffs {
+            match attempt().await {
+                Ok(v) => return Ok(v),
+                Err(e)
+                    if crate::fts::FtsStore::is_transient_fts_commit_error(&format!("{e:#}")) =>
+                {
+                    warn!(
+                        "Transient FTS commit failure ({e:#}) — redriving the full pass in {}s",
+                        backoff.as_secs().max(1)
+                    );
+                    tokio::time::sleep(*backoff).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        attempt().await
+    }
+
+    async fn force_reindex_with_stores_once(
         codebase_path: &Path,
         db_path: &Path,
         stores: &SharedStores,
@@ -1077,6 +1369,22 @@ impl IndexManager {
         info!("🔄 Force reindex: clearing all store data in-place...");
 
         // Bail before clearing any store data if the repo was already removed.
+        Self::ensure_indexing_active(cancel_token)?;
+
+        // Hold the process-wide heavy-job gate across the destructive clear AND
+        // the full reindex. The nested call goes to the gate-free inner body so
+        // the permit is not re-acquired (which would deadlock under
+        // `CODESEARCH_INDEX_JOBS=1`). The wait is cancellation-aware so a repo
+        // removed while queued aborts before the destructive clear.
+        let _job_permit = match stores.acquire_job_permit_or_cancel(cancel_token).await {
+            crate::limits::JobAcquire::Ready(permit) => permit,
+            crate::limits::JobAcquire::Cancelled => {
+                return Err(anyhow::anyhow!("indexing cancelled"));
+            }
+        };
+        // Re-check after the (possibly long) wait: a cancellation that landed
+        // while queued must not start the clear, and the stores are still
+        // intact at this point.
         Self::ensure_indexing_active(cancel_token)?;
 
         // ── Step 0: Read and preserve metadata BEFORE clearing anything ──
@@ -1187,7 +1495,7 @@ impl IndexManager {
         info!("✅ Stores cleared, metadata preserved. Starting full reindex...");
 
         // ── Step 5: Reindex — all files treated as "changed" since metadata is empty ──
-        Self::perform_incremental_refresh_with_stores(
+        Self::perform_incremental_refresh_inner(
             codebase_path,
             db_path,
             stores,
@@ -1228,6 +1536,9 @@ impl IndexManager {
     /// indicator (`Started`/`Succeeded`/`Failed`). Non-applicable languages
     /// (no `.sln` / no `tsconfig.json`) or an unavailable helper are skipped
     /// without touching any status — mirroring the debounce path.
+    ///
+    /// Serializes with the other two C# rebuild tasks via the shared `rebuild_guard`.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_branch_change_symbol_rebuild(
         symbol_registry: Arc<SymbolIndexerRegistry>,
         repo_path: PathBuf,
@@ -1236,8 +1547,12 @@ impl IndexManager {
         csharp_notifier: Option<CSharpRebuildNotifier>,
         indexing_cb: Option<IndexingStatusCallback>,
         cancel_token: CancellationToken,
-    ) {
+        rebuild_guard: Arc<std::sync::Mutex<()>>,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::task::spawn_blocking(move || {
+            // Two rebuilds on one LMDB db must not overlap.
+            let _rebuild_guard = rebuild_guard.lock().unwrap_or_else(|p| p.into_inner());
+
             // Resolve applicable + available indexers up front so we only toggle
             // the "Indexing" label when there is real work to do.
             let csharp = symbol_registry
@@ -1306,7 +1621,7 @@ impl IndexManager {
             if let Some(ref cb) = indexing_cb {
                 cb(false);
             }
-        });
+        })
     }
 
     /// Run a `RebuildScope::Full` rebuild for one language's indexer, log the
@@ -1338,7 +1653,21 @@ impl IndexManager {
                     summary.duration_ms
                 );
                 if let Some(n) = notifier {
-                    n(SymbolRebuildSignal::Succeeded);
+                    n(SymbolRebuildSignal::Succeeded {
+                        index_warnings: summary.index_warnings.clone(),
+                    });
+                }
+            }
+            Err(e) if crate::symbols::csharp::is_restore_exhausted(&e) => {
+                // Restore never finished within the retry cap: the previous
+                // index stays live, so this is a warning, never a red error.
+                warn!(
+                    "⚠️ [{}] {} symbol rebuild abandoned — dotnet restore did not finish, \
+                     previous index stays live: {:#}",
+                    repo_label, lang_label, e
+                );
+                if let Some(n) = notifier {
+                    n(SymbolRebuildSignal::Abandoned(format!("{e:#}")));
                 }
             }
             Err(e) => {
@@ -1444,6 +1773,14 @@ impl IndexManager {
             let mut cs_files_deleted: HashSet<PathBuf> = HashSet::new();
             let mut cs_last_event_time: Option<std::time::Instant> = None;
             let cs_debounce = std::time::Duration::from_millis(SCIP_CSHARP_DEBOUNCE_MS);
+            // C# restore inputs (Directory.Packages.props, NuGet.config, ...)
+            // use the same debounce length but their OWN timer: a CPM bump
+            // invalidates the whole solution's restore state, so the flush is
+            // a FULL rebuild, not the per-project incremental (issue #225).
+            let mut restore_inputs_changed = false;
+            let mut restore_input_last_event_time: Option<std::time::Instant> = None;
+            // Serializes the detached symbol rebuild tasks (incremental, restore-input full, branch-change full).
+            let symbol_rebuild_guard = Arc::new(std::sync::Mutex::new(()));
 
             // Symbol indexer debounce: .ts/.tsx/.mts/.cts files are buffered separately
             // and flushed after SCIP_TYPESCRIPT_DEBOUNCE_MS of quiet time. Unlike C#'s
@@ -1511,7 +1848,7 @@ impl IndexManager {
                             // Trigger a fire-and-forget FULL symbol rebuild for every
                             // language that applies, so `find_impact` reflects the new
                             // branch instead of silently serving stale references.
-                            Self::spawn_branch_change_symbol_rebuild(
+                            drop(Self::spawn_branch_change_symbol_rebuild(
                                 symbol_registry.clone(),
                                 path.clone(),
                                 db_path.clone(),
@@ -1519,7 +1856,8 @@ impl IndexManager {
                                 csharp_notifier.clone(),
                                 indexing_cb.clone(),
                                 cancel_token.clone(),
-                            );
+                                symbol_rebuild_guard.clone(),
+                            ));
                         }
                     }
                 }
@@ -1553,33 +1891,52 @@ impl IndexManager {
                                 // If file was marked for removal, cancel that
                                 files_to_remove.remove(&p);
                                 files_to_index.insert(p.clone());
-                                // Track .cs file modifications for symbol rebuild debounce
-                                if p.extension().and_then(|e| e.to_str()) == Some("cs") {
-                                    // If previously queued as deleted, promote to modified
-                                    cs_files_deleted.remove(&p);
-                                    cs_files_modified.insert(p);
-                                    cs_last_event_time = Some(now);
-                                } else if is_ts_extension(&p) {
-                                    ts_files_deleted.remove(&p);
-                                    ts_files_modified.insert(p);
-                                    ts_last_event_time = Some(now);
+                                // Track modifications for the symbol rebuild debounces
+                                match classify_symbol_rebuild_event(&p) {
+                                    SymbolRebuildTrigger::CSharpIncremental => {
+                                        // If previously queued as deleted, promote to modified
+                                        cs_files_deleted.remove(&p);
+                                        cs_files_modified.insert(p);
+                                        cs_last_event_time = Some(now);
+                                    }
+                                    SymbolRebuildTrigger::CSharpRestoreInput => {
+                                        restore_inputs_changed = true;
+                                        restore_input_last_event_time = Some(now);
+                                    }
+                                    SymbolRebuildTrigger::TypeScript => {
+                                        ts_files_deleted.remove(&p);
+                                        ts_files_modified.insert(p);
+                                        ts_last_event_time = Some(now);
+                                    }
+                                    SymbolRebuildTrigger::None => {}
                                 }
                             }
                             FileEvent::Deleted(p) => {
                                 // If file was marked for indexing, cancel that
                                 files_to_index.remove(&p);
                                 files_to_remove.insert(p.clone());
-                                // Track .cs deletions separately — the symbol rebuilder
-                                // needs to explicitly purge LMDB entries for deleted files
-                                // since they won't appear in the new scip-csharp output.
-                                if p.extension().and_then(|e| e.to_str()) == Some("cs") {
-                                    cs_files_modified.remove(&p);
-                                    cs_files_deleted.insert(p);
-                                    cs_last_event_time = Some(now);
-                                } else if is_ts_extension(&p) {
-                                    ts_files_modified.remove(&p);
-                                    ts_files_deleted.insert(p);
-                                    ts_last_event_time = Some(now);
+                                // Track deletions per debounce — .cs deletions must
+                                // be passed explicitly to the incremental rebuild so
+                                // their LMDB entries are purged even though they're
+                                // absent from the new scip-csharp output.
+                                match classify_symbol_rebuild_event(&p) {
+                                    SymbolRebuildTrigger::CSharpIncremental => {
+                                        cs_files_modified.remove(&p);
+                                        cs_files_deleted.insert(p);
+                                        cs_last_event_time = Some(now);
+                                    }
+                                    SymbolRebuildTrigger::CSharpRestoreInput => {
+                                        // A deleted restore input changes restore
+                                        // semantics just as much as an edited one.
+                                        restore_inputs_changed = true;
+                                        restore_input_last_event_time = Some(now);
+                                    }
+                                    SymbolRebuildTrigger::TypeScript => {
+                                        ts_files_modified.remove(&p);
+                                        ts_files_deleted.insert(p);
+                                        ts_last_event_time = Some(now);
+                                    }
+                                    SymbolRebuildTrigger::None => {}
                                 }
                             }
                             FileEvent::Renamed(old_p, new_p) => {
@@ -1588,37 +1945,43 @@ impl IndexManager {
                                 files_to_remove.insert(old_p.clone());
                                 files_to_remove.remove(&new_p);
                                 files_to_index.insert(new_p.clone());
-                                // Track .cs renames: old path is a deletion, new path is a modification
-                                let old_is_cs =
-                                    old_p.extension().and_then(|e| e.to_str()) == Some("cs");
-                                let new_is_cs =
-                                    new_p.extension().and_then(|e| e.to_str()) == Some("cs");
-                                if old_is_cs || new_is_cs {
-                                    if old_is_cs {
+                                // A rename is a deletion of the old path and a
+                                // modification of the new one; each side feeds its
+                                // own debounce independently (a .cs → restore-input
+                                // rename must trip both).
+                                match classify_symbol_rebuild_event(&old_p) {
+                                    SymbolRebuildTrigger::CSharpIncremental => {
                                         cs_files_modified.remove(&old_p);
                                         cs_files_deleted.insert(old_p);
+                                        cs_last_event_time = Some(now);
                                     }
-                                    if new_is_cs {
-                                        cs_files_deleted.remove(&new_p);
-                                        cs_files_modified.insert(new_p);
+                                    SymbolRebuildTrigger::CSharpRestoreInput => {
+                                        restore_inputs_changed = true;
+                                        restore_input_last_event_time = Some(now);
                                     }
-                                    cs_last_event_time = Some(now);
-                                } else {
-                                    // Track .ts/.tsx/.mts/.cts renames: old path is a
-                                    // deletion, new path is a modification.
-                                    let old_is_ts = is_ts_extension(&old_p);
-                                    let new_is_ts = is_ts_extension(&new_p);
-                                    if old_is_ts || new_is_ts {
-                                        if old_is_ts {
-                                            ts_files_modified.remove(&old_p);
-                                            ts_files_deleted.insert(old_p);
-                                        }
-                                        if new_is_ts {
-                                            ts_files_deleted.remove(&new_p);
-                                            ts_files_modified.insert(new_p);
-                                        }
+                                    SymbolRebuildTrigger::TypeScript => {
+                                        ts_files_modified.remove(&old_p);
+                                        ts_files_deleted.insert(old_p);
                                         ts_last_event_time = Some(now);
                                     }
+                                    SymbolRebuildTrigger::None => {}
+                                }
+                                match classify_symbol_rebuild_event(&new_p) {
+                                    SymbolRebuildTrigger::CSharpIncremental => {
+                                        cs_files_deleted.remove(&new_p);
+                                        cs_files_modified.insert(new_p);
+                                        cs_last_event_time = Some(now);
+                                    }
+                                    SymbolRebuildTrigger::CSharpRestoreInput => {
+                                        restore_inputs_changed = true;
+                                        restore_input_last_event_time = Some(now);
+                                    }
+                                    SymbolRebuildTrigger::TypeScript => {
+                                        ts_files_deleted.remove(&new_p);
+                                        ts_files_modified.insert(new_p);
+                                        ts_last_event_time = Some(now);
+                                    }
+                                    SymbolRebuildTrigger::None => {}
                                 }
                             }
                         }
@@ -1710,7 +2073,11 @@ impl IndexManager {
                             // separate from the text-index callback used for
                             // branch-change refreshes above.
                             let indexing_cb_scip = indexing_cb.clone();
+                            let guard = symbol_rebuild_guard.clone();
                             tokio::task::spawn_blocking(move || {
+                                // Two rebuilds on one LMDB db must not overlap.
+                                let _rebuild_guard =
+                                    guard.lock().unwrap_or_else(|p| p.into_inner());
                                 if let Some(indexer) = reg.get(LANG_CSHARP) {
                                     if !indexer.applies_to(&rp) {
                                         info!(
@@ -1786,6 +2153,14 @@ impl IndexManager {
                                     // cleaned up from LMDB regardless of origin project.
                                     let total_groups = groups.len();
                                     let mut last_error: Option<String> = None;
+                                    // Restore-exhausted groups land here instead:
+                                    // LMDB untouched, previous index stays live.
+                                    let mut last_abandon: Option<String> = None;
+                                    // Index-level warnings survived by any
+                                    // group's rebuild — deduped across groups
+                                    // (MSBuild repeats per project).
+                                    let mut index_warnings: Vec<String> = Vec::new();
+                                    let mut seen_warnings = std::collections::HashSet::new();
                                     for (i, (csproj, files)) in groups.into_iter().enumerate() {
                                         let csproj_name = csproj
                                             .file_name()
@@ -1806,6 +2181,11 @@ impl IndexManager {
                                         };
                                         match indexer.rebuild(&rp, &dp, scope) {
                                             Ok(summary) => {
+                                                for w in &summary.index_warnings {
+                                                    if seen_warnings.insert(w.clone()) {
+                                                        index_warnings.push(w.clone());
+                                                    }
+                                                }
                                                 if summary.symbols_indexed == 0 {
                                                     warn!(
                                                         "⚠️ [{}/{}] Symbol rebuild returned 0 symbols for '{}' — \
@@ -1830,25 +2210,120 @@ impl IndexManager {
                                                 // `{:#}` for the same reason as the
                                                 // full-rebuild path: the put context
                                                 // would otherwise hide the MDB_* code.
-                                                warn!(
-                                                    "⚠️ [{}/{}] Symbol rebuild failed ({}): {:#}",
-                                                    i + 1,
-                                                    total_groups,
-                                                    csproj_name,
-                                                    e
-                                                );
-                                                last_error = Some(format!("{e:#}"));
+                                                // A restore-exhausted group is an
+                                                // abandonment (previous index stays
+                                                // live), not a failure.
+                                                if crate::symbols::csharp::is_restore_exhausted(&e)
+                                                {
+                                                    warn!(
+                                                        "⚠️ [{}/{}] Symbol rebuild abandoned ({}): dotnet \
+                                                         restore did not finish — previous index stays live: {:#}",
+                                                        i + 1,
+                                                        total_groups,
+                                                        csproj_name,
+                                                        e
+                                                    );
+                                                    if last_abandon.is_none() {
+                                                        last_abandon = Some(format!("{e:#}"));
+                                                    }
+                                                } else {
+                                                    warn!(
+                                                        "⚠️ [{}/{}] Symbol rebuild failed ({}): {:#}",
+                                                        i + 1,
+                                                        total_groups,
+                                                        csproj_name,
+                                                        e
+                                                    );
+                                                    last_error = Some(format!("{e:#}"));
+                                                }
                                             }
                                         }
                                     }
-                                    // Notify serve layer about overall outcome
+                                    // Notify serve layer about overall outcome.
+                                    // A real failure wins over an abandonment:
+                                    // exhausted groups leave the previous index
+                                    // live (warning), but a genuine failure must
+                                    // still render red.
                                     if let Some(ref n) = notifier {
-                                        match last_error {
-                                            None => n(SymbolRebuildSignal::Succeeded),
-                                            Some(msg) => n(SymbolRebuildSignal::Failed(msg)),
-                                        }
+                                        n(grouped_rebuild_signal(
+                                            last_error,
+                                            last_abandon,
+                                            index_warnings,
+                                        ));
                                     }
                                     // Clear "Indexing" now that all groups are done
+                                    if let Some(ref cb) = indexing_cb_scip {
+                                        cb(false);
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+
+                // Flush the restore-input debounce: a changed/deleted
+                // Directory.Packages.props (or sibling) invalidates restore
+                // state for EVERY project at once, so the flush is a FULL
+                // solution rebuild — a per-project incremental would index
+                // mid-restore against stale assets (issue #225). The helper's
+                // own gate refuses to index while the triggered restore is
+                // still running; rebuild()'s retry loop waits it out.
+                if restore_inputs_changed {
+                    if let Some(restore_last) = restore_input_last_event_time {
+                        let elapsed = now.duration_since(restore_last);
+                        if elapsed >= cs_debounce {
+                            restore_inputs_changed = false;
+                            restore_input_last_event_time = None;
+
+                            info!(
+                                "🔬 [{}] C# restore input changed, triggering full symbol rebuild (after {}s debounce)",
+                                repo_label,
+                                cs_debounce.as_secs()
+                            );
+
+                            let reg = symbol_registry.clone();
+                            let rp = path.clone();
+                            let dp = db_path.clone();
+                            // Clone the repo label into the blocking task (the outer
+                            // binding is reused by later loop iterations).
+                            let repo_label = repo_label.clone();
+                            let notifier = csharp_notifier.clone();
+                            let indexing_cb_scip = indexing_cb.clone();
+                            let guard = symbol_rebuild_guard.clone();
+                            tokio::task::spawn_blocking(move || {
+                                // Two rebuilds on one LMDB db must not overlap.
+                                let _rebuild_guard =
+                                    guard.lock().unwrap_or_else(|p| p.into_inner());
+                                if let Some(indexer) = reg.get(LANG_CSHARP) {
+                                    if !indexer.applies_to(&rp) {
+                                        info!(
+                                            "🔬 [{}] symbol rebuild skipped: not applicable (no .sln)",
+                                            repo_label
+                                        );
+                                        return;
+                                    }
+                                    if !indexer.is_available() {
+                                        info!(
+                                            "🔬 [{}] symbol rebuild skipped: helper not available",
+                                            repo_label
+                                        );
+                                        return;
+                                    }
+                                    if let Some(ref cb) = indexing_cb_scip {
+                                        cb(true);
+                                    }
+                                    if let Some(ref n) = notifier {
+                                        n(SymbolRebuildSignal::Started);
+                                    }
+                                    Self::run_full_rebuild_logged(
+                                        indexer,
+                                        &rp,
+                                        &dp,
+                                        &repo_label,
+                                        "C#",
+                                        notifier.as_ref(),
+                                    );
+                                    // Clear "Indexing" regardless of outcome
                                     if let Some(ref cb) = indexing_cb_scip {
                                         cb(false);
                                     }
@@ -1969,6 +2444,16 @@ impl IndexManager {
 
         // Bail before touching any store if the repo was removed.
         Self::ensure_indexing_active(cancel_token)?;
+
+        // One permit for the whole watcher batch: a batch can hold hundreds of
+        // files, each re-embedded and followed by an HNSW rebuild, and every
+        // repo's watcher would otherwise run one at the same time.
+        let _job_permit = match stores.acquire_job_permit_or_cancel(cancel_token).await {
+            crate::limits::JobAcquire::Ready(permit) => permit,
+            crate::limits::JobAcquire::Cancelled => {
+                return Err(anyhow::anyhow!("indexing cancelled"));
+            }
+        };
 
         // Enable quiet mode during FSW batch processing to suppress verbose embedding output
         set_quiet(true);
@@ -2130,6 +2615,14 @@ impl IndexManager {
 
         // Abort before the filesystem walk if the repo was already removed.
         Self::ensure_indexing_active(cancel_token)?;
+
+        // One permit for the whole branch-refresh pass (walk, delete, re-index).
+        let _job_permit = match stores.acquire_job_permit_or_cancel(cancel_token).await {
+            crate::limits::JobAcquire::Ready(permit) => permit,
+            crate::limits::JobAcquire::Cancelled => {
+                return Err(anyhow::anyhow!("indexing cancelled"));
+            }
+        };
 
         let result: Result<()> = async {
             // Phase 1: Discover current files on disk.
@@ -2469,11 +2962,11 @@ impl IndexManager {
         // registry and would degrade this path to cache-less re-embedding.
         let embedded_chunks = match embed_service_choice(embedding_pool) {
             EmbeddingSource::Pool(pool) => {
-                let service = pool.get(embed_model)?;
-                let mut guard = service
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                guard.embed_chunks(chunks)?
+                // The FSW paths hold a job permit (`process_batch_with_stores`
+                // / `refresh_index_with_stores`); interleave the model lock per
+                // mini-batch so a concurrent query embedding is not stuck
+                // behind this file.
+                pool.embed_chunks_yielding(embed_model, chunks, std::time::Duration::ZERO)?
             }
             EmbeddingSource::Fresh => {
                 let cache_dir = crate::constants::get_global_models_cache_dir()?;
@@ -2645,6 +3138,115 @@ mod tests {
     use crate::cache::FileMetaStore;
     use tempfile::tempdir;
 
+    /// The watcher must classify every restore input by file NAME,
+    /// case-insensitively (NuGet honours lowercase nuget.config on
+    /// case-sensitive filesystems), and must not classify lookalikes.
+    #[test]
+    fn restore_input_classification_table() {
+        let cases = [
+            ("Directory.Packages.props", true),
+            ("directory.packages.props", true),
+            ("Directory.Build.props", true),
+            ("Directory.Build.targets", true),
+            ("nuget.config", true),
+            ("NuGet.CONFIG", true),
+            ("global.json", true),
+            // Lookalikes that must NOT trigger a full rebuild.
+            ("Global.json.bak", false),
+            ("MyNuGet.config", false),
+            ("Program.cs", false),
+            ("Directory.Packages.props.bak", false),
+            ("packages.props", false),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(
+                is_csharp_restore_input(Path::new(name)),
+                expected,
+                "file name: {name}"
+            );
+            // Same answer through a directory-bearing path.
+            let nested = Path::new("src").join(name);
+            assert_eq!(
+                is_csharp_restore_input(&nested),
+                expected,
+                "nested path: {nested:?}"
+            );
+        }
+    }
+
+    /// The per-event decision the FSW arms rely on: .cs feeds the
+    /// per-project incremental, a restore input the FULL-rebuild debounce,
+    /// .ts/.tsx the TypeScript one — this is the wiring the deliverable
+    /// behaviour depends on, pinned without driving the async loop.
+    #[test]
+    fn symbol_rebuild_event_classification_table() {
+        use SymbolRebuildTrigger::*;
+        let cases = [
+            ("src/Acme.Core.cs", CSharpIncremental),
+            ("Acme.cs", CSharpIncremental),
+            ("Directory.Packages.props", CSharpRestoreInput),
+            ("nuget.config", CSharpRestoreInput),
+            ("Directory.Build.targets", CSharpRestoreInput),
+            ("global.json", CSharpRestoreInput),
+            ("src/app.ts", TypeScript),
+            ("src/app.tsx", TypeScript),
+            ("src/app.mts", TypeScript),
+            ("README.md", None),
+            ("Cargo.toml", None),
+            ("Directory.Packages.props.bak", None),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(
+                classify_symbol_rebuild_event(Path::new(path)),
+                expected,
+                "path: {path}"
+            );
+        }
+    }
+
+    /// The grouped incremental rebuild's terminal-signal ordering: a real
+    /// failure beats an abandonment (exhausted groups leave the previous
+    /// index live — warning — but a genuine failure must render red), and
+    /// an abandonment beats success. Pins the decision the watcher path
+    /// relies on, without driving the async loop — the same
+    /// extract-and-table-test shape as the serve layer's classifier.
+    #[test]
+    fn grouped_rebuild_signal_priority_table() {
+        use SymbolRebuildSignal::*;
+        let real = "MDB_BAD_VALSIZE: put failed".to_string();
+        let exhausted = "dotnet restore did not finish within 3 attempts".to_string();
+        let warnings = vec!["MSBuild advisory".to_string()];
+        let cases = [
+            (
+                "real failure beats abandonment",
+                Some(real.clone()),
+                Some(exhausted.clone()),
+                Failed(real.clone()),
+            ),
+            (
+                "abandonment beats success",
+                None,
+                Some(exhausted.clone()),
+                Abandoned(exhausted.clone()),
+            ),
+            (
+                "clean run keeps the surviving warnings",
+                None,
+                None,
+                Succeeded {
+                    index_warnings: warnings.clone(),
+                },
+            ),
+        ];
+        for (label, last_error, last_abandon, expected) in cases {
+            assert_eq!(
+                grouped_rebuild_signal(last_error, last_abandon, warnings.clone()),
+                expected,
+                "case: {label}"
+            );
+        }
+    }
+
     /// Dropping the last `Arc<SharedStores>` must release every handle inside
     /// the DB directory — the precondition `index rm`'s delete path depends on.
     ///
@@ -2712,6 +3314,7 @@ mod tests {
             writer_lock: None,
             readonly: false,
             changes_count: std::sync::atomic::AtomicU64::new(0),
+            job_gate: None,
         }
     }
 
@@ -2751,6 +3354,263 @@ mod tests {
             "acquire_writer_lock should create the dir and acquire the lock"
         );
         assert!(db_path.join(WRITER_LOCK_FILE).exists());
+    }
+
+    /// The chunk-cap predicate is the batch-splitting decision; pin its edges
+    /// here because the loop that uses it runs inside `spawn_blocking` and
+    /// would otherwise need the ONNX embedding model.
+    #[test]
+    fn chunk_cap_predicate_table() {
+        let cases = [
+            // (consumed, accumulated_chunks, cap, expected)
+            (0, 10_000, 5_000, false), // first file of a batch always proceeds
+            (1, 4_999, 5_000, false),  // below the cap
+            (1, 5_000, 5_000, true),   // exactly at the cap
+            (1, 5_001, 5_000, true),   // one file overshot the cap
+            (7, 10_000, 0, false),     // cap disabled
+            (1, 0, 0, false),          // cap disabled, nothing accumulated
+        ];
+        for (consumed, accumulated, cap, expected) in cases {
+            assert_eq!(
+                chunk_cap_reached(consumed, accumulated, cap),
+                expected,
+                "chunk_cap_reached(consumed={consumed}, accumulated={accumulated}, cap={cap})"
+            );
+        }
+    }
+
+    /// Standalone CLI / `codesearch mcp` stores carry no gate and must keep
+    /// their previous (unbounded) behaviour.
+    #[tokio::test]
+    async fn acquire_job_permit_is_none_for_ungated_stores() {
+        let temp = tempdir().unwrap();
+        let stores = create_test_stores(&temp.path().join("db"), 4).await;
+        assert!(stores.acquire_job_permit().await.is_none());
+    }
+
+    /// Cancellation-aware acquisition: ungated stores must distinguish
+    /// "proceed without a gate" from "cancelled", and a waiter cancelled while
+    /// the only slot is held must abort promptly instead of parking.
+    #[tokio::test]
+    async fn acquire_job_permit_or_cancel_distinguishes_cancel_from_ungated() {
+        let temp = tempdir().unwrap();
+        let stores = create_test_stores(&temp.path().join("db"), 4).await;
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(matches!(
+            stores.acquire_job_permit_or_cancel(&cancelled).await,
+            crate::limits::JobAcquire::Cancelled
+        ));
+        assert!(matches!(
+            stores
+                .acquire_job_permit_or_cancel(&CancellationToken::new())
+                .await,
+            crate::limits::JobAcquire::Ready(None)
+        ));
+
+        // Gated: a waiter cancelled while the only slot is held aborts.
+        let gate = crate::limits::JobGate::with_config(1, 0);
+        let gated = Arc::new(
+            create_test_stores(&temp.path().join("db2"), 4)
+                .await
+                .with_job_gate(Arc::clone(&gate)),
+        );
+        let held = gate.acquire().await;
+        let waiter = CancellationToken::new();
+        let canceller = waiter.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            canceller.cancel();
+        });
+        assert!(matches!(
+            gated.acquire_job_permit_or_cancel(&waiter).await,
+            crate::limits::JobAcquire::Cancelled
+        ));
+        drop(held);
+    }
+
+    /// A gated refresh must (a) wait while the only slot is held and (b)
+    /// release the slot when it finishes. The repo has NO changed files, so the
+    /// refresh completes without loading the ONNX model.
+    #[tokio::test]
+    async fn gated_refresh_waits_for_a_free_slot_and_releases_it() {
+        let temp = tempdir().unwrap();
+        let codebase_path = temp.path().join("codebase");
+        let db_path = temp.path().join("db");
+        std::fs::create_dir_all(&codebase_path).unwrap();
+        std::fs::create_dir_all(&db_path).unwrap();
+        create_metadata_json(&db_path, 4);
+
+        let gate = crate::limits::JobGate::with_config(1, 0);
+        let held = gate.acquire().await;
+        let stores = Arc::new(
+            create_test_stores(&db_path, 4)
+                .await
+                .with_job_gate(Arc::clone(&gate)),
+        );
+
+        let mut refresh = tokio::spawn({
+            let stores = Arc::clone(&stores);
+            let codebase_path = codebase_path.clone();
+            let db_path = db_path.clone();
+            async move {
+                IndexManager::perform_incremental_refresh_with_stores(
+                    &codebase_path,
+                    &db_path,
+                    &stores,
+                    &CancellationToken::new(),
+                    None,
+                    None,
+                )
+                .await
+            }
+        });
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(150), &mut refresh)
+                .await
+                .is_err(),
+            "the refresh must wait while the only job slot is held"
+        );
+
+        drop(held);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), refresh)
+            .await
+            .expect("refresh must complete once the slot is free")
+            .expect("refresh task must not panic");
+        assert!(result.is_ok(), "refresh failed: {:?}", result.err());
+
+        // The permit was released: the gate can be acquired again immediately.
+        let _again = tokio::time::timeout(std::time::Duration::from_secs(1), gate.acquire())
+            .await
+            .expect("the refresh must release its job permit");
+    }
+
+    /// The transient-FTS retry redrives the WHOLE pass, one extra pass per
+    /// backoff entry: a transient-shaped error is retried (the field case —
+    /// the first pass fails on the AV holding a new segment file, the retry
+    /// lands), a non-transient error is returned without a second attempt,
+    /// and a transient failure that outlives the last backoff gives up —
+    /// bounded, never a loop.
+    #[tokio::test]
+    async fn retry_on_transient_fts_redrives_per_backoff_then_gives_up() {
+        let ms = [
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(1),
+        ];
+
+        // Transient once → retried, succeeds, exactly two attempts.
+        let mut attempts = 0u32;
+        let out: Result<u32> = IndexManager::retry_on_transient_fts(&ms, || {
+            let done = attempts >= 1;
+            attempts += 1;
+            async move {
+                if done {
+                    Ok(1)
+                } else {
+                    Err(anyhow::anyhow!(
+                        "FTS commit failed: Access is denied. (os error 5)"
+                    ))
+                }
+            }
+        })
+        .await;
+        assert_eq!(out.unwrap(), 1);
+        assert_eq!(attempts, 2);
+
+        // Non-transient → returned immediately, one attempt.
+        let mut attempts = 0u32;
+        let out: Result<()> = IndexManager::retry_on_transient_fts(&ms, || {
+            attempts += 1;
+            async { Err(anyhow::anyhow!("schema mismatch")) }
+        })
+        .await;
+        assert!(out.is_err());
+        assert_eq!(attempts, 1);
+
+        // Transient three times (initial + two backoffs) → gives up after
+        // the third attempt; a lock outliving both backoffs stays loud.
+        let mut attempts = 0u32;
+        let out: Result<()> = IndexManager::retry_on_transient_fts(&ms, || {
+            attempts += 1;
+            async { Err(anyhow::anyhow!("FTS commit failed: os error 32")) }
+        })
+        .await;
+        assert!(out.is_err());
+        assert_eq!(attempts, 3);
+
+        // Transient twice then clean → the second backoff saves the pass.
+        let mut attempts = 0u32;
+        let out: Result<u32> = IndexManager::retry_on_transient_fts(&ms, || {
+            let done = attempts >= 2;
+            attempts += 1;
+            async move {
+                if done {
+                    Ok(7)
+                } else {
+                    Err(anyhow::anyhow!("FTS commit failed: os error 5"))
+                }
+            }
+        })
+        .await;
+        assert_eq!(out.unwrap(), 7);
+        assert_eq!(attempts, 3);
+    }
+
+    /// The db directory must carry FILE_ATTRIBUTE_HIDDEN after a read-write
+    /// create: the Search indexer skips hidden directories, which is the
+    /// structural fix for the scanner race on fresh Tantivy segment files.
+    #[cfg(windows)]
+    #[test]
+    fn shared_stores_marks_the_db_dir_hidden() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join(".codesearch.db");
+        let _stores = SharedStores::new(&db, 2).unwrap();
+        use std::os::windows::fs::MetadataExt;
+        let attrs = std::fs::metadata(&db).unwrap().file_attributes();
+        assert_ne!(
+            attrs & 0x2,
+            0,
+            "the db dir must carry FILE_ATTRIBUTE_HIDDEN"
+        );
+    }
+
+    /// Regression for the wrapper/inner split: `force_reindex_with_stores`
+    /// holds the gate permit across the destructive clear and then calls the
+    /// gate-free inner body. Calling the public wrapper again would re-acquire
+    /// the only permit and hang forever under `CODESEARCH_INDEX_JOBS=1` (this
+    /// test times out instead of hanging only because of the explicit
+    /// `timeout`).
+    #[tokio::test]
+    async fn force_reindex_under_gate_does_not_reacquire_the_permit() {
+        let temp = tempdir().unwrap();
+        let codebase_path = temp.path().join("codebase");
+        let db_path = temp.path().join("db");
+        std::fs::create_dir_all(&codebase_path).unwrap();
+        std::fs::create_dir_all(&db_path).unwrap();
+        create_metadata_json(&db_path, 4);
+
+        let gate = crate::limits::JobGate::with_config(1, 0);
+        let stores = create_test_stores(&db_path, 4)
+            .await
+            .with_job_gate(Arc::clone(&gate));
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            IndexManager::force_reindex_with_stores(
+                &codebase_path,
+                &db_path,
+                &stores,
+                None,
+                &CancellationToken::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("force reindex must not deadlock on its own job permit");
+
+        assert!(result.is_ok(), "force reindex failed: {:?}", result.err());
     }
 
     #[tokio::test]
@@ -3501,6 +4361,43 @@ mod tests {
         assert!(
             vs.get_chunk(duplicate_id).unwrap().is_none(),
             "the untracked duplicate chunk must be swept"
+        );
+    }
+
+    /// The branch-change full rebuild must queue behind the shared guard so it
+    /// cannot overlap the incremental or restore-input rebuilds on one LMDB db.
+    #[tokio::test]
+    async fn branch_change_symbol_rebuild_waits_for_shared_guard() {
+        let temp = tempdir().unwrap();
+        let guard = Arc::new(std::sync::Mutex::new(()));
+        let held = guard.lock().unwrap();
+
+        let handle = IndexManager::spawn_branch_change_symbol_rebuild(
+            Arc::new(SymbolIndexerRegistry::new()),
+            temp.path().to_path_buf(),
+            temp.path().join("db"),
+            "test".to_string(),
+            None,
+            None,
+            CancellationToken::new(),
+            guard.clone(),
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !handle.is_finished(),
+            "rebuild must block while the shared guard is held"
+        );
+
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+            .await
+            .expect("rebuild must finish once the guard is released")
+            .expect("rebuild task must not panic");
+
+        assert!(
+            guard.try_lock().is_ok(),
+            "guard must be released after the rebuild"
         );
     }
 }

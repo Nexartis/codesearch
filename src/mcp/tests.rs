@@ -506,6 +506,25 @@ fn test_path_prefix_no_alias() {
 }
 
 #[test]
+fn test_strip_alias_prefix_variants() {
+    // The inbound counterpart of prefix_path_with_alias: find_impact
+    // position queries arrive as find reports them — alias-prefixed.
+    let alias = "myrepo".to_string();
+    assert_eq!(
+        super::strip_alias_prefix("myrepo/src/main.rs", Some(&alias)),
+        "src/main.rs"
+    );
+    assert_eq!(
+        super::strip_alias_prefix("other/src/main.rs", Some(&alias)),
+        "other/src/main.rs"
+    );
+    assert_eq!(
+        super::strip_alias_prefix("src/main.rs", None),
+        "src/main.rs"
+    );
+}
+
+#[test]
 fn test_path_prefix_empty_alias() {
     let result = super::prefix_path_with_alias("C:/repo/src/main.rs", Some(""), "C:/repo");
     assert_eq!(result, "src/main.rs");
@@ -563,6 +582,140 @@ fn test_relative_path_without_alias() {
 fn test_relative_path_empty_alias() {
     let result = super::prefix_path_with_alias("docs/guide.md", Some(""), "/data/vendor");
     assert_eq!(result, "docs/guide.md");
+}
+
+// === group fan-out alias attribution (semantic_search_multi) ===
+
+#[tokio::test]
+async fn group_lexical_search_attributes_each_hit_to_its_repo() {
+    use rmcp::model::ContentBlock;
+
+    // Two repos with disjoint chunk ids. A group query must answer with
+    // alias-prefixed paths ("alpha/…", "beta/…") exactly like a project=
+    // query — before the fix the fan-out lost the store of origin and both
+    // hits came back bare, making a cross-repo response unattributable.
+    let root_a = tempfile::tempdir().expect("tempdir a");
+    let stores_a = std::sync::Arc::new(
+        crate::index::SharedStores::new(&root_a.path().join(".codesearch.db"), 2)
+            .expect("stores a"),
+    );
+    {
+        let mut vs = stores_a.vector_store.write().await;
+        let chunk = crate::chunker::Chunk::new(
+            "fn gadget() {}".to_string(),
+            0,
+            0,
+            crate::chunker::ChunkKind::Function,
+            "src/lib.rs".to_string(),
+        );
+        vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+            chunk,
+            vec![0.0, 1.0],
+        )])
+        .expect("insert chunk a");
+        vs.build_index().expect("build index a");
+    }
+    {
+        let mut fts = stores_a.fts_store.write().await;
+        fts.add_chunk(0, "fn gadget() {}", "src/lib.rs", None, "Function")
+            .expect("fts doc a");
+        fts.commit().expect("commit a");
+    }
+
+    let root_b = tempfile::tempdir().expect("tempdir b");
+    let stores_b = std::sync::Arc::new(
+        crate::index::SharedStores::new(&root_b.path().join(".codesearch.db"), 2)
+            .expect("stores b"),
+    );
+    {
+        // insert_chunks assigns ids from 0 per store, so a filler chunk keeps
+        // the real one at id 1 and the two test repos never share a chunk id.
+        let mut vs = stores_b.vector_store.write().await;
+        let filler = crate::chunker::Chunk::new(
+            "filler".to_string(),
+            0,
+            0,
+            crate::chunker::ChunkKind::Function,
+            "src/filler.rs".to_string(),
+        );
+        let chunk = crate::chunker::Chunk::new(
+            "gadget helper".to_string(),
+            0,
+            0,
+            crate::chunker::ChunkKind::Function,
+            "src/util.rs".to_string(),
+        );
+        vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+            filler,
+            vec![0.5, 0.5],
+        )])
+        .expect("insert filler b");
+        vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+            chunk,
+            vec![1.0, 0.0],
+        )])
+        .expect("insert chunk b");
+        vs.build_index().expect("build index b");
+    }
+    {
+        let mut fts = stores_b.fts_store.write().await;
+        fts.add_chunk(1, "gadget helper", "src/util.rs", None, "Function")
+            .expect("fts doc b");
+        fts.commit().expect("commit b");
+    }
+
+    let service = super::CodesearchService::new_with_stores(
+        Some(root_a.path().to_path_buf()),
+        Some(stores_a.clone()),
+    )
+    .expect("service");
+
+    let request = super::SemanticSearchRequest {
+        query: "gadget".to_string(),
+        limit: Some(10),
+        compact: Some(false),
+        filter_path: None,
+        mode: Some("lexical".to_string()),
+        project: None,
+        group: Some("all".to_string()),
+    };
+    let mut alias_roots = std::collections::HashMap::new();
+    alias_roots.insert(
+        "alpha".to_string(),
+        crate::cache::normalize_path_str(&root_a.path().to_string_lossy()),
+    );
+    alias_roots.insert(
+        "beta".to_string(),
+        crate::cache::normalize_path_str(&root_b.path().to_string_lossy()),
+    );
+
+    let result = service
+        .semantic_search_multi(
+            &request,
+            &[],
+            10,
+            false,
+            vec![stores_a.clone(), stores_b.clone()],
+            &["alpha".to_string(), "beta".to_string()],
+            &alias_roots,
+        )
+        .await
+        .expect("group search must succeed");
+
+    let json = match &result.content[0] {
+        ContentBlock::Text(t) => t.text.clone(),
+        other => panic!("expected text content, got {other:?}"),
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json response");
+    let paths: Vec<&str> = parsed["results"]
+        .as_array()
+        .expect("results array")
+        .iter()
+        .map(|r| r["path"].as_str().expect("path string"))
+        .collect();
+    assert_eq!(paths.len(), 2, "both repos must answer, paths: {paths:?}");
+    assert!(paths.contains(&"alpha/src/lib.rs"), "paths: {paths:?}");
+    assert!(paths.contains(&"beta/src/util.rs"), "paths: {paths:?}");
 }
 
 #[test]
@@ -2079,14 +2232,14 @@ fn note_store_failure_survives_a_short_alias_list() {
 
 #[test]
 fn index_status_summary_reports_building_before_anything_failed() {
-    let (status, message) = super::index_status_summary(3, 0, 0, true);
+    let (status, message) = super::index_status_summary(3, 0, 0, true, false);
     assert_eq!(status, "building");
     assert!(!message.contains("failed"), "got: {message}");
 }
 
 #[test]
 fn index_status_summary_reports_clean_ready_with_no_failures() {
-    let (status, message) = super::index_status_summary(3, 0, 500, true);
+    let (status, message) = super::index_status_summary(3, 0, 500, true, false);
     assert_eq!(status, "ready");
     assert!(!message.contains("failed"), "got: {message}");
     assert!(message.contains("3 repo(s)"), "got: {message}");
@@ -2096,7 +2249,7 @@ fn index_status_summary_reports_clean_ready_with_no_failures() {
 fn index_status_summary_surfaces_a_degraded_group_as_ready_with_a_count() {
     // This is the exact case that used to be indistinguishable from
     // "index still warming": some data is in, one store didn't answer.
-    let (status, message) = super::index_status_summary(3, 1, 500, true);
+    let (status, message) = super::index_status_summary(3, 1, 500, true, false);
     assert_eq!(
         status, "ready",
         "the two healthy stores must not be masked by the one that failed"
@@ -2116,7 +2269,7 @@ fn index_status_summary_reports_error_when_every_store_failed() {
     // this fix, `total_chunks == 0` was checked first and this rendered as
     // "building" — byte-identical to "not indexed yet" — even though every
     // store actively failed. `failed_count >= total_repos` must win.
-    let (status, message) = super::index_status_summary(3, 3, 0, true);
+    let (status, message) = super::index_status_summary(3, 3, 0, true, false);
     assert_eq!(
         status, "error",
         "a group where every store failed must not read as merely 'still building'"
@@ -2842,7 +2995,7 @@ fn readonly_or_require_ready_never_creates_a_missing_index() {
 /// failed with "Index not built. Call build_index() after inserting chunks."
 #[test]
 fn index_status_summary_reports_building_when_chunks_exist_but_graph_is_not_built() {
-    let (status, message) = super::index_status_summary(3, 0, 500, false);
+    let (status, message) = super::index_status_summary(3, 0, 500, false, false);
     assert_eq!(
         status, "building",
         "chunks without a built vector index are not searchable"
@@ -2853,27 +3006,96 @@ fn index_status_summary_reports_building_when_chunks_exist_but_graph_is_not_buil
         "message must still name the scope, got: {message}"
     );
     // A stats() failure on some stores must NOT be misread as "not built".
-    let (status, _) = super::index_status_summary(3, 1, 500, true);
+    let (status, _) = super::index_status_summary(3, 1, 500, true, false);
     assert_eq!(
         status, "ready",
         "a failed store is surfaced as degraded-ready"
     );
 }
 
+/// A running rebuild turns every would-be "ready" into "building"; states that
+/// already carry a more specific verdict (all stores failed) are left alone.
+#[test]
+fn index_status_summary_reports_building_while_a_rebuild_runs() {
+    // (total_repos, failed, chunks, all_built, indexing) -> expected status
+    let cases = [
+        ((3, 0, 500, true, true), "building"),
+        ((3, 1, 500, true, true), "building"),
+        ((3, 0, 500, true, false), "ready"),
+        ((3, 3, 0, true, true), "error"),
+    ];
+    for ((repos, failed, chunks, built, indexing), expected) in cases {
+        let (status, message) = super::index_status_summary(repos, failed, chunks, built, indexing);
+        assert_eq!(
+            status, expected,
+            "case ({repos},{failed},{chunks},{built},{indexing}): {message}"
+        );
+    }
+    let (_, message) = super::index_status_summary(3, 0, 500, true, true);
+    assert!(message.contains("rebuild"), "got: {message}");
+}
+
 /// Single-store counterpart: the same `total_chunks > 0` shortcut reported
 /// `ready` for a store whose graph was never built (`indexed == false`).
 #[test]
 fn single_index_status_requires_a_built_graph_to_report_ready() {
-    let (status, message) = super::single_index_status(403, false);
+    let (status, message) = super::single_index_status(403, false, false);
     assert_eq!(
         status, "building",
         "403 chunks with no built graph are not searchable"
     );
     assert!(message.contains("not built"), "got: {message}");
 
-    let (status, _) = super::single_index_status(403, true);
+    let (status, _) = super::single_index_status(403, true, false);
     assert_eq!(status, "ready");
 
-    let (status, _) = super::single_index_status(0, false);
+    let (status, _) = super::single_index_status(0, false, false);
     assert_eq!(status, "building");
+}
+
+#[test]
+fn test_unknown_project_error_is_classified() {
+    // P1 (codesearch tuning round 2026-10-16): a bad `project=` alias must be a
+    // NAMED refusal carrying the available-project list, not a bare
+    // `Unknown alias 'x'` string (NEE-P-CONSISTENT: a refusal names its class
+    // and remedy so the agent corrects without a guessing round-trip).
+    let mut project_groups = std::collections::HashMap::new();
+    project_groups.insert(
+        "nexartis".to_string(),
+        vec!["alpha".to_string(), "beta".to_string()],
+    );
+    let json = super::unknown_project_error_json(
+        "nope",
+        vec!["alpha".to_string(), "beta".to_string()],
+        vec!["all".to_string(), "nexartis".to_string()],
+        project_groups,
+    );
+    let v: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+    assert_eq!(v["error_code"], "project_unresolved");
+    assert_eq!(v["available_projects"][0], "alpha");
+    assert_eq!(v["available_projects"][1], "beta");
+    assert_eq!(v["available_groups"][1], "nexartis");
+    assert!(v["hint_for_agent"].as_str().unwrap().contains("nope"));
+}
+
+/// A running rebuild overrides "ready": the stores are still being rewritten
+/// even though the previous generation's graph reports built.
+#[test]
+fn single_index_status_reports_building_while_a_rebuild_runs() {
+    // (total_chunks, indexed, indexing) -> expected status
+    let cases = [
+        ((403, true, true), "building"),
+        ((403, false, true), "building"),
+        ((0, false, true), "building"),
+        ((403, true, false), "ready"),
+    ];
+    for ((chunks, indexed, indexing), expected) in cases {
+        let (status, message) = super::single_index_status(chunks, indexed, indexing);
+        assert_eq!(
+            status, expected,
+            "case ({chunks},{indexed},{indexing}): {message}"
+        );
+    }
+    let (_, message) = super::single_index_status(403, true, true);
+    assert!(message.contains("rebuild"), "got: {message}");
 }

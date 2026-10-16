@@ -341,6 +341,47 @@ impl EmbeddingServicePool {
         guard.insert(model, arc.clone());
         Ok(arc)
     }
+
+    /// Embed `chunks`, releasing the service lock between ONNX mini-batches.
+    ///
+    /// The per-model `Mutex<EmbeddingService>` is what serialises embedding
+    /// between repos and queries. Holding it for a whole refresh batch (one
+    /// `CODESEARCH_INCREMENTAL_BATCH_SIZE` window can hold thousands of
+    /// chunks) made an interactive query embedding queue behind minutes of
+    /// background inference. Each lock acquisition here covers exactly one
+    /// ONNX mini-batch ([`FastEmbedder::effective_batch_size`]), followed by
+    /// the optional `pause` duty cycle, so a long background pass yields the
+    /// model between mini-batches.
+    pub fn embed_chunks_yielding(
+        &self,
+        model: ModelType,
+        chunks: Vec<crate::chunker::Chunk>,
+        pause: std::time::Duration,
+    ) -> Result<Vec<EmbeddedChunk>> {
+        if chunks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let service = self.get(model)?;
+        let group_size = FastEmbedder::effective_batch_size(model).max(1);
+        let mut out: Vec<EmbeddedChunk> = Vec::with_capacity(chunks.len());
+        for group in chunks.chunks(group_size) {
+            {
+                // Recover from poisoning: a panicked embed service still yields
+                // a valid guard; the batch result carries correctness, and a
+                // poison here must not hard-fail every later batch for the
+                // process lifetime.
+                let mut guard = service
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut embedded = guard.embed_chunks(group.to_vec())?;
+                out.append(&mut embedded);
+            }
+            if !pause.is_zero() {
+                std::thread::sleep(pause);
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -351,6 +392,47 @@ mod tests {
     fn test_model_type_default() {
         let model = ModelType::default();
         assert_eq!(model.dimensions(), 384);
+    }
+
+    /// Mini-batch size drives how long one lock acquisition lasts; pin the
+    /// dimension-adaptive default and the env override.
+    #[test]
+    #[serial_test::serial]
+    fn effective_batch_size_defaults_by_dimensions_and_env_overrides() {
+        let _unset = crate::testing::EnvRestore::remove(&["CODESEARCH_BATCH_SIZE"]);
+        assert_eq!(
+            FastEmbedder::effective_batch_size(ModelType::AllMiniLML6V2Q),
+            256,
+            "384-dim models use 256-text mini-batches"
+        );
+        assert_eq!(
+            FastEmbedder::effective_batch_size(ModelType::EmbeddingGemma300MQ4),
+            128,
+            "768-dim models use 128-text mini-batches"
+        );
+        assert_eq!(
+            FastEmbedder::effective_batch_size(ModelType::BGELargeENV15),
+            64,
+            ">768-dim models use 64-text mini-batches"
+        );
+
+        let _override = crate::testing::EnvRestore::set(&[("CODESEARCH_BATCH_SIZE", "7")]);
+        assert_eq!(
+            FastEmbedder::effective_batch_size(ModelType::EmbeddingGemma300MQ4),
+            7,
+            "CODESEARCH_BATCH_SIZE must win over the adaptive default"
+        );
+    }
+
+    /// The interleaved embed path must not even load the model for an empty
+    /// batch; this is its no-op arm and the only one testable without ONNX.
+    #[test]
+    fn embed_chunks_yielding_empty_is_a_noop() {
+        let pool = EmbeddingServicePool::new(None);
+        let out = pool
+            .embed_chunks_yielding(ModelType::default(), Vec::new(), std::time::Duration::ZERO)
+            .expect("empty embed must succeed");
+        assert!(out.is_empty());
     }
 
     /// The index-metadata reader must invert `write_metadata_fields`, and must

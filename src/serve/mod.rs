@@ -23,7 +23,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use axum::response::{IntoResponse, Json as AxumJson};
 use colored::Colorize;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use rmcp::transport::{
     streamable_http_server::session::local::LocalSessionManager, StreamableHttpServerConfig,
     StreamableHttpService,
@@ -38,16 +38,17 @@ use crate::constants::{
     ALLOWED_HOSTS_ENV, ALLOWED_ROOTS_ENV, CHUNK_PATH, CSHARP_PREWARM_ENABLED_ENV,
     CSHARP_PREWARM_MAX_SYMBOLS, CSHARP_SCIP_CONCURRENCY_DEFAULT, CSHARP_SCIP_CONCURRENCY_ENV,
     DB_DIR_NAME, DEFAULT_SERVE_PORT, DISABLE_HOST_VALIDATION_ENV, EXPLORE_PATH, FIND_IMPACT_PATH,
-    FIND_PATH, HEALTHZ_PATH, HEALTH_PATH, INDEXING_PATH, LANG_CSHARP, LANG_TYPESCRIPT,
-    MAX_INDEXING_SECS, MAX_INDEXING_SECS_ENV, MCP_ENDPOINT_PATH, PERSIST_DEBOUNCE_SECS,
-    REAPER_INTERVAL_SECS, REMOTES_PATH, REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SEARCH_PATH,
-    SERVE_API_KEY_ENV, SERVE_PORT_ENV, STATUS_PATH,
+    FIND_PATH, HEALTHZ_PATH, HEALTH_PATH, INDEXING_MARKER_HEARTBEAT_SECS, INDEXING_PATH,
+    LANG_CSHARP, LANG_TYPESCRIPT, MAX_INDEXING_SECS, MAX_INDEXING_SECS_ENV, MCP_ENDPOINT_PATH,
+    PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS, REMOTES_PATH, REPO_IDLE_TIMEOUT_ENV,
+    REPO_IDLE_TIMEOUT_SECS, SEARCH_PATH, SERVE_API_KEY_ENV, SERVE_PORT_ENV, STATUS_PATH,
 };
 use crate::db_discovery::repos::{config_dir, ReposConfig};
 use crate::index::{
     CSharpRebuildNotifier, IndexManager, IndexingHeartbeat, IndexingStatusCallback, SharedStores,
     SymbolRebuildSignal,
 };
+use crate::limits::JobAcquire;
 use crate::mcp::types::HealthResponse;
 use crate::symbols::{csharp, RebuildScope, SymbolIndexerRegistry};
 
@@ -92,10 +93,81 @@ pub(crate) enum CSharpIndexStatus {
     None,
     /// Helper available and index built successfully.
     Ready,
+    /// Index built, but degraded or stale: the helper survived
+    /// workspace/MSBuild failures (definitions present while cross-project
+    /// references may be missing), or a rebuild was abandoned because
+    /// `dotnet restore` never finished (the previous index stays live).
+    /// Rendered yellow (`C#⚠`) in the TUI; the failures are in the info
+    /// panel and on every find_impact answer from this index.
+    Partial,
     /// Index exists but had errors or is stale.
     Error,
     /// Symbol index is currently being built.
     Indexing,
+}
+
+/// Outcome of a SUCCESSFUL C# symbol rebuild, derived from the rebuild's
+/// index warnings: clean → Ready (error cleared), survived failures →
+/// Partial with a bounded detail line for the TUI info panel. Pure so the
+/// status contract is testable without running a helper.
+fn csharp_success_outcome(index_warnings: &[String]) -> (CSharpIndexStatus, Option<String>) {
+    if index_warnings.is_empty() {
+        (CSharpIndexStatus::Ready, None)
+    } else {
+        let detail = index_warnings
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" | ");
+        (CSharpIndexStatus::Partial, Some(detail))
+    }
+}
+
+/// Symbol-index status shown for a repo: a running build wins over any cached
+/// value (a stale `Ready` must not outlive a rebuild), otherwise the cache,
+/// otherwise a fresh probe. Pure so the precedence is testable.
+pub(crate) fn resolve_csharp_status(
+    cached: Option<CSharpIndexStatus>,
+    indexing: bool,
+    probe: impl FnOnce() -> CSharpIndexStatus,
+) -> CSharpIndexStatus {
+    if indexing {
+        CSharpIndexStatus::Indexing
+    } else {
+        cached.unwrap_or_else(probe)
+    }
+}
+
+/// Classification of a FAILED symbol rebuild, deciding how the serve layer
+/// renders the outcome. Pure so the contract is table-testable without
+/// running a helper (same reason as [`csharp_success_outcome`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SymbolRebuildFailureKind {
+    /// `dotnet restore` never finished within the retry cap: the previous
+    /// index stays live — warning (Partial), never a red error.
+    RestoreExhausted,
+    /// LMDB storage-format corruption: wipe + recovery path.
+    LmdbCorruption,
+    /// Any other failure: red Error.
+    Generic,
+}
+
+/// Restore-exhaustion is checked FIRST: the typed error carries its own
+/// contract (LMDB untouched, previous index live) that the corruption
+/// matcher must not override.
+fn classify_symbol_rebuild_failure(
+    msg: &str,
+    e: &anyhow::Error,
+    is_csharp: bool,
+) -> SymbolRebuildFailureKind {
+    if is_csharp && csharp::is_restore_exhausted(e) {
+        SymbolRebuildFailureKind::RestoreExhausted
+    } else if ServeState::is_lmdb_format_corruption(msg) {
+        SymbolRebuildFailureKind::LmdbCorruption
+    } else {
+        SymbolRebuildFailureKind::Generic
+    }
 }
 
 /// Lightweight repo status derived from DashMap state only (no DB opens).
@@ -198,6 +270,22 @@ pub(crate) enum IndexingOwner {
     Symbol,
 }
 
+/// Per-alias indexing markers: owner → when it last started or renewed.
+type ActiveReindexes = DashMap<String, std::collections::HashMap<IndexingOwner, Instant>>;
+
+/// A tracked background indexing task.
+///
+/// `db_path` travels with the entry so the DB directory of a repo that was
+/// removed mid-index can be cleaned up after the task finally exits, and
+/// `started_at` lets the periodic sweeper report tasks that have been alive
+/// past the stale threshold (a wedge signal for operators).
+struct IndexTask {
+    handle: tokio::task::JoinHandle<()>,
+    token: CancellationToken,
+    db_path: PathBuf,
+    started_at: Instant,
+}
+
 /// Shared state for the serve mode.
 pub(crate) struct ServeState {
     /// Repo alias → opened stores (or conflicted marker).
@@ -232,22 +320,28 @@ pub(crate) struct ServeState {
     /// `stop_fsw`) so the LMDB `Environment` drops and releases the file
     /// handles BEFORE the DB directory is deleted. See `await_fsw_shutdown`.
     fsw_tasks: DashMap<String, tokio::task::JoinHandle<()>>,
-    /// Repo alias → `(JoinHandle, CancellationToken)` of its background
-    /// *indexing* task (the heavy `add_repo`/`reindex` embed pass), separate
-    /// from `fsw_tasks` because `restart_fsw` reuses the `fsw_tasks` slot for
-    /// the continuous watcher loop.
+    /// Repo alias → its tracked background *indexing* task (the heavy
+    /// `add_repo`/`reindex` embed pass), separate from `fsw_tasks` because
+    /// `restart_fsw` reuses the `fsw_tasks` slot for the continuous watcher
+    /// loop.
     ///
     /// This exists to fix the index-cancellation no-op (BUG1): `add_repo` and
     /// `reindex` used to spawn detached, untracked `tokio::spawn` tasks that
     /// neither observed the cancel token nor could be awaited, so `remove_repo`
     /// reported success while a full-corpus embed pass kept running (and
     /// writing) on the removed alias — 6 GB / 52% CPU runaway. Registering the
-    /// handle here lets `await_index_task` (called from `remove_repo`) cancel
-    /// the token AND await the task before the DB directory is deleted, so the
-    /// task's `Arc<SharedStores>` (and the LMDB mmap handles it keeps alive)
-    /// drop first. The token is stored alongside the handle so `remove_repo`
-    /// can cancel regardless of the repo's `RepoState` variant.
-    index_tasks: DashMap<String, (tokio::task::JoinHandle<()>, CancellationToken)>,
+    /// task here lets `await_index_task` (called from `remove_repo`) cancel the
+    /// token AND wait for the task, so the task's `Arc<SharedStores>` (and the
+    /// LMDB mmap handles it keeps alive) drop first. The entry is *never*
+    /// dropped while the task may still run: when the cooperative wait cannot
+    /// join it (uninterruptible `build_index`), the handle goes back into this
+    /// map so [`Self::sweep_index_tasks`] can reap it — and clean up a removed
+    /// repo's DB directory — once it finally exits.
+    index_tasks: DashMap<String, IndexTask>,
+    /// Repo alias → last time [`Self::is_indexing`] / [`Self::sweep_index_tasks`]
+    /// warned that a *live* task's marker crossed `MAX_INDEXING_SECS`.
+    /// Throttles the wedge warning to once per alias per few minutes.
+    stale_live_warned: DashMap<String, Instant>,
     /// Aliases detected with LMDB storage-format corruption (e.g.
     /// `MDB_BAD_VALSIZE` after a storage-layer major upgrade such as
     /// arroy 0.5→0.8 / heed 0.20→0.22), queued for a wipe + full force
@@ -285,7 +379,7 @@ pub(crate) struct ServeState {
     /// capture a cheap clone that **shares** the underlying map (a bare
     /// `DashMap::clone()` is a deep copy and would silently disconnect the
     /// file-watcher callback from this field).
-    active_reindexes: Arc<DashMap<String, std::collections::HashMap<IndexingOwner, Instant>>>,
+    active_reindexes: Arc<ActiveReindexes>,
     /// Per-repo change count since serve started (incremented by index/reindex operations).
     repo_changes: DashMap<String, AtomicU64>,
     /// Per-repo last tool call: (tool_name, timestamp).
@@ -319,6 +413,12 @@ pub(crate) struct ServeState {
     /// with the model of the repo it targets. Mirrors the `symbol_registry`
     /// pattern.
     embedding_pool: Arc<crate::embed::EmbeddingServicePool>,
+    /// Process-wide heavy-job gate (`CODESEARCH_INDEX_JOBS`): bounds how many
+    /// repos run a refresh / reindex / HNSW build at once. It is attached to
+    /// every [`SharedStores`] this state opens, so cold opens, warmup and
+    /// file-watcher refreshes all draw from the same budget. Queries never
+    /// take it. See [`crate::limits`].
+    job_gate: Arc<crate::limits::JobGate>,
     /// Serve-wide default embedding model for newly created indexes
     /// (`codesearch serve --model <name>`), or `None` for the built-in default.
     ///
@@ -344,6 +444,17 @@ pub(crate) struct ServeState {
     /// Per-repo C# symbol index last error message (set when status is Error, cleared on success).
     /// Wrapped in `Arc` for the same reason as `csharp_index_status`.
     csharp_index_error: Arc<DashMap<String, String>>,
+    /// Symbol rebuilds in flight, keyed `"{lang}:{alias}"` → claim Instant.
+    /// Guards against double-triggered full rebuilds (find_impact self-heal
+    /// racing phase-2/reindex/watcher): two concurrent rebuilds interleave
+    /// their LMDB clear/write passes. Stale claims self-heal past the
+    /// indexing timeout, like `active_reindexes` markers.
+    symbol_rebuild_in_flight: DashMap<String, std::time::Instant>,
+    /// Aliases whose degraded index (index_warnings in meta) already got its
+    /// automatic retry this serve process. Without this, a still-broken
+    /// build environment would rebuild on every evaluation — the next serve
+    /// start retries once more, which is the operator-visible bound.
+    degraded_rebuild_attempted: DashSet<String>,
     /// Debounced deadline for persisting repos config metadata (unix millis).
     persist_deadline_unix_ms: AtomicU64,
     /// Ensures only one debounce worker task runs.
@@ -375,6 +486,9 @@ enum RebuildDecision {
     Fresh,
     /// No `.sln` file found; C# indexing is not applicable for this repo.
     NoSolutionFile,
+    /// The repo lacks this language's entrypoint (e.g. no `tsconfig.json`) —
+    /// the generic per-language gate's counterpart of `NoSolutionFile`.
+    NotApplicable,
     /// The scip-csharp helper binary is not available.
     HelperUnavailable,
     /// An indexing task for this alias is already running.
@@ -403,6 +517,7 @@ impl ServeState {
             open_locks: DashMap::new(),
             fsw_tasks: DashMap::new(),
             index_tasks: DashMap::new(),
+            stale_live_warned: DashMap::new(),
             format_recovery_queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
             format_recovery_done: DashMap::new(),
             format_recovery_worker_started: std::sync::atomic::AtomicBool::new(false),
@@ -420,11 +535,14 @@ impl ServeState {
             embedding_pool: Arc::new(crate::embed::EmbeddingServicePool::new(
                 crate::constants::get_global_models_cache_dir().ok(),
             )),
+            job_gate: crate::limits::JobGate::from_env(),
             default_model: None,
             legacy_model_warned: DashMap::new(),
             tool_call_counts: DashMap::new(),
             csharp_index_status: Arc::new(DashMap::new()),
             csharp_index_error: Arc::new(DashMap::new()),
+            symbol_rebuild_in_flight: DashMap::new(),
+            degraded_rebuild_attempted: DashSet::new(),
             persist_deadline_unix_ms: AtomicU64::new(0),
             persist_worker_started: AtomicBool::new(false),
             #[cfg(test)]
@@ -598,10 +716,11 @@ impl ServeState {
     /// The notifier captures `Arc` clones of the two status maps so it can be sent
     /// into the file-watcher background task without holding a reference to `&self`.
     /// The watcher calls it with [`SymbolRebuildSignal::Started`] just before a
-    /// rebuild runs (→ `Indexing`) and again with `Succeeded`/`Failed` when it
-    /// finishes (→ `Ready`/`Error`), updating `csharp_index_status` /
-    /// `csharp_index_error` — making both the in-progress and terminal states
-    /// visible in the TUI and in `/status` without any extra polling.
+    /// rebuild runs (→ `Indexing`) and again with `Succeeded`/`Abandoned`/
+    /// `Failed` when it finishes (→ `Ready`/`Partial`/`Error`), updating
+    /// `csharp_index_status` / `csharp_index_error` — making both the
+    /// in-progress and terminal states visible in the TUI and in `/status`
+    /// without any extra polling.
     fn make_csharp_notifier(&self, alias: &str) -> CSharpRebuildNotifier {
         let status_map = Arc::clone(&self.csharp_index_status);
         let error_map = Arc::clone(&self.csharp_index_error);
@@ -612,9 +731,24 @@ impl ServeState {
                 // watcher-triggered rebuild, matching `trigger_symbol_rebuild`.
                 status_map.insert(alias_key.clone(), CSharpIndexStatus::Indexing);
             }
-            SymbolRebuildSignal::Succeeded => {
-                status_map.insert(alias_key.clone(), CSharpIndexStatus::Ready);
-                error_map.remove(&alias_key);
+            SymbolRebuildSignal::Succeeded { index_warnings } => {
+                // Same contract as trigger_symbol_rebuild's success arm: a
+                // rebuild that survived workspace failures is Partial (red
+                // C#⚠) with the failures as the info detail — never green.
+                let (status, detail) = csharp_success_outcome(&index_warnings);
+                status_map.insert(alias_key.clone(), status);
+                if let Some(detail) = detail {
+                    error_map.insert(alias_key.clone(), detail);
+                } else {
+                    error_map.remove(&alias_key);
+                }
+            }
+            SymbolRebuildSignal::Abandoned(msg) => {
+                // Restore never finished within the retry cap: the previous
+                // index stays live, so a warning (yellow C#⚠ + detail) —
+                // never a red Error. Not Ready either: the index is stale.
+                error_map.insert(alias_key.clone(), msg);
+                status_map.insert(alias_key.clone(), CSharpIndexStatus::Partial);
             }
             SymbolRebuildSignal::Failed(msg) => {
                 error_map.insert(alias_key.clone(), msg);
@@ -652,18 +786,37 @@ impl ServeState {
     }
 
     /// Mark `alias` as actively indexing for `owner`, returning `true` if the
-    /// caller may proceed. Returns `false` when **any** owner holds a
-    /// non-stale marker (i.e. another indexing run is genuinely in progress) —
-    /// in that case the caller should return HTTP 409. Stale markers from
-    /// leaked/crashed tasks are silently dropped first.
+    /// caller may proceed. Returns `false` when **any** owner holds a live
+    /// marker (i.e. another indexing run is genuinely in progress) — in that
+    /// case the caller should return HTTP 409. Stale markers from leaked
+    /// tasks are dropped first, but a marker whose tracked task is still
+    /// alive is never treated as stale: queued-behind-the-gate jobs can wait
+    /// far past `MAX_INDEXING_SECS` without being leaks.
     ///
     /// This is the guard used by `reindex_handler`, `add_repo_handler`, and
     /// `spawn_force_reindex` to reject concurrent reindexes.
     fn begin_indexing(&self, alias: &str, owner: IndexingOwner) -> bool {
         let now = Instant::now();
         let max = self.indexing_timeout();
+        // Liveness is read before locking the marker map so the two DashMaps
+        // are never locked in a nested order.
+        let task_live = self.index_task_is_live(alias);
         let mut owners = self.active_reindexes.entry(alias.to_string()).or_default();
-        owners.retain(|_, ts| now.duration_since(*ts) < max);
+        owners.retain(|owner, ts| {
+            if now.duration_since(*ts) < max {
+                return true;
+            }
+            if task_live && *owner == IndexingOwner::Reindex {
+                // Not a leak: renew rather than drop, or a concurrent begin
+                // could double-run the repo. Only the tracked index task
+                // (Reindex) supplies liveness evidence; other owners' stale
+                // markers are dropped as before.
+                *ts = now;
+                true
+            } else {
+                false
+            }
+        });
         if owners.is_empty() {
             owners.insert(owner, now);
             true
@@ -698,6 +851,18 @@ impl ServeState {
             .entry(alias.to_string())
             .or_default()
             .insert(owner, Instant::now());
+    }
+
+    /// Refresh `owner`'s marker only while it still exists. Unlike
+    /// [`Self::renew_indexing`] it never re-inserts, so a heartbeat tick that
+    /// races `end_indexing` cannot resurrect a finished marker (which would
+    /// block the reaper and every `begin_indexing` for a full timeout).
+    fn refresh_indexing_if_held(&self, alias: &str, owner: IndexingOwner) {
+        if let Some(mut owners) = self.active_reindexes.get_mut(alias) {
+            if let Some(ts) = owners.get_mut(&owner) {
+                *ts = Instant::now();
+            }
+        }
     }
 
     /// True iff an error chain indicates LMDB storage-format corruption —
@@ -803,7 +968,18 @@ impl ServeState {
         self.repos.remove(alias);
         self.last_access.remove(alias);
         self.await_fsw_shutdown(alias).await;
-        self.await_index_task(alias).await;
+        if !self.await_index_task(alias).await {
+            // The task is still alive (typically parked in the uninterruptible
+            // build_index). Wiping the DB dir from under it is unsafe — it can
+            // wedge the task while it holds the store handles and the
+            // process-wide job permit. Refuse and let the next corruption
+            // detection retry once the task exits.
+            return Err(format!(
+                "in-flight indexing task for '{}' did not stop within the cooperative \
+                 budget; refusing to wipe its DB dir",
+                alias
+            ));
+        }
 
         let deadline =
             Instant::now() + Duration::from_secs(crate::constants::DB_DELETE_RETRY_BUDGET_SECS);
@@ -904,7 +1080,7 @@ impl ServeState {
         let cancelled = self
             .index_tasks
             .get(alias)
-            .is_some_and(|entry| entry.value().1.is_cancelled());
+            .is_some_and(|entry| entry.value().token.is_cancelled());
         if cancelled {
             return Err(format!(
                 "rebuild for '{}' was cancelled before it completed (stale indexing marker); \
@@ -915,14 +1091,50 @@ impl ServeState {
         Ok(())
     }
 
-    /// Returns `true` if `alias` is currently (non-stale) indexing for any
-    /// owner.
+    /// True when a tracked indexing task for `alias` has not finished.
     ///
-    /// Stale markers — those older than [`MAX_INDEXING_SECS`] — are lazily
-    /// evicted here. This is the self-healing mechanism: even if a
-    /// fire-and-forget background task panics or is cancelled between
-    /// `begin_indexing` and `end_indexing`, its marker eventually expires and
-    /// the TUI returns to the correct state without a server restart.
+    /// Live-task evidence overrides marker age: a task queued behind the
+    /// process-wide job gate can wait far longer than `MAX_INDEXING_SECS`
+    /// without being a leak, and treating it as one (evict marker + cancel)
+    /// cancels healthy queued work whenever the backlog drains slower than the
+    /// threshold.
+    fn index_task_is_live(&self, alias: &str) -> bool {
+        self.index_tasks
+            .get(alias)
+            .is_some_and(|entry| !entry.value().handle.is_finished())
+    }
+
+    /// Throttled gate for the "live task past the stale threshold" warning:
+    /// true at most once per alias per five minutes.
+    fn stale_warn_due(&self, alias: &str) -> bool {
+        const WARN_EVERY: Duration = Duration::from_secs(300);
+        let now = Instant::now();
+        let due = match self.stale_live_warned.get_mut(alias) {
+            Some(mut last) => {
+                if now.duration_since(*last) < WARN_EVERY {
+                    false
+                } else {
+                    *last = now;
+                    true
+                }
+            }
+            None => true,
+        };
+        if due {
+            self.stale_live_warned.insert(alias.to_string(), now);
+        }
+        due
+    }
+
+    /// Returns `true` if `alias` is currently indexing for any owner.
+    ///
+    /// Markers older than [`MAX_INDEXING_SECS`] are aged out unless their
+    /// owner carries liveness evidence: a `Reindex` marker backed by a live
+    /// tracked index task is renewed instead. That keeps the self-healing
+    /// behavior for panicked or crashed tasks while never cancelling
+    /// live-but-slow work — a task queued on the process-wide job gate or a
+    /// long `build_index` routinely exceeds the threshold, and a backlog of
+    /// queued reindexes must drain instead of being cancelled as "leaked".
     ///
     /// Eviction runs under the shard's write lock (`get_mut` + `retain`), so a
     /// concurrent `begin_indexing`/`renew_indexing` that refreshed a marker in
@@ -932,16 +1144,26 @@ impl ServeState {
     /// predicate + removal).
     pub(crate) fn is_indexing(&self, alias: &str) -> bool {
         let max = self.indexing_timeout();
+        // Liveness is read before locking the marker map so the two DashMaps
+        // are never locked in a nested order.
+        let task_live = self.index_task_is_live(alias);
         let mut evicted: Vec<IndexingOwner> = Vec::new();
+        let mut renewed: Vec<IndexingOwner> = Vec::new();
         let mut any_left = false;
         if let Some(mut owners) = self.active_reindexes.get_mut(alias) {
             let now = Instant::now();
             owners.retain(|owner, ts| {
-                let fresh = now.duration_since(*ts) < max;
-                if !fresh {
-                    evicted.push(*owner);
+                if now.duration_since(*ts) < max {
+                    return true;
                 }
-                fresh
+                if task_live && *owner == IndexingOwner::Reindex {
+                    *ts = now;
+                    renewed.push(*owner);
+                    true
+                } else {
+                    evicted.push(*owner);
+                    false
+                }
             });
             any_left = !owners.is_empty();
         }
@@ -950,56 +1172,146 @@ impl ServeState {
             // raced this eviction keeps its fresh marker.
             self.active_reindexes.remove_if(alias, |_, m| m.is_empty());
         }
+        if !renewed.is_empty() && self.stale_warn_due(alias) {
+            tracing::warn!(
+                "⏳ Indexing marker(s) for '{}' exceeded {}s but the tracked task is still \
+                 live (queued on the job gate, or a long-running build) — renewing, not \
+                 cancelling. Owners: {:?}",
+                alias,
+                max.as_secs(),
+                renewed
+            );
+        }
         if !evicted.is_empty() {
             tracing::warn!(
                 "🧹 Evicted stale indexing marker(s) for '{}' (older than {}s, owners \
-                 {:?}) — likely a leaked/crashed background task",
+                 {:?}) — no tracked task is alive; reaping",
                 alias,
                 max.as_secs(),
                 evicted
             );
-            self.cancel_stale_index_task(alias);
+            self.reap_finished_index_task(alias);
         }
         any_left
     }
 
-    /// Cancel the background index task still registered for `alias` after its
-    /// indexing marker was evicted as stale.
+    /// Any TEXT-indexing owner (warmup, watcher, reindex) holds a marker for
+    /// `alias`. Only these flows rewrite the text index, so only these own
+    /// the general "Indexing" status; a symbol-only marker keeps the repo on
+    /// its resting state and drives the language columns instead.
     ///
-    /// Dropping the marker only fixes what the TUI and the reindex guard
-    /// *believe*; the task itself keeps running, and with it the
-    /// `Arc<SharedStores>` it captured — so the LMDB env and the
-    /// `.writer.lock` stay held for the process lifetime. Every later write
-    /// (reindex, format recovery, `POST /repos`) then fails with "Database is
-    /// locked by another process" even though the repo looks idle and closed.
-    /// Cancelling the task's token releases those handles at its next
-    /// cancellation point.
+    /// Read-only by design: call after [`Self::is_indexing`], which evicts
+    /// stale markers, so a dead marker cannot light the status here.
+    fn has_text_indexing_marker(&self, alias: &str) -> bool {
+        self.active_reindexes
+            .get(alias)
+            .map(|owners| owners.keys().any(|o| *o != IndexingOwner::Symbol))
+            .unwrap_or(false)
+    }
+
+    /// A symbol (SCIP) rebuild holds its marker for `alias` — drives the
+    /// C#/TS columns, never the general status.
+    fn has_symbol_indexing_marker(&self, alias: &str) -> bool {
+        self.active_reindexes
+            .get(alias)
+            .map(|owners| owners.contains_key(&IndexingOwner::Symbol))
+            .unwrap_or(false)
+    }
+
+    /// Reap the tracked index task for `alias` once its handle has finished.
     ///
-    /// Cooperative only: the handle is never aborted (see
-    /// [`Self::await_index_task`] — an abort would detach the blocking
-    /// `build_index` that owns its own store clone and drop the post-build
-    /// self-cleanup), and the entry stays registered so `remove_repo` can
-    /// still join it. A task that already finished is reaped here instead.
-    fn cancel_stale_index_task(&self, alias: &str) {
-        let finished = match self.index_tasks.get(alias) {
-            Some(entry) => {
-                let (handle, token) = entry.value();
-                if handle.is_finished() {
-                    true
-                } else {
-                    token.cancel();
-                    tracing::warn!(
-                        "🧹 Cancelled the leaked index task for '{}' — releasing its store \
-                         handles and writer lock",
-                        alias
-                    );
-                    false
-                }
-            }
-            None => return,
+    /// Called after stale markers are evicted (there is no live task by
+    /// definition) and from the periodic [`Self::sweep_index_tasks`]. A
+    /// running task is never cancelled here, however old its marker: only
+    /// [`Self::remove_repo`] cancels, and only for its own alias.
+    fn reap_finished_index_task(&self, alias: &str) {
+        let Some(entry) = self.index_tasks.get(alias) else {
+            return;
         };
-        if finished {
-            self.index_tasks.remove(alias);
+        if !entry.value().handle.is_finished() {
+            return;
+        }
+        let db_path = entry.value().db_path.clone();
+        drop(entry);
+        if self
+            .index_tasks
+            .remove_if(alias, |_, v| v.handle.is_finished())
+            .is_some()
+        {
+            self.stale_live_warned.remove(alias);
+            // A finished task that left markers behind panicked or errored
+            // without `end_indexing`; with no task left they are stale state.
+            // Only the Reindex owner belongs to the index task — the other
+            // owners (Warmup, Watcher, Symbol) manage their own lifecycle.
+            if !self.index_tasks.contains_key(alias) {
+                if let Some(mut owners) = self.active_reindexes.get_mut(alias) {
+                    owners.remove(&IndexingOwner::Reindex);
+                }
+                self.active_reindexes.remove_if(alias, |_, m| m.is_empty());
+            }
+            // Covers the removed-mid-build case where the task exited via a
+            // path that never reached its post-build self-clean.
+            self.self_clean_if_unregistered(alias, &db_path);
+        }
+    }
+
+    /// Periodic sweep of tracked index tasks (runs on the idle-reaper tick).
+    ///
+    /// Finishes what cooperative removal could not: reaps entries whose tasks
+    /// finally exited (clearing leftover markers and deleting a removed
+    /// repo's DB directory), re-asserts cancellation for tasks whose repo is
+    /// gone, and loudly reports tasks alive far past the stale threshold —
+    /// the wedge signal an operator needs. Live tasks are never cancelled
+    /// here.
+    fn sweep_index_tasks(&self) {
+        let entries: Vec<(String, bool, Duration)> = self
+            .index_tasks
+            .iter()
+            .map(|e| {
+                let v = e.value();
+                (
+                    e.key().clone(),
+                    v.handle.is_finished(),
+                    v.started_at.elapsed(),
+                )
+            })
+            .collect();
+        let max = self.indexing_timeout();
+        for (alias, finished, age) in entries {
+            if finished {
+                self.reap_finished_index_task(&alias);
+                continue;
+            }
+            let registered = self
+                .config
+                .read()
+                .map(|c| c.resolve(&alias).is_some())
+                .unwrap_or(true);
+            if !registered {
+                // A removed alias's task has no reason to keep going. The
+                // token was cancelled by remove_repo; re-assert it
+                // (idempotent, cooperative) so the entry can be reaped at its
+                // next cancellation point.
+                if let Some(entry) = self.index_tasks.get(&alias) {
+                    if !entry.value().token.is_cancelled() {
+                        entry.value().token.cancel();
+                        tracing::warn!(
+                            "🧹 Index task for removed repo '{}' is still live — \
+                             cancellation re-asserted",
+                            alias
+                        );
+                    }
+                }
+                continue;
+            }
+            if age > max && self.stale_warn_due(&alias) {
+                tracing::warn!(
+                    "⏳ Index task for '{}' has been live for {}s with no completion — \
+                     possible wedge; it stays tracked and will be reaped when it exits",
+                    alias,
+                    age.as_secs()
+                );
+            }
         }
     }
 
@@ -1056,6 +1368,10 @@ impl ServeState {
                 .arg("-1")
                 .arg("--format=%ct")
                 .arg("HEAD")
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_OBJECT_DIRECTORY")
                 .output()
             {
                 if out.status.success() {
@@ -1216,11 +1532,97 @@ impl ServeState {
             return RebuildDecision::NoIndex;
         }
 
+        // Fresh-by-timestamp is not correct: an index built by an older
+        // binary predates both the warning capture and the helper's
+        // load-behaviour fixes (the deployed binary must never serve an
+        // index it did not produce), and an index built WITH surviving
+        // workspace failures carries those warnings in its meta. Both
+        // rebuild automatically — the version path on every binary change,
+        // the degraded path once per serve process so a still-broken
+        // environment cannot loop; the next serve start retries once.
+        if indexer.index_builder_version(db_path).as_deref()
+            != Some(crate::constants::INDEX_BUILDER_VERSION)
+        {
+            return RebuildDecision::ChangedSinceLastBuild;
+        }
+        if !indexer.index_warnings(db_path).is_empty()
+            && self.degraded_rebuild_attempted.insert(alias.to_string())
+        {
+            return RebuildDecision::ChangedSinceLastBuild;
+        }
+
         if last_changed > last_scip {
             RebuildDecision::ChangedSinceLastBuild
         } else {
             RebuildDecision::Fresh
         }
+    }
+
+    /// Claim the `(alias, language)` symbol-rebuild slot. Returns `false`
+    /// when a fresh claim exists (a rebuild is genuinely running); a claim
+    /// older than the indexing timeout is taken over (leaked by a crashed
+    /// task, same self-heal as [`Self::begin_indexing`]).
+    fn begin_symbol_rebuild(&self, alias: &str, lang: &str) -> bool {
+        let now = std::time::Instant::now();
+        let max = self.indexing_timeout();
+        let key = format!("{lang}:{alias}");
+        match self.symbol_rebuild_in_flight.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+                if now.duration_since(*occupied.get()) < max {
+                    return false;
+                }
+                *occupied.get_mut() = now;
+                true
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                vacant.insert(now);
+                true
+            }
+        }
+    }
+
+    /// Release the `(alias, language)` symbol-rebuild slot claimed by
+    /// [`Self::begin_symbol_rebuild`].
+    fn end_symbol_rebuild(&self, alias: &str, lang: &str) {
+        self.symbol_rebuild_in_flight
+            .remove(&format!("{lang}:{alias}"));
+    }
+
+    /// Generic per-language rebuild gate. C# keeps its dedicated evaluator
+    /// (last_scip/last_changed bookkeeping, TUI status map); every other
+    /// language rebuilds only a *missing* index — drift stays
+    /// watcher/branch-change driven, mirroring the deliberate no-thrash
+    /// policy documented on `SymbolIndexer::index_head_sha`.
+    fn evaluate_symbol_rebuild(
+        self: &Arc<Self>,
+        lang: &str,
+        alias: &str,
+        repo_path: &Path,
+        db_path: &Path,
+    ) -> RebuildDecision {
+        if lang.eq_ignore_ascii_case(LANG_CSHARP) {
+            return self.evaluate_csharp_rebuild(alias, repo_path, db_path);
+        }
+        let Some(indexer) = self.symbol_registry.get(lang) else {
+            return RebuildDecision::HelperUnavailable;
+        };
+        // Applicability before availability: the entrypoint check is cheap and
+        // deterministic (mirrors `evaluate_csharp_rebuild`'s .sln-first order),
+        // while helper availability depends on the machine.
+        if !indexer.applies_to(repo_path) {
+            return RebuildDecision::NotApplicable;
+        }
+        if !indexer.is_available() {
+            return RebuildDecision::HelperUnavailable;
+        }
+        if !self.begin_symbol_rebuild(alias, lang) {
+            return RebuildDecision::AlreadyInFlight;
+        }
+        self.end_symbol_rebuild(alias, lang);
+        if !indexer.has_index(db_path) {
+            return RebuildDecision::NoIndex;
+        }
+        RebuildDecision::Fresh
     }
 
     pub(crate) fn schedule_persist_repos_config(self: &Arc<Self>) {
@@ -1411,10 +1813,15 @@ impl ServeState {
         }
     }
 
-    /// Phase 2: semaphore-bounded concurrent C# SCIP rebuilds, sorted by recency.
-    pub(crate) async fn run_phase_2_csharp_scip(self: &Arc<Self>) {
+    /// Phase 2: semaphore-bounded concurrent SCIP rebuilds across all
+    /// installed languages, sorted by recency. C# keeps its dedicated gate
+    /// (`evaluate_csharp_rebuild`); other languages rebuild only a missing
+    /// index (no-thrash: drift is watcher/branch-change driven).
+    pub(crate) async fn run_phase_2_symbols(self: &Arc<Self>) {
         let aliases = self.aliases();
-        let mut candidates: Vec<(String, i64)> = Vec::new();
+        let langs = self.symbol_registry.installed_languages();
+        // (alias, lang, last_changed)
+        let mut candidates: Vec<(String, String, i64)> = Vec::new();
 
         for alias in &aliases {
             let path = match self.config.read().ok().and_then(|c| c.resolve(alias)) {
@@ -1422,70 +1829,79 @@ impl ServeState {
                 None => continue,
             };
             let db_path = path.join(DB_DIR_NAME);
-            // evaluate_csharp_rebuild may spawn a git subprocess and walk the
-            // filesystem — offload to the blocking pool so the async runtime
-            // stays responsive while processing all candidates.
-            let state2 = self.clone();
-            let alias2 = alias.clone();
-            let path2 = path.clone();
-            let db_path2 = db_path.clone();
-            let decision = match tokio::task::spawn_blocking(move || {
-                state2.evaluate_csharp_rebuild(&alias2, &path2, &db_path2)
-            })
-            .await
-            {
-                Ok(d) => d,
-                Err(e) => {
-                    warn!(
-                        "phase-2: evaluate_csharp_rebuild panicked for '{}': {:?}",
-                        alias, e
-                    );
+            for lang in &langs {
+                // evaluate_symbol_rebuild may spawn a git subprocess and walk
+                // the filesystem — offload to the blocking pool so the async
+                // runtime stays responsive while processing all candidates.
+                let state2 = self.clone();
+                let alias2 = alias.clone();
+                let lang2 = lang.clone();
+                let path2 = path.clone();
+                let db_path2 = db_path.clone();
+                let decision = match tokio::task::spawn_blocking(move || {
+                    state2.evaluate_symbol_rebuild(&lang2, &alias2, &path2, &db_path2)
+                })
+                .await
+                {
+                    Ok(d) => d,
+                    Err(e) => {
+                        warn!(
+                            "phase-2: symbol evaluate panicked for '{}' ({}): {:?}",
+                            alias, lang, e
+                        );
+                        continue;
+                    }
+                };
+                if !decision.needs_rebuild() {
+                    // A fresh C# index flips the TUI C# indicator to Ready;
+                    // other languages have no status map, nothing to update.
+                    // Skipped while a build runs: Ready would mask it.
+                    if decision == RebuildDecision::Fresh
+                        && lang.as_str() == LANG_CSHARP
+                        && !self.is_indexing(alias)
+                    {
+                        let mut status = self
+                            .csharp_index_status
+                            .get(alias)
+                            .map(|e| *e.value())
+                            .unwrap_or(CSharpIndexStatus::None);
+                        if matches!(status, CSharpIndexStatus::None) {
+                            status = CSharpIndexStatus::Ready;
+                        }
+                        self.csharp_index_status.insert(alias.to_string(), status);
+                    }
+                    info!("phase-2: skip '{}' ({}) — {:?}", alias, lang, decision);
                     continue;
                 }
-            };
-            if !decision.needs_rebuild() {
-                // If the SCIP index exists and is fresh, mark C# status as Ready
-                // so the TUI shows the C# indicator (e.g. "C#·") instead of None.
-                if decision == RebuildDecision::Fresh {
-                    let mut status = self
-                        .csharp_index_status
-                        .get(alias)
-                        .map(|e| *e.value())
-                        .unwrap_or(CSharpIndexStatus::None);
-                    if matches!(status, CSharpIndexStatus::None) {
-                        status = CSharpIndexStatus::Ready;
-                    }
-                    self.csharp_index_status.insert(alias.to_string(), status);
-                }
-                info!("phase-2: skip '{}' — {:?}", alias, decision);
-                continue;
+                let last_changed = self
+                    .config
+                    .read()
+                    .ok()
+                    .and_then(|c| c.meta(alias).last_changed_unix)
+                    .unwrap_or(0);
+                info!(
+                    "phase-2: queued '{}' ({}) — {:?} (last_changed={})",
+                    alias, lang, decision, last_changed
+                );
+                candidates.push((alias.clone(), lang.clone(), last_changed));
             }
-            let last_changed = self
-                .config
-                .read()
-                .ok()
-                .and_then(|c| c.meta(alias).last_changed_unix)
-                .unwrap_or(0);
-            info!(
-                "phase-2: queued '{}' — {:?} (last_changed={})",
-                alias, decision, last_changed
-            );
-            candidates.push((alias.clone(), last_changed));
         }
 
-        candidates.sort_by_key(|b| std::cmp::Reverse(b.1));
+        candidates.sort_by_key(|c| std::cmp::Reverse(c.2));
         if candidates.is_empty() {
             info!("phase-2 complete: 0 candidates");
             return;
         }
 
-        // Pre-mark all queued candidates as C# Indexing so the TUI C# indicator
+        // Pre-mark queued C# candidates as Indexing so the TUI C# indicator
         // reflects pending rebuilds immediately, even before each repo acquires
         // its semaphore slot. trigger_symbol_rebuild will overwrite this with the
         // same value (no-op) and eventually with Ready or Error on completion.
-        for (alias, _) in &candidates {
-            self.csharp_index_status
-                .insert(alias.clone(), CSharpIndexStatus::Indexing);
+        for (alias, lang, _) in &candidates {
+            if lang.as_str() == LANG_CSHARP {
+                self.csharp_index_status
+                    .insert(alias.clone(), CSharpIndexStatus::Indexing);
+            }
         }
 
         let concurrency = Self::csharp_scip_concurrency();
@@ -1497,18 +1913,26 @@ impl ServeState {
         let sem = Arc::new(Semaphore::new(concurrency));
         let mut handles = Vec::with_capacity(candidates.len());
 
-        for (alias, _) in candidates {
+        for (alias, lang, _) in candidates {
             let sem = sem.clone();
             let state = self.clone();
             handles.push(tokio::spawn(async move {
                 let permit = match sem.acquire_owned().await {
                     Ok(p) => p,
-                    Err(_) => return,
+                    Err(_) => {
+                        if lang.as_str() == LANG_CSHARP {
+                            state.csharp_index_status.remove(&alias);
+                        }
+                        return;
+                    }
                 };
-                info!("phase-2: starting '{}'", alias);
+                info!("phase-2: starting '{}' ({})", alias, lang);
                 let path = match state.config.read().ok().and_then(|c| c.resolve(&alias)) {
                     Some(p) => p,
                     None => {
+                        if lang.as_str() == LANG_CSHARP {
+                            state.csharp_index_status.remove(&alias);
+                        }
                         drop(permit);
                         return;
                     }
@@ -1522,11 +1946,16 @@ impl ServeState {
                         alias,
                         path.display()
                     );
+                    // Skip paths drop the queue pre-mark: no rebuild will
+                    // start, so the row must not keep showing indexing.
+                    if lang.as_str() == LANG_CSHARP {
+                        state.csharp_index_status.remove(&alias);
+                    }
                     drop(permit);
                     return;
                 }
                 let db_path = path.join(DB_DIR_NAME);
-                trigger_symbol_rebuild(&alias, &path, &db_path, &state).await;
+                trigger_symbol_rebuild(&alias, &path, &db_path, &state, &lang).await;
                 drop(permit);
             }));
         }
@@ -1676,9 +2105,12 @@ impl ServeState {
                 // Restore Ready status regardless of pre-warm outcome: the SCIP
                 // definitions index (built in Phase 2) remains valid even if
                 // ref-cache pre-warm fails. TUI returns to "C#·" (ready).
-                state
-                    .csharp_index_status
-                    .insert(alias_owned, CSharpIndexStatus::Ready);
+                // Not while a build runs: it sets the final status itself.
+                if !state.is_indexing(&alias_owned) {
+                    state
+                        .csharp_index_status
+                        .insert(alias_owned, CSharpIndexStatus::Ready);
+                }
             }));
         }
 
@@ -1798,6 +2230,21 @@ impl ServeState {
     /// This is the shared logic used by both the HTTP `DELETE /repos/{alias}` handler
     /// and the TUI confirmation flow.
     pub(crate) async fn remove_repo(&self, alias: &str) -> Result<RepoRemovalOutcome> {
+        self.remove_repo_with_budget(
+            alias,
+            std::time::Duration::from_secs(crate::constants::BG_TASK_COOPERATIVE_TIMEOUT_SECS),
+        )
+        .await
+    }
+
+    /// [`Self::remove_repo`] with an injectable cooperative budget for the
+    /// index-task wait (tests use a short one; production passes
+    /// `BG_TASK_COOPERATIVE_TIMEOUT_SECS`).
+    pub(crate) async fn remove_repo_with_budget(
+        &self,
+        alias: &str,
+        index_task_budget: Duration,
+    ) -> Result<RepoRemovalOutcome> {
         // 1. Resolve project path from config
         let project_path = {
             let config = self
@@ -1831,9 +2278,15 @@ impl ServeState {
         // above cancelled a token nobody listened to, this await found nothing
         // to wait on, and the embed pass kept running (writing chunks, holding
         // the LMDB mmap open) long after remove_repo reported success.
-        // await_index_task cancels the task's OWN token and awaits its exit, so
-        // its Arc<SharedStores> drops before the DB delete below.
-        self.await_index_task(alias).await;
+        // await_index_task cancels the task's OWN token and waits for its
+        // exit, so its Arc<SharedStores> drops before the DB delete below. It
+        // returns false when the task could not be joined within the
+        // cooperative budget (e.g. parked in an uninterruptible build): the DB
+        // delete is then DEFERRED instead of pulling the directory out from
+        // under the live build.
+        let index_task_exited = self
+            .await_index_task_with_budget(alias, index_task_budget)
+            .await;
 
         // 3. Unregister from repos.json
         {
@@ -1872,7 +2325,24 @@ impl ServeState {
         // report honestly.
         let mut db_deleted = !db_path.exists();
         let mut db_delete_error: Option<String> = None;
-        if db_path.exists() {
+        if db_path.exists() && !index_task_exited {
+            // The index task is still alive (typically parked in the
+            // uninterruptible `build_index`). Deleting the directory out from
+            // under it can wedge a serve process: the task's
+            // mmapped LMDB/arroy/Tantivy files vanished mid-build, it never
+            // reached a cancellation point, and it then held its
+            // `Arc<SharedStores>` plus the process-wide job permit for the
+            // process lifetime. Defer instead: the task's post-build guard
+            // (`self_clean_if_unregistered`) deletes the dir once it observes
+            // the removal, and [`Self::sweep_index_tasks`] retries if a panic
+            // skips that path.
+            tracing::warn!(
+                "Database dir for '{}' left in place: its index task is still running \
+                 (cleanup deferred to the task's post-build guard / sweeper)",
+                alias
+            );
+            db_delete_error = Some("index task still running; DB cleanup deferred".to_string());
+        } else if db_path.exists() {
             // Deadline-bounded exponential-backoff retry. We ONLY retry on
             // lock-class errors (sharing/lock violation or access-denied on
             // Windows, or a message hinting the dir is in use) — a genuine
@@ -2102,58 +2572,85 @@ impl ServeState {
         }
     }
 
-    /// Cancel and await the background *indexing* task for `alias`
-    /// (`add_repo`/`reindex` embed pass), if one is registered in
+    /// Cancel and wait (bounded) for the background *indexing* task for
+    /// `alias` (`add_repo`/`reindex` embed pass), if one is registered in
     /// [`Self::index_tasks`].
     ///
-    /// Cancels the task's token first (so an in-flight embed pass aborts at the
-    /// next batch/phase boundary), then awaits its `JoinHandle` with a 5s
-    /// timeout. The await is what guarantees the task's `Arc<SharedStores>` —
-    /// and the LMDB mmap handles it keeps alive on Windows — have actually
-    /// dropped before `remove_repo` deletes the DB directory. Without this,
-    /// `remove_repo` would delete `repos.json` while the detached task kept
-    /// writing chunks into a soon-to-be-orphaned `.codesearch.db`.
-    async fn await_index_task(&self, alias: &str) {
-        if let Some((_, (handle, token))) = self.index_tasks.remove(alias) {
-            token.cancel();
-            // Bounded cooperative join. We deliberately do NOT abort the task
-            // on timeout. An indexing task can be parked inside `build_index`'s
-            // synchronous arroy HNSW build, which runs on a `spawn_blocking`
-            // thread and has no cancellation point Tokio can interrupt.
-            // Aborting the OUTER `JoinHandle` would only detach that blocking
-            // task (it keeps its own `Arc<RwLock<VectorStore>>` clone, so the
-            // LMDB mmap stays open regardless) AND drop the post-build
-            // continuation — including the self-cleanup that deletes the
-            // orphaned `.codesearch.db` dir once the build finishes. So on
-            // timeout we detach the outer task ON PURPOSE: its post-build guard
-            // (`remove_orphaned_db_dir`) releases the handles and self-cleans
-            // the directory. The deadline-bounded delete retry in `remove_repo`
-            // covers builds that finish within its budget; a serve restart reaps
-            // anything left over.
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(crate::constants::BG_TASK_COOPERATIVE_TIMEOUT_SECS),
-                handle,
-            )
-            .await
-            {
-                Ok(Ok(())) => {
-                    tracing::debug!("Index task for '{}' exited cleanly", alias);
-                }
-                Ok(Err(join_err)) => {
-                    tracing::warn!(
-                        "Index task for '{}' panicked during shutdown: {}",
-                        alias,
-                        join_err
-                    );
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "Index task for '{}' still in an uninterruptible build_index after {}s; \
-                         detaching — its post-build guard will self-clean the DB dir",
-                        alias,
-                        crate::constants::BG_TASK_COOPERATIVE_TIMEOUT_SECS,
-                    );
-                }
+    /// Cancels the task's token first (so an in-flight embed pass aborts at
+    /// the next batch/phase boundary), then waits up to the cooperative
+    /// budget for its exit. Returns `true` when the task exited within the
+    /// budget, `false` when it is still running (typically parked inside the
+    /// uninterruptible `build_index`).
+    ///
+    /// The entry is never lost: on timeout the still-pending handle goes back
+    /// into [`Self::index_tasks`]. The old code removed the entry before
+    /// waiting and dropped the handle on timeout, so a detached task held its
+    /// `Arc<SharedStores>` (and the process-wide job permit) invisibly for the
+    /// process lifetime — the leak class this tracking exists to prevent. Keeping
+    /// the handle tracked lets [`Self::sweep_index_tasks`] reap it and clean
+    /// up a removed repo's DB directory once it finally exits.
+    async fn await_index_task(&self, alias: &str) -> bool {
+        self.await_index_task_with_budget(
+            alias,
+            std::time::Duration::from_secs(crate::constants::BG_TASK_COOPERATIVE_TIMEOUT_SECS),
+        )
+        .await
+    }
+
+    /// [`Self::await_index_task`] with an injectable budget (tests use a short
+    /// one; production passes `BG_TASK_COOPERATIVE_TIMEOUT_SECS`).
+    async fn await_index_task_with_budget(&self, alias: &str, budget: Duration) -> bool {
+        let Some((_, task)) = self.index_tasks.remove(alias) else {
+            return true;
+        };
+        task.token.cancel();
+        let IndexTask {
+            mut handle,
+            token,
+            db_path,
+            started_at,
+        } = task;
+        // Bounded cooperative wait; never abort. An indexing task can be
+        // parked inside `build_index`'s synchronous arroy HNSW build, which
+        // runs on a `spawn_blocking` thread and has no cancellation point
+        // Tokio can interrupt. Aborting the OUTER `JoinHandle` would only
+        // detach that blocking task (it keeps its own
+        // `Arc<RwLock<VectorStore>>` clone, so the LMDB mmap stays open
+        // regardless) AND drop the post-build continuation — including the
+        // self-cleanup that deletes the orphaned `.codesearch.db` dir once the
+        // build finishes.
+        match tokio::time::timeout(budget, &mut handle).await {
+            Ok(Ok(())) => {
+                tracing::debug!("Index task for '{}' exited cleanly", alias);
+                true
+            }
+            Ok(Err(join_err)) => {
+                tracing::warn!(
+                    "Index task for '{}' panicked during shutdown: {}",
+                    alias,
+                    join_err
+                );
+                true
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "Index task for '{}' did not exit within {}s; keeping it tracked — the \
+                     stale-task sweeper will reap it and clean up its DB dir once it exits",
+                    alias,
+                    budget.as_secs()
+                );
+                // `timeout(&mut handle)` leaves the handle owned; put it back
+                // so the task can never become invisible.
+                self.index_tasks.insert(
+                    alias.to_string(),
+                    IndexTask {
+                        handle,
+                        token,
+                        db_path,
+                        started_at,
+                    },
+                );
+                false
             }
         }
     }
@@ -2262,8 +2759,8 @@ impl ServeState {
             .unwrap_or(true);
         if registered {
             tracing::info!(
-                "Task for '{}' was cancelled but the repo is still registered — keeping its DB \
-                 dir (handles released)",
+                "Index task for '{}' ended but the repo is still registered — keeping its DB \
+                 dir",
                 alias
             );
             return;
@@ -2510,6 +3007,9 @@ impl ServeState {
             }
         };
         if let Some(total_chunks) = needs_build {
+            // HNSW construction is one of the heaviest single operations a repo
+            // can do; draw the process-wide job permit around it.
+            let _job_permit = stores.acquire_job_permit().await;
             info!(
                 "Warmup '{}': building vector index ({} existing chunks)",
                 alias, total_chunks
@@ -2577,14 +3077,25 @@ impl ServeState {
             let alias_hb = alias.to_string();
             Arc::new(move || state.renew_indexing(&alias_hb, IndexingOwner::Warmup))
         };
-        let refreshed = IndexManager::perform_incremental_refresh_with_stores(
-            &path,
-            &db_path,
-            &stores,
-            &CancellationToken::new(),
-            Some(&pool),
-            Some(&heartbeat),
-        )
+        // Same transient-FTS redrive as the add/reindex paths: the warmup
+        // commit is just as exposed to the AV/Search-Indexer lock race, and
+        // a warmup failure without a retry leaves the repo re-embedded but
+        // uncommitted (field incident: a warmup refresh, 15 Oct 2026).
+        const FTS_TRANSIENT_BACKOFFS: [std::time::Duration; 2] = [
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(20),
+        ];
+        let refreshed = IndexManager::retry_on_transient_fts(&FTS_TRANSIENT_BACKOFFS, || async {
+            IndexManager::perform_incremental_refresh_with_stores(
+                &path,
+                &db_path,
+                &stores,
+                &CancellationToken::new(),
+                Some(&pool),
+                Some(&heartbeat),
+            )
+            .await
+        })
         .await;
         self.end_indexing(alias, IndexingOwner::Warmup);
         if let Err(e) = refreshed {
@@ -2704,6 +3215,8 @@ impl ServeState {
         // "Index not built" until the background refresh completes.
         // build_index() is CPU-heavy — offload to the blocking pool so the async
         // runtime is not stalled while building the HNSW index for large repos.
+        // The open itself is part of a heavy job: hold a process-wide permit.
+        let _job_permit = stores.acquire_job_permit().await;
         {
             let vector_store = Arc::clone(&stores.vector_store);
             let alias_owned = alias.to_string();
@@ -2983,7 +3496,7 @@ impl ServeState {
             return match SharedStores::new_readonly(db_path, dims) {
                 Ok(s) => {
                     info!("Opened repo in readonly mode (forced by config): {}", alias);
-                    let stores_arc = Arc::new(s);
+                    let stores_arc = Arc::new(s.with_job_gate(Arc::clone(&self.job_gate)));
                     self.repos.insert(
                         alias.to_string(),
                         RepoState::Readonly {
@@ -3003,7 +3516,9 @@ impl ServeState {
         match SharedStores::new(db_path, dims) {
             Ok(s) => {
                 info!("Opened repo in write mode: {}", alias);
-                Ok(OpenedStores::Write(Arc::new(s)))
+                Ok(OpenedStores::Write(Arc::new(
+                    s.with_job_gate(Arc::clone(&self.job_gate)),
+                )))
             }
             Err(write_err) => {
                 if allow_create {
@@ -3015,7 +3530,7 @@ impl ServeState {
                 match SharedStores::new_readonly(db_path, dims) {
                     Ok(s) => {
                         info!("Opened repo in readonly mode: {}", alias);
-                        let stores_arc = Arc::new(s);
+                        let stores_arc = Arc::new(s.with_job_gate(Arc::clone(&self.job_gate)));
                         self.repos.insert(
                             alias.to_string(),
                             RepoState::Readonly {
@@ -3227,6 +3742,62 @@ impl ServeState {
         self.active_sessions.load(Ordering::Relaxed)
     }
 
+    /// Durable symbol-index warnings for the info surfaces: read fresh from
+    /// the on-disk meta of every symbol language, language-prefixed.
+    /// Deliberately NOT filtered by installed languages — reading meta needs
+    /// no helper, and a helper that vanished after a degraded rebuild must
+    /// not hide the record. Unlike the in-memory C# status this survives a
+    /// serve restart.
+    pub(crate) fn collect_symbol_warnings(&self, db_path: &Path) -> Vec<String> {
+        let mut warnings: Vec<String> = Vec::new();
+        for lang in [LANG_CSHARP, LANG_TYPESCRIPT] {
+            if let Some(indexer) = self.symbol_registry.get(lang) {
+                let lang_warnings = indexer.index_warnings(db_path);
+                if !lang_warnings.is_empty() {
+                    warnings.extend(
+                        lang_warnings
+                            .into_iter()
+                            .map(|w| format!("[{}] {w}", indexer.language())),
+                    );
+                }
+            }
+        }
+        warnings
+    }
+
+    /// Per-language symbol-index status for the info surfaces — the same
+    /// shared collector find_impact answers carry, so the TUI, REST and MCP
+    /// surfaces cannot disagree about what "ready" means. Needs the project
+    /// path (applicability) next to the db path.
+    pub(crate) fn collect_symbol_index_status(
+        &self,
+        project_path: &Path,
+        db_path: &Path,
+    ) -> Vec<crate::symbols::SymbolIndexStatus> {
+        crate::symbols::symbol_index_status(&self.symbol_registry, project_path, db_path)
+    }
+
+    /// Record a failed first build for a newly added repo: log the error
+    /// with the heal command and release the Reindex marker. Deliberately
+    /// does NOT unregister — a vanished repo (the old rollback) is
+    /// unfixable by the operator who cannot even see it; a registered one
+    /// heals via reindex.
+    pub(crate) fn note_add_index_failure(
+        &self,
+        alias: &str,
+        project_path: &Path,
+        error: &anyhow::Error,
+    ) {
+        tracing::error!(
+            "Index creation failed for '{}' ({}): {error:#} — the repo stays \
+             registered with a partial index; reindex it to heal: \
+             `codesearch index reindex {alias}` (or POST /repos/{alias}/reindex)",
+            alias,
+            project_path.display()
+        );
+        self.end_indexing(alias, IndexingOwner::Reindex);
+    }
+
     /// Get lightweight repo statuses WITHOUT opening any databases.
     /// Returns a list of (alias, status_info) where status is derived from DashMap state only.
     pub(crate) fn repo_statuses_lightweight(&self) -> Vec<(String, RepoStatusInfo)> {
@@ -3240,25 +3811,14 @@ impl ServeState {
             let db_path = path.join(DB_DIR_NAME);
             let db_exists = db_path.exists();
 
-            let label = if self.is_indexing(alias) {
-                RepoStateLabel::Indexing
-            } else {
-                match self.repos.get(alias) {
-                    Some(entry) => match entry.value() {
-                        RepoState::Write { .. } => RepoStateLabel::Open,
-                        RepoState::Warm { .. } => RepoStateLabel::Warm,
-                        RepoState::Readonly { .. } => RepoStateLabel::Readonly,
-                        RepoState::Conflicted => RepoStateLabel::Error,
-                    },
-                    None => {
-                        if !db_exists {
-                            RepoStateLabel::NoIndex
-                        } else {
-                            RepoStateLabel::Idle
-                        }
-                    }
-                }
-            };
+            // Evict stale markers first (side effect the owner-scoped reads
+            // below rely on); the any-owner boolean itself is no longer the
+            // label key.
+            self.is_indexing(alias);
+            // Owner-scoped: only text-indexing flows light the general
+            // "Indexing" label; symbol rebuilds own the language columns.
+            let text_indexing = self.has_text_indexing_marker(alias);
+            let symbol_indexing = self.has_symbol_indexing_marker(alias);
 
             let changes = match self.repos.get(alias) {
                 Some(entry) => match entry.value() {
@@ -3288,26 +3848,36 @@ impl ServeState {
                 .map(|c| c.load(Ordering::Relaxed))
                 .unwrap_or(0);
 
-            // C# index status: check cached value first, then probe
-            let csharp_index = self
-                .csharp_index_status
-                .get(alias)
-                .map(|e| *e.value())
-                .unwrap_or_else(|| {
-                    // Probe: helper available + index exists → Ready
-                    let registry = &self.symbol_registry;
-                    let has_helper = registry
+            // The repo-level indexing flag only shows as a language's `Indexing`
+            // where that language applies; elsewhere (e.g. a Rust-only repo) the
+            // symbol column keeps its normal None/probe result. A cached status
+            // exists only for repos where a rebuild ran, so it also counts.
+            let cached_csharp = self.csharp_index_status.get(alias).map(|e| *e.value());
+            let csharp_building = symbol_indexing
+                && (cached_csharp.is_some()
+                    || self
+                        .symbol_registry
                         .get(LANG_CSHARP)
-                        .map(|i| i.is_available())
-                        .unwrap_or(false);
-                    if has_helper && registry.has_index_for(LANG_CSHARP, &db_path) {
-                        CSharpIndexStatus::Ready
-                    } else {
-                        CSharpIndexStatus::None
-                    }
-                });
+                        .map(|i| i.applies_to(path))
+                        .unwrap_or(false));
+            let csharp_index = resolve_csharp_status(cached_csharp, csharp_building, || {
+                // Probe: helper available + index exists → Ready
+                let registry = &self.symbol_registry;
+                let has_helper = registry
+                    .get(LANG_CSHARP)
+                    .map(|i| i.is_available())
+                    .unwrap_or(false);
+                if has_helper && registry.has_index_for(LANG_CSHARP, &db_path) {
+                    CSharpIndexStatus::Ready
+                } else {
+                    CSharpIndexStatus::None
+                }
+            });
 
-            let csharp_error = if matches!(csharp_index, CSharpIndexStatus::Error) {
+            let csharp_error = if matches!(
+                csharp_index,
+                CSharpIndexStatus::Error | CSharpIndexStatus::Partial
+            ) {
                 self.csharp_index_error
                     .get(alias)
                     .map(|e: dashmap::mapref::one::Ref<String, String>| e.value().clone())
@@ -3321,7 +3891,14 @@ impl ServeState {
             // exists → Ready; otherwise None. The TUI icon reflects "an index
             // exists", which is exactly what matters for discoverability.
             let registry = &self.symbol_registry;
-            let typescript_index = {
+            let ts_building = symbol_indexing
+                && registry
+                    .get(LANG_TYPESCRIPT)
+                    .map(|i| i.applies_to(path) && i.is_available())
+                    .unwrap_or(false);
+            let typescript_index = if ts_building {
+                CSharpIndexStatus::Indexing
+            } else {
                 let has_ts_helper = registry
                     .get(LANG_TYPESCRIPT)
                     .map(|i| i.is_available())
@@ -3330,6 +3907,32 @@ impl ServeState {
                     CSharpIndexStatus::Ready
                 } else {
                     CSharpIndexStatus::None
+                }
+            };
+
+            // Only TEXT-indexing flows light the general label. A queued or
+            // running symbol rebuild (phase-2 pre-mark, watcher SCIP pass)
+            // shows in the C#/TS columns only — a pure SCIP pass never made
+            // the text index busy, and "Indexing" there read as "the normal
+            // index is stuck". Both owner reads run after is_indexing's
+            // stale eviction.
+            let label = if text_indexing {
+                RepoStateLabel::Indexing
+            } else {
+                match self.repos.get(alias) {
+                    Some(entry) => match entry.value() {
+                        RepoState::Write { .. } => RepoStateLabel::Open,
+                        RepoState::Warm { .. } => RepoStateLabel::Warm,
+                        RepoState::Readonly { .. } => RepoStateLabel::Readonly,
+                        RepoState::Conflicted => RepoStateLabel::Error,
+                    },
+                    None => {
+                        if !db_exists {
+                            RepoStateLabel::NoIndex
+                        } else {
+                            RepoStateLabel::Idle
+                        }
+                    }
                 }
             };
 
@@ -3506,16 +4109,17 @@ impl ServeState {
     /// closed. Naming the holders turns a two-day silent failure into one
     /// warning line.
     ///
-    /// Gated on a still-running index task: the reaper only evicts repos that
-    /// are not indexing, so a live task here means its marker was already
-    /// evicted as stale — the leak signature. Without that gate the warning
-    /// would fire on every eviction, because a just-cancelled FSW drains
-    /// asynchronously and still holds the env for a moment.
+    /// Gated on a still-running index task: the idle reaper evicts repos only
+    /// when they are not indexing, so a live task at eviction time means its
+    /// marker is missing or was dropped by another flow (e.g. a stale
+    /// non-Reindex marker) — the leak/teardown signature. Without that gate
+    /// the warning would fire on every eviction, because a just-cancelled FSW
+    /// drains asynchronously and still holds the env for a moment.
     fn warn_if_still_held(&self, alias: &str) {
         let leaked_task = self
             .index_tasks
             .get(alias)
-            .is_some_and(|entry| !entry.value().0.is_finished());
+            .is_some_and(|entry| !entry.value().handle.is_finished());
         if !leaked_task {
             return;
         }
@@ -3537,25 +4141,30 @@ impl ServeState {
     ///
     /// Closes DB handles, stops FSW, and releases memory. The repo will be
     /// automatically re-opened (and re-warmed) on the next query.
-    /// Active reindexes are never evicted.
+    /// Active reindexes are never evicted, and their idle clock restarts on
+    /// every sweep they are seen indexing.
     pub(crate) fn evict_idle_repos(&self) {
         let timeout = self.idle_timeout();
         let now = std::time::Instant::now();
 
-        // Collect aliases to evict (can't mutate DashMap while iterating)
-        let to_evict: Vec<String> = self
+        // Snapshot first: refreshing `last_access` below must not run while the
+        // map is being iterated (an insert on a read-locked shard deadlocks).
+        let snapshot: Vec<(String, Instant)> = self
             .last_access
             .iter()
-            .filter(|entry| {
-                let alias = entry.key();
-                // Don't evict repos that are being reindexed
-                if self.is_indexing(alias) {
-                    return false;
-                }
-                now.duration_since(*entry.value()) >= timeout
-            })
-            .map(|entry| entry.key().clone())
+            .map(|entry| (entry.key().clone(), *entry.value()))
             .collect();
+        let mut to_evict: Vec<String> = Vec::new();
+        for (alias, last) in &snapshot {
+            if self.is_indexing(alias) {
+                // Never evict a repo mid-build, and restart its idle clock: a
+                // build longer than the timeout would otherwise leave the repo
+                // "idle" the instant it finishes and evict it on the next sweep.
+                self.touch_access(alias);
+            } else if now.duration_since(*last) >= timeout {
+                to_evict.push(alias.clone());
+            }
+        }
 
         // Log reaper status even when nothing to evict (for debugging idle eviction)
         if !self.last_access.is_empty() {
@@ -3766,12 +4375,14 @@ async fn status_handler(
             let csharp_str = match info.csharp_index {
                 CSharpIndexStatus::None => "none",
                 CSharpIndexStatus::Ready => "ready",
+                CSharpIndexStatus::Partial => "partial",
                 CSharpIndexStatus::Error => "error",
                 CSharpIndexStatus::Indexing => "indexing",
             };
             let ts_str = match info.typescript_index {
                 CSharpIndexStatus::None => "none",
                 CSharpIndexStatus::Ready => "ready",
+                CSharpIndexStatus::Partial => "partial",
                 CSharpIndexStatus::Error => "error",
                 CSharpIndexStatus::Indexing => "indexing",
             };
@@ -3995,6 +4606,14 @@ async fn info_handler(
 
     let db_size_human = tui::dir_size_human(&db_path);
 
+    // Durable symbol-index warnings, read fresh from the on-disk meta
+    // (shared with the TUI info overlay so the two cannot drift).
+    let symbol_warnings = state.collect_symbol_warnings(&db_path);
+    // Per-language symbol-index status — the same shared collector the TUI
+    // overlay and find_impact answers use, so a consumer can tell a working
+    // symbol index from an absent/stale/degraded one before trusting it.
+    let symbol_index = state.collect_symbol_index_status(&project_path, &db_path);
+
     AxumJson(json!({
         "path": db_path.display().to_string(),
         "chunks": chunks,
@@ -4005,6 +4624,15 @@ async fn info_handler(
         "dims": dims,
         "lock": lock,
         "index_age": index_age,
+        // Durable record of a degraded symbol index (see the TUI's C#⚠):
+        // build-environment failures the helper survived during rebuild.
+        "symbol_warnings": symbol_warnings,
+        // Per-language symbol-index status (ready/degraded/stale/
+        // restore-pending/absent/not-applicable): is there a usable SCIP
+        // index at all, and is it THIS build's? The chunk fields above say
+        // nothing about it — that gap made agents trust "0 references"
+        // from a repo with no symbol index.
+        "symbol_index": symbol_index,
         // Is the HNSW graph built and committed? A non-zero `chunks` with
         // `indexed: false` is a searchable-looking but silently dead index:
         // `VectorStore::search` refuses to run without the graph. The cloud
@@ -4071,38 +4699,118 @@ async fn doctor_handler(
     AxumJson(json!({ "results": results })).into_response()
 }
 
-/// Trigger a symbol index rebuild for a repo (C# etc.).
+/// Holds `owner`'s indexing marker for `alias` and keeps it fresh until
+/// dropped, however the run exits (success, error, panic, cancelled future).
 ///
-/// Reuses the shared `SymbolIndexerRegistry` from `ServeState`, looks up the C# indexer,
-/// and runs `rebuild()` in a blocking task. Updates the C# index status on success/failure.
+/// A flow with no per-batch progress hook (the SCIP rebuild is one opaque
+/// blocking call) would otherwise age out at `MAX_INDEXING_SECS`, letting the
+/// idle reaper evict the repo mid-build.
+struct IndexingMarkerGuard {
+    state: Arc<ServeState>,
+    alias: String,
+    owner: IndexingOwner,
+    /// `Some` only when this guard acquired the marker; an inert guard (another
+    /// owner already holds the alias) neither renews nor ends anything.
+    heartbeat: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl IndexingMarkerGuard {
+    /// Must be called inside a tokio runtime (the heartbeat is a spawned task).
+    fn begin(
+        state: &Arc<ServeState>,
+        alias: &str,
+        owner: IndexingOwner,
+        heartbeat_every: Duration,
+    ) -> Self {
+        let heartbeat = state.begin_indexing(alias, owner).then(|| {
+            let state = Arc::clone(state);
+            let alias = alias.to_string();
+            tokio::spawn(async move {
+                let start = tokio::time::Instant::now() + heartbeat_every;
+                let mut tick = tokio::time::interval_at(start, heartbeat_every);
+                loop {
+                    tick.tick().await;
+                    state.refresh_indexing_if_held(&alias, owner);
+                }
+            })
+        });
+        Self {
+            state: Arc::clone(state),
+            alias: alias.to_string(),
+            owner,
+            heartbeat,
+        }
+    }
+}
+
+impl Drop for IndexingMarkerGuard {
+    fn drop(&mut self) {
+        if let Some(heartbeat) = self.heartbeat.take() {
+            heartbeat.abort();
+            self.state.end_indexing(&self.alias, self.owner);
+        }
+    }
+}
+
+/// Trigger a symbol index rebuild for a repo in one language (C#, TypeScript).
+///
+/// Reuses the shared `SymbolIndexerRegistry` from `ServeState`, looks up the
+/// indexer for `lang`, and runs `rebuild()` in a blocking task. C#-only
+/// bookkeeping (TUI status/error maps, `last_scip` timestamp) stays gated on
+/// the language; `IndexingOwner::Symbol` markers apply to every language.
+///
+/// A per-`(alias, language)` in-flight slot prevents two concurrent full
+/// rebuilds from interleaving their LMDB clear/write passes (find_impact
+/// self-heal racing phase-2/reindex/watcher). Languages for one alias run
+/// sequentially at multi-language call sites (see `maybe_rebuild_symbols`) —
+/// the `IndexingOwner::Symbol` marker is not language-scoped.
 async fn trigger_symbol_rebuild(
     alias: &str,
     project_path: &Path,
     db_path: &Path,
     state: &Arc<ServeState>,
+    lang: &str,
 ) {
+    let is_csharp = lang.eq_ignore_ascii_case(LANG_CSHARP);
     // Skip non-applicable repos BEFORE touching status — otherwise the TUI
     // would flip C#-indicator red on Rust/Python repos that simply have no
-    // .sln. The phase-2 gate (`evaluate_csharp_rebuild`) already filters
+    // .sln. The phase-2 gate (`evaluate_symbol_rebuild`) already filters
     // these out, but other callers (POST /reindex?symbols=true,
-    // .cs watcher debounce, future paths) bypass that gate.
+    // .cs watcher debounce, find_impact self-heal) bypass that gate.
     let applies = state
         .symbol_registry
-        .get(LANG_CSHARP)
+        .get(lang)
         .map(|i| i.applies_to(project_path))
         .unwrap_or(false);
     if !applies {
         tracing::info!(
-            "🔬 symbol reindex skipped for '{}': not applicable (no .sln)",
+            "🔬 symbol reindex skipped for '{}': not applicable (no .sln / tsconfig.json)",
             alias
+        );
+        // A queued pre-mark (phase-2) can outlive its applicability window
+        // (e.g. the .sln vanished while the task waited for its slot): drop
+        // it — no rebuild will start here to overwrite it.
+        if is_csharp {
+            state.csharp_index_status.remove(alias);
+        }
+        return;
+    }
+
+    if !state.begin_symbol_rebuild(alias, lang) {
+        tracing::info!(
+            "🔬 symbol reindex skipped for '{}' ({}): already in flight",
+            alias,
+            lang
         );
         return;
     }
 
-    tracing::info!("🔬 symbol reindex triggered for '{}'", alias);
-    state
-        .csharp_index_status
-        .insert(alias.to_string(), CSharpIndexStatus::Indexing);
+    tracing::info!("🔬 symbol reindex triggered for '{}' ({})", alias, lang);
+    if is_csharp {
+        state
+            .csharp_index_status
+            .insert(alias.to_string(), CSharpIndexStatus::Indexing);
+    }
     // Mark as actively indexing so the TUI status column shows "Indexing"
     // (not just the C# indicator). This mirrors what reindex_handler does.
     //
@@ -4110,22 +4818,38 @@ async fn trigger_symbol_rebuild(
     // for the same alias simultaneously, each path ends only its own marker,
     // so neither can flip the TUI back to Warm/Open while the other still
     // runs. (Stale entries from a crashed task self-heal via `is_indexing`.)
-    state.begin_indexing(alias, IndexingOwner::Symbol);
+    // Nested callers (the reindex and add-repo background tasks) legitimately
+    // hold the alias's Reindex marker while triggering this; the guard is then
+    // inert and that marker covers the run.
+    let marker = IndexingMarkerGuard::begin(
+        state,
+        alias,
+        IndexingOwner::Symbol,
+        Duration::from_secs(INDEXING_MARKER_HEARTBEAT_SECS),
+    );
     let rp = project_path.to_path_buf();
     let dp = db_path.to_path_buf();
     let alias_owned = alias.to_string();
+    let lang_owned = lang.to_string();
     let registry = state.symbol_registry.clone();
-    match tokio::task::spawn_blocking(move || {
-        let Some(indexer) = registry.get(LANG_CSHARP) else {
-            return Err(anyhow::anyhow!("No C# symbol indexer registered"));
+    let rebuilt = tokio::task::spawn_blocking(move || {
+        let Some(indexer) = registry.get(&lang_owned) else {
+            return Err(anyhow::anyhow!(
+                "No symbol indexer registered for '{lang_owned}'"
+            ));
         };
         if !indexer.is_available() {
-            return Err(anyhow::anyhow!("scip-csharp helper not available"));
+            return Err(anyhow::anyhow!(
+                "symbol helper for '{lang_owned}' not available"
+            ));
         }
         indexer.rebuild(&rp, &dp, RebuildScope::Full)
     })
-    .await
-    {
+    .await;
+    // Released before the outcome handling: format recovery enqueued below
+    // reindexes through `begin_indexing`, which a live Symbol marker rejects.
+    drop(marker);
+    match rebuilt {
         Ok(Ok(summary)) => {
             tracing::info!(
                 "✅ Symbol rebuild complete for '{}': {} symbols, {} refs in {}ms",
@@ -4134,59 +4858,89 @@ async fn trigger_symbol_rebuild(
                 summary.references_stored,
                 summary.duration_ms
             );
-            state.end_indexing(&alias_owned, IndexingOwner::Symbol);
-            state
-                .csharp_index_status
-                .insert(alias_owned.clone(), CSharpIndexStatus::Ready);
-            state.csharp_index_error.remove(&alias_owned);
+            if is_csharp {
+                let (status, detail) = csharp_success_outcome(&summary.index_warnings);
+                state
+                    .csharp_index_status
+                    .insert(alias_owned.clone(), status);
+                if let Some(detail) = detail {
+                    state.csharp_index_error.insert(alias_owned.clone(), detail);
+                } else {
+                    state.csharp_index_error.remove(&alias_owned);
+                }
 
-            if let Ok(mut cfg) = state.config.write() {
-                cfg.touch_last_scip(&alias_owned, ServeState::now_unix_secs());
+                if let Ok(mut cfg) = state.config.write() {
+                    cfg.touch_last_scip(&alias_owned, ServeState::now_unix_secs());
+                }
+                state.schedule_persist_repos_config();
             }
-            state.schedule_persist_repos_config();
         }
         Ok(Err(e)) => {
             // `{:#}` — the whole chain, not just the outermost context. The
             // SCIP puts wrap their errors (table + key size), and plain `{}`
             // would hide the `MDB_*` code the classifier below matches on.
             let msg = format!("{e:#}");
-            state.end_indexing(&alias_owned, IndexingOwner::Symbol);
-            state
-                .csharp_index_error
-                .insert(alias_owned.clone(), msg.clone());
-            if ServeState::is_lmdb_format_corruption(&msg)
-                && state.enqueue_format_recovery(&alias_owned)
-            {
-                tracing::warn!(
-                    "⚠️ LMDB storage-format corruption for '{}' — queueing sequential wipe + \
-                     full rebuild. Raw error: {}",
-                    alias_owned,
-                    msg
-                );
-                // Recovery owns the outcome from here: show in-progress rather
-                // than Error; it flips to Ready on success or Error on failure.
+            if is_csharp {
                 state
-                    .csharp_index_status
-                    .insert(alias_owned, CSharpIndexStatus::Indexing);
-            } else if ServeState::is_lmdb_format_corruption(&msg) {
-                // A wipe already happened for this alias in this process, so the
-                // data was written by the running binary: the error is write-side
-                // (LMDB rejects an empty or >511-byte key), not an old format.
-                // Wiping again would only restart a multi-hour reindex loop.
-                tracing::error!(
-                    "❌ Symbol rebuild for '{}' hit an LMDB key/value-size error AFTER a format \
-                     wipe — refusing a second wipe, this is a bug in the writer: {}",
-                    alias_owned,
-                    msg
-                );
-                state
-                    .csharp_index_status
-                    .insert(alias_owned, CSharpIndexStatus::Error);
-            } else {
-                tracing::error!("❌ Symbol rebuild failed for '{}': {}", alias_owned, msg);
-                state
-                    .csharp_index_status
-                    .insert(alias_owned, CSharpIndexStatus::Error);
+                    .csharp_index_error
+                    .insert(alias_owned.clone(), msg.clone());
+            }
+            match classify_symbol_rebuild_failure(&msg, &e, is_csharp) {
+                SymbolRebuildFailureKind::RestoreExhausted => {
+                    // Restore never finished within the retry cap: the previous
+                    // index stays live — warning (yellow C#⚠ + detail), not a red
+                    // Error, and no touch_last_scip: the index is stale, the next
+                    // rebuild attempt must not be gated as fresh.
+                    tracing::warn!(
+                        "⚠️ Symbol rebuild abandoned for '{}': dotnet restore did not finish \
+                         within the retry cap — previous index stays live",
+                        alias_owned
+                    );
+                    state
+                        .csharp_index_status
+                        .insert(alias_owned, CSharpIndexStatus::Partial);
+                }
+                SymbolRebuildFailureKind::LmdbCorruption => {
+                    if state.enqueue_format_recovery(&alias_owned) {
+                        tracing::warn!(
+                            "⚠️ LMDB storage-format corruption for '{}' — queueing sequential wipe + \
+                             full rebuild. Raw error: {}",
+                            alias_owned,
+                            msg
+                        );
+                        // Recovery owns the outcome from here: show in-progress rather
+                        // than Error; it flips to Ready on success or Error on failure.
+                        if is_csharp {
+                            state
+                                .csharp_index_status
+                                .insert(alias_owned, CSharpIndexStatus::Indexing);
+                        }
+                    } else {
+                        // A wipe already happened for this alias in this process, so the
+                        // data was written by the running binary: the error is write-side
+                        // (LMDB rejects an empty or >511-byte key), not an old format.
+                        // Wiping again would only restart a multi-hour reindex loop.
+                        tracing::error!(
+                            "❌ Symbol rebuild for '{}' hit an LMDB key/value-size error AFTER a format \
+                             wipe — refusing a second wipe, this is a bug in the writer: {}",
+                            alias_owned,
+                            msg
+                        );
+                        if is_csharp {
+                            state
+                                .csharp_index_status
+                                .insert(alias_owned, CSharpIndexStatus::Error);
+                        }
+                    }
+                }
+                SymbolRebuildFailureKind::Generic => {
+                    tracing::error!("❌ Symbol rebuild failed for '{}': {}", alias_owned, msg);
+                    if is_csharp {
+                        state
+                            .csharp_index_status
+                            .insert(alias_owned, CSharpIndexStatus::Error);
+                    }
+                }
             }
         }
         Err(e) => {
@@ -4195,15 +4949,107 @@ async fn trigger_symbol_rebuild(
                 alias_owned,
                 e
             );
-            state.end_indexing(&alias_owned, IndexingOwner::Symbol);
-            state
-                .csharp_index_error
-                .insert(alias_owned.clone(), format!("Task panicked: {}", e));
-            state
-                .csharp_index_status
-                .insert(alias_owned, CSharpIndexStatus::Error);
+            if is_csharp {
+                state
+                    .csharp_index_error
+                    .insert(alias_owned.clone(), format!("Task panicked: {}", e));
+                state
+                    .csharp_index_status
+                    .insert(alias_owned, CSharpIndexStatus::Error);
+            }
         }
     }
+    state.end_symbol_rebuild(alias, lang);
+}
+
+/// Evaluate every installed symbol language for `alias` and rebuild the ones
+/// whose gate says so. `force` (POST /reindex?symbols=true) bypasses the
+/// gate, preserving the old unconditional-rebuild behaviour.
+///
+/// Sequential per language: `IndexingOwner::Symbol` is not language-scoped,
+/// so parallel languages would collide on the marker. Called from the
+/// reindex and add-repo background tasks, where the alias already holds a
+/// Reindex owner marker — `trigger_symbol_rebuild`'s own marker insert is
+/// additive, not a guard, so nesting is safe.
+async fn maybe_rebuild_symbols(
+    alias: &str,
+    project_path: &Path,
+    db_path: &Path,
+    state: &Arc<ServeState>,
+    force: bool,
+) {
+    let langs = state.symbol_registry.installed_languages();
+    for lang in langs {
+        let decision = if force {
+            RebuildDecision::ChangedSinceLastBuild
+        } else {
+            // evaluate may spawn a git subprocess — offload like phase-2.
+            let st = Arc::clone(state);
+            let a = alias.to_string();
+            let l = lang.clone();
+            let p = project_path.to_path_buf();
+            let d = db_path.to_path_buf();
+            match tokio::task::spawn_blocking(move || st.evaluate_symbol_rebuild(&l, &a, &p, &d))
+                .await
+            {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!(
+                        "symbol evaluate panicked for '{}' ({}): {:?}",
+                        alias, lang, e
+                    );
+                    continue;
+                }
+            }
+        };
+        if decision.needs_rebuild() {
+            trigger_symbol_rebuild(alias, project_path, db_path, state, &lang).await;
+        } else {
+            info!("symbols fresh for '{}' ({}) — {:?}", alias, lang, decision);
+        }
+    }
+}
+
+/// Fire-and-forget self-heal invoked by `find_impact` when the target index
+/// does not exist: rebuild exactly that language's *missing* index — never on
+/// drift (reindexing per query would thrash; see
+/// `SymbolIndexer::index_head_sha`). The alias is re-resolved from the serve
+/// config so remote-mounted projects (`peer/name`) are never healed locally.
+pub(crate) async fn heal_missing_symbol_index(state: &Arc<ServeState>, alias: &str, lang: &str) {
+    let Some(path) = state.config.read().ok().and_then(|c| c.resolve(alias)) else {
+        return;
+    };
+    if !path.exists() {
+        return;
+    }
+    let db_path = path.join(DB_DIR_NAME);
+    // evaluate may spawn a git subprocess (C# last_changed bootstrap) —
+    // offload so the heal task never blocks an async worker.
+    let st = Arc::clone(state);
+    let a = alias.to_string();
+    let l = lang.to_string();
+    let p = path.clone();
+    let d = db_path.clone();
+    let decision =
+        match tokio::task::spawn_blocking(move || st.evaluate_symbol_rebuild(&l, &a, &p, &d)).await
+        {
+            Ok(decision) => decision,
+            Err(e) => {
+                warn!(
+                    "self-heal evaluate panicked for '{}' ({}): {:?}",
+                    alias, lang, e
+                );
+                return;
+            }
+        };
+    if decision != RebuildDecision::NoIndex {
+        return;
+    }
+    info!(
+        "🔬 self-heal: '{}' has no {} symbol index — rebuilding in background (triggered by find_impact)",
+        alias, lang
+    );
+    trigger_symbol_rebuild(alias, &path, &db_path, state, lang).await;
 }
 
 /// Reload repos config handler: POST /reload
@@ -4334,6 +5180,8 @@ async fn reindex_handler(
     let guard_alias = alias_bg.clone();
     let guard_state = state.clone();
 
+    // `symbols=true` forces a symbol rebuild; without it the rebuild is
+    // gate-driven (missing/stale indexes are still healed).
     let do_symbols = symbols;
 
     if force {
@@ -4400,6 +5248,9 @@ async fn reindex_handler(
 
         let g_alias = guard_alias.clone();
         let g_state = guard_state.clone();
+        // The task closure moves `db_path`; keep a copy for the tracked entry
+        // so a removed repo's DB dir can be cleaned up after the task exits.
+        let task_db_path = db_path.clone();
         let handle = tokio::spawn(async move {
             tracing::info!(
                 "Force reindex for '{}': clearing stores and reindexing",
@@ -4459,16 +5310,21 @@ async fn reindex_handler(
             // 3. Restart FSW with fresh IndexManager.
             g_state.restart_fsw(&g_alias, stores).await;
 
-            // 4. Optional symbol index rebuild
-            if do_symbols {
-                trigger_symbol_rebuild(&alias_bg, &project_path, &db_path, &g_state).await;
-            }
+            // 4. Symbol index rebuild — gate-driven for every installed
+            // language; `symbols=true` forces it (previous behaviour).
+            maybe_rebuild_symbols(&alias_bg, &project_path, &db_path, &g_state, do_symbols).await;
 
             g_state.end_indexing(&g_alias, IndexingOwner::Reindex);
         });
-        state
-            .index_tasks
-            .insert(alias.to_string(), (handle, reindex_token));
+        state.index_tasks.insert(
+            alias.to_string(),
+            IndexTask {
+                handle,
+                token: reindex_token,
+                db_path: task_db_path,
+                started_at: Instant::now(),
+            },
+        );
     } else {
         // Incremental refresh: ensure the repo is opened, then refresh
         let stores = match state.get_or_open_stores(&alias, true).await {
@@ -4492,6 +5348,9 @@ async fn reindex_handler(
 
         let g_alias = guard_alias.clone();
         let g_state = guard_state.clone();
+        // The task closure moves `db_path`; keep a copy for the tracked entry
+        // so a removed repo's DB dir can be cleaned up after the task exits.
+        let task_db_path = db_path.clone();
         let handle = tokio::spawn(async move {
             tracing::info!(
                 "🔄 Incremental reindex triggered for '{}' via HTTP API",
@@ -4533,16 +5392,21 @@ async fn reindex_handler(
                 return;
             }
 
-            // Optional symbol index rebuild
-            if do_symbols {
-                trigger_symbol_rebuild(&alias_bg, &project_path, &db_path, &g_state).await;
-            }
+            // Symbol index rebuild — gate-driven for every installed
+            // language; `symbols=true` forces it (previous behaviour).
+            maybe_rebuild_symbols(&alias_bg, &project_path, &db_path, &g_state, do_symbols).await;
 
             g_state.end_indexing(&g_alias, IndexingOwner::Reindex);
         });
-        state
-            .index_tasks
-            .insert(alias.to_string(), (handle, reindex_token));
+        state.index_tasks.insert(
+            alias.to_string(),
+            IndexTask {
+                handle,
+                token: reindex_token,
+                db_path: task_db_path,
+                started_at: Instant::now(),
+            },
+        );
     }
 
     (
@@ -4810,6 +5674,9 @@ async fn add_repo_handler(
     // indexing task, so cancelling it (stop_fsw) did nothing and the task ran
     // the full embed pass to completion on a removed alias.
     let token_for_task = cancel_token.clone();
+    // The task closure moves `db_path`; keep a copy for the tracked entry so a
+    // removed repo's DB dir can be cleaned up after the task exits.
+    let task_db_path = db_path.clone();
 
     let index_handle = tokio::spawn(async move {
         tracing::info!(
@@ -4846,20 +5713,14 @@ async fn add_repo_handler(
                     state_bg.end_indexing(&alias_bg, IndexingOwner::Reindex);
                     return;
                 }
-                tracing::error!("Index creation failed for '{}': {}", alias_bg, e);
-                // Clean up: remove from repos and config
-                state_bg.repos.remove(&alias_bg);
-                state_bg.end_indexing(&alias_bg, IndexingOwner::Reindex);
-                if let Ok(mut config) = state_bg.config.write() {
-                    config.unregister_alias(&alias_bg);
-                    if let Err(e) = state_bg.persist_config(&config) {
-                        tracing::warn!(
-                            "Failed to persist config after add-repo index failure for '{}': {}",
-                            alias_bg,
-                            e
-                        );
-                    }
-                }
+                // KEEP the repo registered on a failed first build. The old
+                // rollback (repos.remove + unregister + persist_config)
+                // turned one build crash into a vanishing repo: the 202 was
+                // the caller's last word, repos.json lost the entry, and
+                // self-cleanup then deleted the DB dir. A half-built store
+                // heals on the next reindex (it clears and rebuilds
+                // in-place), so the failure must be loud, not destructive.
+                state_bg.note_add_index_failure(&alias_bg, &project_path, &e);
                 return;
             }
         }
@@ -4878,7 +5739,23 @@ async fn add_repo_handler(
         }
 
         // Build vector index from freshly indexed data.
-        // build_index() is CPU-heavy — offload to the blocking pool.
+        // build_index() is CPU-heavy — offload to the blocking pool, under the
+        // same process-wide job permit as every other heavy pass. The wait is
+        // cancellation-aware: a repo removed while queued behind another build
+        // must not keep its stores (and a queue position) parked.
+        let _job_permit = match stores.acquire_job_permit_or_cancel(&token_for_task).await {
+            JobAcquire::Ready(permit) => permit,
+            JobAcquire::Cancelled => {
+                state_bg.end_indexing(&alias_bg, IndexingOwner::Reindex);
+                return;
+            }
+        };
+        // Re-check liveness after the wait: a removal that landed while the
+        // task was parked must not resurrect the alias's vector index.
+        if !state_bg.is_alias_live(&alias_bg, &token_for_task) {
+            state_bg.end_indexing(&alias_bg, IndexingOwner::Reindex);
+            return;
+        }
         {
             let vector_store = Arc::clone(&stores.vector_store);
             let alias_bi = alias_bg.clone();
@@ -4921,16 +5798,28 @@ async fn add_repo_handler(
         // Start FSW and transition to proper Write state with IndexManager
         state_bg.restart_fsw(&alias_bg, stores).await;
 
+        // Phase-2 equivalence for runtime adds: a repo registered while serve
+        // runs never sees the startup symbol pass, so its symbol indexes would
+        // not exist until a restart — build them now (gate-driven).
+        maybe_rebuild_symbols(&alias_bg, &project_path, &db_path, &state_bg, false).await;
+
         state_bg.end_indexing(&alias_bg, IndexingOwner::Reindex);
         tracing::info!("Repo '{}' fully indexed and ready", alias_bg);
     });
 
     // Register the indexing task so remove_repo can cancel + await it (BUG1).
     // Storing the token alongside the handle means remove_repo can cancel
-    // regardless of the repo's RepoState variant.
-    state
-        .index_tasks
-        .insert(alias.clone(), (index_handle, cancel_token));
+    // regardless of the repo's RepoState variant. The DB path travels with
+    // the entry for deferred cleanup if the repo is removed mid-index.
+    state.index_tasks.insert(
+        alias.clone(),
+        IndexTask {
+            handle: index_handle,
+            token: cancel_token,
+            db_path: task_db_path,
+            started_at: Instant::now(),
+        },
+    );
 
     (
         StatusCode::ACCEPTED,
@@ -5098,18 +5987,18 @@ fn validate_path_within_allowed_roots(canonical_path: &Path) -> std::result::Res
 
 /// Constant-time API key comparison.
 ///
-/// Hashes both the supplied candidate and the configured key with SHA-256 and
-/// compares the fixed-length 32-byte digests byte-for-byte without early exit.
-/// Because the digests are always the same length and SHA-256 is
-/// preimage-resistant, the comparison time does not depend on how many leading
-/// bytes of the candidate match the secret — closing the timing side-channel
-/// that a raw `==` on the key strings would open on the network-exposed path.
+/// Folds the length difference and every byte XOR into one accumulator and
+/// returns whether it stayed zero, so the comparison never early-exits on how
+/// many leading bytes of the candidate match the secret — closing the timing
+/// side-channel that a raw `==` on the key strings would open on the
+/// network-exposed path. No hash is involved: hashing adds nothing to an
+/// equality comparison (and flagging a credential as hashed with a general
+/// digest is a false positive, not a real weakness).
 fn api_key_matches(candidate: &str, configured: &str) -> bool {
-    use sha2::{Digest, Sha256};
-    let candidate_digest = Sha256::digest(candidate.as_bytes());
-    let configured_digest = Sha256::digest(configured.as_bytes());
-    let mut diff: u8 = 0;
-    for (a, b) in candidate_digest.iter().zip(configured_digest.iter()) {
+    let candidate = candidate.as_bytes();
+    let configured = configured.as_bytes();
+    let mut diff: u8 = u8::from(candidate.len() != configured.len());
+    for (a, b) in candidate.iter().zip(configured.iter()) {
         diff |= a ^ b;
     }
     diff == 0
@@ -5694,6 +6583,22 @@ pub async fn run_serve(
     // — it never polls a federated peer on a timer at all.
     let serve_state = Arc::new(ServeState::new(config, None).with_default_model(default_model));
 
+    // One line that answers "why is it slower / less parallel than before?"
+    // without grepping the code: the effective heavy-work budget.
+    info!(
+        "⚙️  Indexing limits: index_jobs={} (CODESEARCH_INDEX_JOBS), embed_threads={} \
+         (CODESEARCH_EMBED_THREADS), embed_pause_ms={} (CODESEARCH_EMBED_PAUSE_MS), \
+         min_free_mb={} (CODESEARCH_MIN_FREE_MB), max_chunks_per_batch={} \
+         (CODESEARCH_MAX_CHUNKS_PER_BATCH)",
+        serve_state.job_gate.index_jobs(),
+        crate::limits::embed_threads()
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "default".to_string()),
+        crate::limits::embed_pause().as_millis(),
+        crate::limits::min_free_mb(),
+        crate::limits::max_chunks_per_batch(),
+    );
+
     // Construct the bind address from resolved host + port.
     // Using `format!` with `parse::<SocketAddr>()` handles both IPv4 and IPv6.
     // For IPv6 literals, users should pass e.g. `[::1]` (with brackets).
@@ -5884,7 +6789,7 @@ pub async fn run_serve(
 
     // ── Startup phase orchestration ──
     // Phase 1 warms all repos sequentially (text/vector ready).
-    // Phase 2 runs gated C# SCIP rebuilds ordered by last_changed.
+    // Phase 2 runs gated per-language SCIP rebuilds ordered by last_changed.
     {
         let phase_state = serve_state.clone();
         tokio::spawn(async move {
@@ -5901,7 +6806,7 @@ pub async fn run_serve(
                 warn!("reconcile: spawn_blocking panicked: {:?}", e);
             }
             phase_state.run_phase_1_warmup_all().await;
-            phase_state.run_phase_2_csharp_scip().await;
+            phase_state.run_phase_2_symbols().await;
             phase_state.run_phase_3_prewarm().await;
         });
     }
@@ -5918,6 +6823,7 @@ pub async fn run_serve(
                 tokio::select! {
                     _ = tokio::time::sleep(interval) => {
                         reaper_state.evict_idle_repos();
+                        reaper_state.sweep_index_tasks();
                         // Dashboard refresh handled by TUI auto-refresh (TTY) or not needed (non-TTY)
                     }
                     _ = reaper_cancel.cancelled() => {
@@ -6082,6 +6988,13 @@ pub async fn run_serve(
             info!("⚠️  Shutdown deadline reached — forcing exit (open sessions dropped)");
         }
     }
+
+    // Kill in-flight helper children (one-shot rebuilds + resident
+    // workspaces): an orphaned scip-csharp holds the helper exe locked for
+    // minutes after 'q' — the deploy blocker — and keeps computing for a
+    // dead host.
+    csharp::kill_live_helper_children();
+    crate::symbols::resident::WORKSPACE_POOL.kill_all();
 
     // Wait for the TUI task to finish cleanup (restore terminal).
     // The TUI's Drop guard restores the terminal, so we need to give it

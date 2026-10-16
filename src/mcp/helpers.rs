@@ -119,24 +119,6 @@ pub(crate) fn prefix_path_with_alias(
     }
 }
 
-/// Prefix a result path with the matching repo alias from a set of aliases and their roots.
-/// Used by handlers that have alias/root info but not a full `MultiStoreContext`.
-pub(crate) fn prefix_path_multi(
-    path: &str,
-    aliases: &[String],
-    alias_roots: &std::collections::HashMap<String, String>,
-) -> String {
-    let normalized = crate::cache::normalize_path_str(path);
-    for alias in aliases {
-        if let Some(root) = alias_roots.get(alias) {
-            if normalized.starts_with(root.as_str()) {
-                return prefix_path_with_alias(path, Some(alias), root);
-            }
-        }
-    }
-    normalized
-}
-
 /// Pick the project root to relativise a result path against for a `filter_path`
 /// prefix match, so `filter_path` is interpreted **relative to the repo root**
 /// in every routing mode:

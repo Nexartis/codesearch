@@ -40,7 +40,8 @@ that make the preference *structural* instead of advisory:
   Windows-style roots, so POSIX absolute paths were still resolved
   against the cwd). Coverage is decided by **registration**: the target's
   git root must be one of the repos in the hub's `~/.codesearch/repos.json`
-  (honoring `CODESEARCH_REPOS_CONFIG`), which also carves out nested
+  (honoring `CODESEARCH_REPOS_CONFIG`; `CODESEARCH_HOME` relocates the
+  root), which also carves out nested
   repos for free — an unregistered clone inside a registered repo
   resolves to its own git root and is treated as uncovered. Grep is
   auto-allowed **only** when codesearch is genuinely
@@ -73,7 +74,8 @@ that make the preference *structural* instead of advisory:
   everything else — making the caller-aware-editing protocol structural.
   Coverage uses the same registration model as grep-guard (shared
   `codesearch-common` helpers): the file's git root must be listed in
-  `~/.codesearch/repos.json` (or `CODESEARCH_SERVER` is set); unregistered
+  `~/.codesearch/repos.json` (relocatable via `CODESEARCH_HOME`; or
+  `CODESEARCH_SERVER` is set); unregistered
   repos and non-git paths are never blocked.
 
 - **`edit-guard-post`** — a `PostToolUse` hook on
@@ -182,7 +184,7 @@ whose commands point at `hooks/codesearch/`) from `settings.json`, and delete
   **registration with the serve hub**: the target's git root must be one
   of the repos listed in `~/.codesearch/repos.json` (the same
   registration list the hub itself resolves queries by, honoring the
-  `CODESEARCH_REPOS_CONFIG` override), or an explicit `CODESEARCH_SERVER`
+  `CODESEARCH_REPOS_CONFIG` / `CODESEARCH_HOME` overrides), or an explicit `CODESEARCH_SERVER`
   env var for pure remote-serve setups with no local registration. A
   local `.codesearch.db` directory is deliberately **not** a coverage
   signal anymore (#199): a stale db from a since-unregistered repo used

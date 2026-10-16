@@ -76,6 +76,7 @@ if ([string]::IsNullOrWhiteSpace($q)) { exit 0 }
 # names — the opt-in allowlist). No mounts -> nothing to prefer -> allow.
 # ------------------------------------------------------------------
 $config = if ($env:CODESEARCH_REPOS_CONFIG) { $env:CODESEARCH_REPOS_CONFIG }
+          elseif ($env:CODESEARCH_HOME) { Join-Path $env:CODESEARCH_HOME 'repos.json' }
           else { Join-Path $HOME '.codesearch/repos.json' }
 if (-not (Test-Path $config)) { exit 0 }
 

@@ -4,7 +4,7 @@
     Builds CodeSearch.
 
 .DESCRIPTION
-    Always runs `cargo build` (debug or release). Cargo's own incremental
+    Always runs `cargo build` (debug). Cargo's own incremental
     compilation decides what actually needs to be recompiled — this script
     no longer tries to second-guess it with git-diff heuristics.
 
@@ -18,11 +18,7 @@
 
 .EXAMPLE
     .\build.ps1
-    Builds in debug mode
-
-.EXAMPLE
-    .\build.ps1 -Release
-    Builds in release mode
+    Builds in debug mode (the only supported mode)
 #>
 
 param(
@@ -30,6 +26,10 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+if ($Release) {
+    throw "-Release is not supported (debug-only policy, issue #192). Release artifacts are built by CI (.github/workflows/release.yml)."
+}
 
 # Change to script directory (where Cargo.toml is located)
 $ScriptDir = $PSScriptRoot
@@ -67,8 +67,8 @@ if ($orphans.Count -gt 0) {
     Write-Host "  [warn] if this build hangs on 'Blocking waiting for file lock', terminate the stale process manually." -ForegroundColor Yellow
 }
 
-# Determine build mode
-$BuildMode = if ($Release) { "release" } else { "debug" }
+# Debug only (see -Release guard above)
+$BuildMode = "debug"
 
 Write-Host "Building in $BuildMode mode..." -ForegroundColor Yellow
 
@@ -81,11 +81,7 @@ $TmpDir = Join-Path $ScriptDir ".tmp"
 New-Item -ItemType Directory -Force -Path $TmpDir | Out-Null
 $LogFile = Join-Path $TmpDir "build-$BuildMode.log"
 
-if ($Release) {
-    & cargo build --release 2>&1 | Out-File -FilePath $LogFile -Encoding utf8
-} else {
-    & cargo build 2>&1 | Out-File -FilePath $LogFile -Encoding utf8
-}
+& cargo build 2>&1 | Out-File -FilePath $LogFile -Encoding utf8
 
 $BuildExit = $LASTEXITCODE
 Get-Content $LogFile | ForEach-Object { Write-Host $_ }

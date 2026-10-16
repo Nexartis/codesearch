@@ -1,3 +1,4 @@
+use super::helpers::strip_alias_prefix;
 use super::types::FindImpactRequest;
 use super::CodesearchService;
 use crate::symbols::SymbolReference;
@@ -93,6 +94,38 @@ fn dedupe_references(
     out
 }
 
+/// What find_impact actually did (or could not do) about a missing symbol
+/// index — drives the wording of [`missing_index_warning`] so the answer
+/// never claims a rebuild that is not running.
+pub(crate) enum SymbolIndexHeal {
+    /// Serve mode with a routed alias: the self-heal task was spawned.
+    BackgroundStarted,
+    /// No serve / no routed alias: nothing runs automatically; the caller
+    /// must build the index explicitly.
+    Manual,
+    /// The indexer does not apply to this repository (e.g. no top-level
+    /// tsconfig.json for TypeScript) — no rebuild can ever start here.
+    NotApplicable(&'static str),
+}
+
+/// Caller-facing warning for a find_impact answer against a project whose
+/// symbol index was never built. The empty reference list such an answer
+/// carries means UNKNOWN — stamping this on the payload is what keeps it from
+/// passing for "no callers" while the status says what will actually happen.
+pub(crate) fn missing_index_warning(lang: &str, heal: SymbolIndexHeal) -> String {
+    match heal {
+        SymbolIndexHeal::BackgroundStarted => format!(
+            "No {lang} symbol index exists for this project — an empty reference list means UNKNOWN, not 'no references'. A background rebuild was started; retry this call once it completes."
+        ),
+        SymbolIndexHeal::Manual => format!(
+            "No {lang} symbol index exists for this project — an empty reference list means UNKNOWN, not 'no references'. Background rebuilds only run in serve mode; build it with `codesearch index symbol <alias>` and retry."
+        ),
+        SymbolIndexHeal::NotApplicable(reason) => format!(
+            "No {lang} symbol index exists for this project and none can be built automatically ({reason}) — an empty reference list means UNKNOWN, not 'no references'."
+        ),
+    }
+}
+
 #[tool_router(router = find_impact_router, vis = "pub(crate)")]
 impl CodesearchService {
     /// Symbol impact analysis — returns transitive call-sites of a symbol with file/line precision.
@@ -112,7 +145,7 @@ impl CodesearchService {
     /// with `symbol_key` set to exactly one candidate. Every resolved answer names the
     /// selected canonical key in `resolved_symbol`.
     #[tool(
-        description = "Symbol impact analysis — find all references to a symbol with IDE-class precision (SCIP).\n\nThe right tool for \"who calls X?\" / \"what breaks if I rename X?\". Returns transitive call-sites with file/line precision, enabling agents to plan refactors without missing a caller. More accurate than text-based `find kind=\"usages\"` because it understands language semantics.\n\nInput variants (mutually exclusive):\n- By name: `{ \"symbol_name\": \"FieldDefinition.Validate\", \"project\": \"myrepo\" }`\n- By position: `{ \"file\": \"src/Validation/FieldDefinition.cs\", \"line\": 42, \"project\": \"myrepo\" }`\n- By exact canonical key: `{ \"symbol_key\": \"csharp . . . FieldDefinition#Validate().\", \"project\": \"myrepo\" }`\n\nAMBIGUITY: if several stored symbols match (overloads, same-line definitions), the answer is `{\"ambiguous\": true, \"query\": ..., \"candidates\": [...]}` — pick one candidate and re-call with `symbol_key` set to it verbatim. A resolved answer names the selected canonical key in `resolved_symbol`; never assume which overload answered.\n\nWARNINGS: a resolved answer may carry a `\"warnings\": [\"...\"]` array — non-empty means the reference list may be INCOMPLETE because a helper failure was survived rather than fatal (a project that failed to compile, an exception during reference resolution, a non-zero scip-typescript exit). Each entry names what failed. Treat warnings as a prompt to reindex the project (or cross-check with `find` `kind=\"usages\"`) before concluding \"no callers\" — absent or empty means the answer is as complete as the index knows.\n\nLANGUAGE: if `language` is omitted, position lookups auto-detect it from the file extension; with several SCIP helpers installed the answer asks you to name one — pass `language` to avoid the round-trip.\n\nPrecision backends (SCIP) ship per language; C# (bundled `scip-csharp` helper, `-with-csharp` releases) and TypeScript (via `npx` or `CODESEARCH_SCIP_TYPESCRIPT`) are available today. For Rust/Python/Go/etc., use `find` with `kind=\"usages\"` as a text-based fallback until SCIP backends for those languages ship.\n\nOn a busy answer (`\"busy\": true`): sleep `retry_after_seconds` and retry the SAME call. Busy is progress, not failure — never fall back to text search on busy.\n\nIMPORTANT (multi-repo): always specify `project` (single repo). Omitting `project` in multi-repo mode returns a `scope_required` error."
+        description = "Symbol impact analysis — find all references to a symbol with IDE-class precision (SCIP).\n\nThe right tool for \"who calls X?\" / \"what breaks if I rename X?\". Returns transitive call-sites with file/line precision, enabling agents to plan refactors without missing a caller. More accurate than text-based `find kind=\"usages\"` because it understands language semantics.\n\nInput variants (mutually exclusive):\n- By name: `{ \"symbol_name\": \"FieldDefinition.Validate\", \"project\": \"myrepo\" }`\n- By position: `{ \"file\": \"src/Validation/FieldDefinition.cs\", \"line\": 42, \"project\": \"myrepo\" }`\n- By exact canonical key: `{ \"symbol_key\": \"csharp . . . FieldDefinition#Validate().\", \"project\": \"myrepo\" }`\n\nAMBIGUITY: if several stored symbols match (overloads, same-line definitions), the answer is `{\"ambiguous\": true, \"query\": ..., \"candidates\": [...]}` — pick one candidate and re-call with `symbol_key` set to it verbatim. A resolved answer names the selected canonical key in `resolved_symbol`; never assume which overload answered.\n\nWARNINGS: a resolved answer may carry a `\"warnings\": [\"...\"]` array — non-empty means the reference list may be INCOMPLETE because a helper failure was survived rather than fatal (a project that failed to compile, an exception during reference resolution, a non-zero scip-typescript exit). Each entry names what failed. Treat warnings as a prompt to reindex the project (or cross-check with `find` `kind=\"usages\"`) before concluding \"no callers\" — absent or empty means the answer is as complete as the index knows.\n\nSYMBOL INDEX: resolved and empty answers carry `\"symbol_index\": [{\"language\", \"state\", \"age_seconds\", ...}]` — the state of the SCIP index that produced the answer (`ready` | `degraded` | `stale` | `restore-pending` | `absent`). Check it before trusting `references: []`: `absent`/`stale`/`restore-pending` means the empty answer reflects an unusable or outdated index, not verified absence of callers — trigger/await a reindex and re-call instead of concluding.\n\nLANGUAGE: if `language` is omitted, position lookups auto-detect it from the file extension; with several SCIP helpers installed the answer asks you to name one — pass `language` to avoid the round-trip.\n\nPrecision backends (SCIP) ship per language; C# (bundled `scip-csharp` helper, `-with-csharp` releases) and TypeScript (via `npx` or `CODESEARCH_SCIP_TYPESCRIPT`) are available today. For Rust/Python/Go/etc., use `find` with `kind=\"usages\"` as a text-based fallback until SCIP backends for those languages ship.\n\nOn a busy answer (`\"busy\": true`): sleep `retry_after_seconds` and retry the SAME call. Busy is progress, not failure — never fall back to text search on busy.\n\nIMPORTANT (multi-repo): always specify `project` (single repo). Omitting `project` in multi-repo mode returns a `scope_required` error."
     )]
     async fn find_impact(
         &self,
@@ -249,6 +282,50 @@ impl CodesearchService {
             )]));
         }
 
+        // Self-heal + honesty: a project whose symbol index was never built
+        // answers EVERY query with NotFound/empty references — visually
+        // identical to "no callers", the exact trap that reads as "safe to
+        // remove" when it is not. Start a background rebuild (serve mode
+        // only) whenever the definitions index is absent; the *warning*
+        // below rides only on answers that actually come back empty
+        // (NotFound / resolution failure) — a successful resolution proves
+        // usable data exists and keeps its payload to the persisted
+        // warnings channel. Drift (index_head_sha vs current) is
+        // deliberately NOT healed — reindexing on every branch switch would
+        // thrash (see `SymbolIndexer::index_head_sha`).
+        //
+        // The warning wording follows the real status: a repo the indexer
+        // does not apply to (no top-level tsconfig.json / no .sln) can never
+        // get a rebuilt index, so saying "a rebuild was started" there was a
+        // promise nothing would fulfil.
+        let index_missing = !indexer.has_index(&db_path);
+        let mut heal_spawned = false;
+        let heal_warning: Vec<String> = if index_missing {
+            let heal = if !indexer.applies_to(&project_root) {
+                SymbolIndexHeal::NotApplicable(indexer.applicability_hint())
+            } else if self.serve_state.is_some() && ctx.project_alias.is_some() {
+                heal_spawned = true;
+                SymbolIndexHeal::BackgroundStarted
+            } else {
+                SymbolIndexHeal::Manual
+            };
+            vec![missing_index_warning(indexer.language(), heal)]
+        } else {
+            Vec::new()
+        };
+        if heal_spawned {
+            if let (Some(ref serve_state), Some(ref alias)) =
+                (&self.serve_state, &ctx.project_alias)
+            {
+                let st = std::sync::Arc::clone(serve_state);
+                let alias_heal = alias.clone();
+                let lang_heal = indexer.language().to_string();
+                tokio::spawn(async move {
+                    crate::serve::heal_missing_symbol_index(&st, &alias_heal, &lang_heal).await;
+                });
+            }
+        }
+
         // Perform the lookup under an internal wall-clock budget.
         //
         // `find_references_for_key` may invoke `scip-csharp find-refs` on a cache miss
@@ -273,9 +350,16 @@ impl CodesearchService {
             )
         } else {
             crate::symbols::ImpactQuery::Position {
+                // `find`/`search` report alias-prefixed paths in serve
+                // mode ("ALIAS/src/foo.cs"); the position index keys are
+                // repo-relative. Strip the prefix before normalizing, or
+                // every position query copied from a find result misses.
                 file: self.normalize_symbol_query_path(
                     &project_root,
-                    Path::new(request.file.as_ref().expect("has_position checked")),
+                    Path::new(&strip_alias_prefix(
+                        request.file.as_ref().expect("has_position checked"),
+                        ctx.project_alias.as_ref(),
+                    )),
                 ),
                 line: request.line.expect("has_position checked"),
             }
@@ -313,6 +397,31 @@ impl CodesearchService {
                 .await
                 .unwrap_or(None);
 
+        // Per-language symbol-index status, computed once and attached to
+        // every answer this handler builds: a consumer reading
+        // `references: []` must be able to check the state of the index
+        // that produced it (absent/stale/restore-pending) without a second
+        // round-trip to repo info. Meta reads are blocking: off the async
+        // runtime like every other read here; a failed task degrades to an
+        // omitted field, never a failed answer. Non-applicable languages
+        // are noise in an answer envelope.
+        let registry_for_status = self.symbol_registry.clone();
+        let root_for_status = project_root.clone();
+        let db_for_status = db_path.clone();
+        let symbol_index_status: Vec<crate::symbols::SymbolIndexStatus> =
+            match tokio::task::spawn_blocking(move || {
+                crate::symbols::symbol_index_status(
+                    &registry_for_status,
+                    &root_for_status,
+                    &db_for_status,
+                )
+            })
+            .await
+            {
+                Ok(statuses) => statuses.into_iter().filter(|s| !s.not_applicable).collect(),
+                Err(_) => Vec::new(),
+            };
+
         // Shared result construction: the warm-retry path (below) must be
         // byte-identical to a budget-fast completion, so both build the
         // response through this one closure.
@@ -333,6 +442,7 @@ impl CodesearchService {
                     .unwrap_or_else(|| "local".to_string()),
                 index_head_sha: indexer.index_head_sha(&db_path),
                 current_head_sha: current_head_sha.clone(),
+                symbol_index: symbol_index_status.clone(),
             }
         };
 
@@ -341,6 +451,10 @@ impl CodesearchService {
         // helper invocation — as a typed candidates answer; the server never
         // silently picks among the query's matches (the old behaviour took
         // the shortest fuzzy candidate and answered about the wrong symbol).
+        // The same read pass collects the index-level rebuild warnings: a
+        // partially loaded solution produces an index whose reference lists
+        // are incomplete EVEN WHEN the lookup succeeds, and that honesty
+        // rides on every answer from this index.
         let registry_for_resolve = self.symbol_registry.clone();
         let language_for_resolve = language_for_lookup.clone();
         let db_path_for_resolve = db_path.clone();
@@ -354,7 +468,16 @@ impl CodesearchService {
                         language_for_resolve
                     )
                 })?;
-            indexer.resolve_query(&db_path_for_resolve, &query_for_resolve)
+            let resolution = indexer.resolve_query(&db_path_for_resolve, &query_for_resolve)?;
+            let mut index_warnings = indexer.index_warnings(&db_path_for_resolve);
+            // A rebuild waiting out a restore (issue #225) refreshes nothing:
+            // every answer from this index comes from the previous one and
+            // must say so, on every path that carries warnings.
+            if indexer.restore_pending(&db_path_for_resolve) {
+                index_warnings
+                    .push(crate::symbols::csharp::RESTORE_PENDING_INDEX_WARNING.to_string());
+            }
+            Ok((resolution, index_warnings))
         })
         .await
         {
@@ -364,13 +487,33 @@ impl CodesearchService {
             // (classified stale/failed by the index age) instead of `?`.
             Err(e) => Err(anyhow::anyhow!("symbol resolve task failed: {e:#}")),
         };
+        // Both are read from the SAME env/txn pass above; on a JoinError the
+        // warnings are unknown and the failure path below speaks for itself.
+        let (resolution, index_warnings) = match resolution {
+            Ok((resolution, index_warnings)) => (Ok(resolution), index_warnings),
+            Err(e) => (Err(e), Vec::new()),
+        };
+        // Warnings assembled per answer path: persisted per-symbol warnings
+        // (set at the lookup sites) + index-level rebuild warnings. The
+        // missing-index self-heal warning does NOT belong here — a successful
+        // resolution proves usable data exists (see the NotFound arm, the
+        // only payload that carries it).
+        let answer_warnings = |mut persisted: Vec<String>| -> Vec<String> {
+            persisted.extend(index_warnings.iter().cloned());
+            persisted
+        };
 
         let canonical = match resolution {
             Err(e) => {
-                let failure = crate::symbols::SymbolLookupFailure::classify(
+                let mut failure = crate::symbols::SymbolLookupFailure::classify(
                     format!("{e:#}"),
                     indexer.index_age(&db_path),
                 );
+                if index_missing {
+                    failure.hint_for_agent.push_str(
+                        " A background rebuild of the missing index was started — retry this call once it completes.",
+                    );
+                }
                 let json =
                     serde_json::to_string(&failure).unwrap_or_else(|_| failure.error.clone());
                 return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
@@ -391,6 +534,8 @@ impl CodesearchService {
                 // empty answer: the caller selected that key deliberately,
                 // so a miss means the answer it came from and the index
                 // have drifted apart.
+                let mut failure_warnings = answer_warnings(Vec::new());
+                failure_warnings.extend(heal_warning.iter().cloned());
                 let failure = crate::symbols::SymbolLookupFailure {
                     error: format!(
                         "symbol_key '{}' is not in the {} index",
@@ -399,16 +544,45 @@ impl CodesearchService {
                     class: crate::symbols::SymbolLookupFailureClass::Failed,
                     hint_for_agent: "The index was likely rebuilt since the ambiguous answer. Re-run the original name or position query to list the current candidates instead of retrying the key."
                         .to_string(),
+                    warnings: failure_warnings,
                 };
                 let json =
                     serde_json::to_string(&failure).unwrap_or_else(|_| failure.error.clone());
                 return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
             }
             Ok(crate::symbols::KeyMatch::NotFound) => {
-                // Preserve the historical contract for fuzzy queries: an
-                // unresolvable name/position answers empty references.
-                let impact = build_impact(Vec::new(), None, Vec::new());
-                let json = serde_json::to_string(&impact).unwrap_or_else(|_| "{}".to_string());
+                // Preserve the historical contract for fuzzy NAME queries:
+                // an unresolvable name answers empty references. A POSITION
+                // query is exact input — NotFound means the (file, line)
+                // pair maps to nothing in this index (wrong line
+                // convention, lines from a stale chunker, a file the
+                // indexer never saw), and an empty-references answer
+                // reads as "no callers" (observed live: an agent concluded
+                // a heavily-called method had zero call sites because the
+                // position query missed). Loud failure, not silence.
+                if !has_position {
+                    let mut warnings = answer_warnings(Vec::new());
+                    warnings.extend(heal_warning.iter().cloned());
+                    let impact = build_impact(Vec::new(), None, warnings);
+                    let json = serde_json::to_string(&impact).unwrap_or_else(|_| "{}".to_string());
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
+                }
+                // Warnings ride on EVERY answer shape — the failure must
+                // not advise an action that is already running (heal) or
+                // hide that the index is known-incomplete.
+                let mut failure_warnings = answer_warnings(Vec::new());
+                failure_warnings.extend(heal_warning.iter().cloned());
+                let failure = crate::symbols::SymbolLookupFailure {
+                    error: format!(
+                        "no indexed symbol at {} in the {} index",
+                        echo, language_for_lookup
+                    ),
+                    class: crate::symbols::SymbolLookupFailureClass::Failed,
+                    hint_for_agent: "Position lines are 1-based (editor lines). If the line came from `find` on an index that has not been reindexed since the 1-based chunk-line fix, it may be off by one — reindex the repo, or resolve by `symbol_name` and pass `symbol_key` from the candidates instead.".to_string(),
+                    warnings: failure_warnings,
+                };
+                let json =
+                    serde_json::to_string(&failure).unwrap_or_else(|_| failure.error.clone());
                 return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
             }
             Ok(crate::symbols::KeyMatch::Resolved(canonical)) => canonical,
@@ -450,7 +624,11 @@ impl CodesearchService {
                 // The warm retry must carry the same honesty as a fresh
                 // answer: read the persisted warnings for this key.
                 let warnings = indexer.lookup_warnings(&db_path, &canonical);
-                let impact = build_impact(references, Some(canonical.clone()), warnings);
+                let impact = build_impact(
+                    references,
+                    Some(canonical.clone()),
+                    answer_warnings(warnings),
+                );
                 let json = serde_json::to_string(&impact).unwrap_or_else(|_| "{}".to_string());
                 return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
             }
@@ -506,7 +684,7 @@ impl CodesearchService {
                 // Surface what the lookup survived: a partial answer must
                 // say so in its own payload, not only in a log line.
                 let warnings = indexer.lookup_warnings(&db_path, &canonical);
-                let impact = build_impact(references, Some(canonical), warnings);
+                let impact = build_impact(references, Some(canonical), answer_warnings(warnings));
                 let json = serde_json::to_string(&impact).unwrap_or_else(|_| "{}".to_string());
                 Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
             }

@@ -54,7 +54,7 @@ q=$(echo "$raw" | jq -r '.tool_input.query // .tool_input.url // empty')
 # names — the opt-in allowlist). No mounts -> nothing to prefer -> allow the
 # web call unimpeded.
 # ------------------------------------------------------------------
-config="${CODESEARCH_REPOS_CONFIG:-$HOME/.codesearch/repos.json}"
+config="${CODESEARCH_REPOS_CONFIG:-${CODESEARCH_HOME:-$HOME/.codesearch}/repos.json}"
 [ -f "$config" ] || exit 0
 
 # NOTE: strip CR. On Windows/Git Bash jq emits CRLF, and a trailing \r silently

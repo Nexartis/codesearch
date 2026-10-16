@@ -8,10 +8,11 @@
 #
 # Coverage is simulated without a real index: repoA is "registered" via a
 # temp repos.json passed through CODESEARCH_REPOS_CONFIG (the same override
-# the guards honour at runtime), repoB is not listed. The serve hub is only
-# contacted by the grep-guard smoke case, which forces a dead port so the
-# answer is deterministic. State lives in a temp TMPDIR; the env overrides
-# are process-scoped and die with this script.
+# the guards honour at runtime), repoB is not listed. One case pins the
+# CODESEARCH_HOME relocation fallback with REPOS_CONFIG unset. The serve hub
+# is only contacted by the grep-guard smoke case, which forces a dead port
+# so the answer is deterministic. State lives in a temp TMPDIR; the env
+# overrides are process-scoped and die with this script.
 
 set -u
 
@@ -25,7 +26,7 @@ STATE_DIR="$TMP_ROOT/state"
 mkdir -p "$STATE_DIR"
 
 cleanup() {
-    unset CODESEARCH_REPOS_CONFIG CODESEARCH_SERVER TMPDIR
+    unset CODESEARCH_REPOS_CONFIG CODESEARCH_SERVER CODESEARCH_HOME TMPDIR
     rm -rf "$TMP_ROOT"
 }
 trap cleanup EXIT
@@ -152,6 +153,23 @@ case_grep_guard_smoke() {
     fi
 }
 
+case_covered_via_codesearch_home() {
+    # Relocation pin: with REPOS_CONFIG unset, guards must resolve repos.json
+    # from $CODESEARCH_HOME (mirrors constants.rs codesearch_home()) — and
+    # only from there, so a dev's real global registry cannot leak in.
+    local home="$TMP_ROOT/cs-home" saved_cfg="${CODESEARCH_REPOS_CONFIG:-}"
+    mkdir -p "$home"
+    jq -n --arg a "$ROOT_A" '{repos: {repoA: $a}}' > "$home/repos.json"
+    unset CODESEARCH_REPOS_CONFIG
+    export CODESEARCH_HOME="$home"
+    run_edit "$(edit_event "$REPO_A/x.cs")"
+    expect_deny "CODESEARCH_HOME registry: covered .cs denied" "find_impact"
+    run_edit "$(edit_event "$REPO_B/b.cs")"
+    expect_allow "CODESEARCH_HOME registry: unregistered repo fails open"
+    unset CODESEARCH_HOME
+    export CODESEARCH_REPOS_CONFIG="$saved_cfg"
+}
+
 case_no_coverage_allows
 case_covered_cs_denied
 case_covered_ts_denied
@@ -163,6 +181,7 @@ case_multiedit_partial_marks_denied
 case_find_usages_marker_allows
 case_window_expiry_denies_again
 case_grep_guard_smoke
+case_covered_via_codesearch_home
 
 echo
 echo "edit-guard self-tests: $PASS passed, $FAIL failed"

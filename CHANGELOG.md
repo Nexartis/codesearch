@@ -14,6 +14,137 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.5.31]
+
+### Changed
+
+- **scip-csharp retries the solution restore with the VS MSBuild when the CLI SDK set cannot target the repo.** When `dotnet restore` fails on SDK resolution (NETSDK1045 — CLI SDKs older than the repo's TFM — or an unsatisfiable `global.json`; detection reads stdout AND stderr, because NETSDK1045 prints to stdout on current hosts), the helper locates the newest VS MSBuild via vswhere and retries the restore once with `MSBuild -t:restore` — VS ships its own MSBuild + SDK targets independent of `C:\Program Files\dotnet`, so it restores solutions the CLI cannot even evaluate. Timeout keeps the existing pending-marker/gated-exit-75 contract (a hung VS restore is never killed); on VS failure the per-project fallback still runs. The workspace-load MSBuild registration is now capability-aware too: when every CLI SDK instance is older than the repo's raw-text TFM floor (max over all `TargetFrameworks` + the nearest `global.json` major), the highest VS instance is registered instead — otherwise an SDK 8 instance would evaluate net10 projects into certain NETSDK1045 load failures even with fresh assets. On healthy machines the choice is unchanged (single-SDK machines byte-identical; multi-SDK machines now deterministically take the highest qualifying SDK, was first-enumerated). Motivated by the 2026-10-15 field incident: a hollow `10.0.101` SDK dir left the CLI blind to net10 on a machine where VS built fine, degrading every net10 repo's symbol index to "0 projects loaded".
+
+- **The serve TUI status column no longer shows `Indexing` for a pure symbol (SCIP) rebuild.** Only text-indexing flows (startup warmup, file-watcher batches, explicit reindex) light the general repo label; a C#/TypeScript symbol rebuild — including a long restore-pending retry loop — drives only the language columns, so a busy C# pass can no longer read as "the normal index is stuck behind the SCIP index". A queued phase-2 rebuild stays visible in the C# column only. The `/status` wire vocabulary is unchanged. A repo whose index is on disk but which is not loaded renders `Idle` again — the interim `idx` rendering read as active indexing on done, non-SCIP repos.
+
+## [1.5.30]
+
+### Fixed
+
+- **File metadata is persisted once per index batch instead of once per pass.** The vector and FTS stores already commit per batch, but the file-meta cache was only written at the very end of a refresh pass — a serve restart (or a failed FTS commit) mid-pass left the meta empty while chunks existed, and the next open then wiped the whole store and re-embedded everything again. The meta now follows the stores' own commit granularity, and `save()` writes atomically (tmp + rename) so a crash mid-write can never truncate the file.
+
+### Changed
+
+- **find_impact position queries that resolve to no symbol now return an error with a hint.** Previously they returned an empty references list, which looked like "no callers".
+
+## [1.5.29]
+
+### Fixed
+
+- **Index caches are no longer wiped on every binary swap.** The chunk file-meta cache and the SCIP symbol meta were stamped with the full package version (`CARGO_PKG_VERSION_FULL`), which the bump-bot moves on every merged PR — so every rebuilt binary treated every repo's indexes as foreign and re-embedded/re-built the whole fleet at each serve restart (field incident 14–15 Oct 2026: ten patch bumps in one day). The stamp is now a hand-bumped generation marker (`2026-10.1`) that changes ONLY when chunker or SCIP conventions actually change; one final full rebuild migrates existing caches. The transient Windows FTS-commit lock race (AV/Search-Indexer holding fresh Tantivy segment files) also gets a second, longer redrive (5s then 20s, was a single 5s pass) and now covers the warmup incremental refresh as well — the two paths whose builds died in the field, leaving repos registered with 0 chunks.
+
+## [1.5.16]
+
+### Fixed
+
+- **The serve TUI/`/status` repo label no longer flips to `idle` while a rebuild is still queued.** Phase-2 pre-marks queued C# rebuilds in the per-language status cache, but the repo-level label waited for the `active_reindexes` marker that only appears when the task actually starts — so during a startup rebuild wave most repos read `idle` with only the C# column showing indexing. A resolved `Indexing` language status now also holds the repo label at `indexing`; it returns to idle/open when the rebuild completes. Queued pre-marks are cleared on the phase-2 skip paths (unresolvable/missing repo) so a skipped rebuild cannot show indexing forever.
+
+- **C# restore-pending retries capped at 3 attempts with exponential backoff, and restore exhaustion renders as a warning instead of an error.** A hung `dotnet restore` burned 20 retries × 60s before the rebuild gave up — and then flagged the index red as if broken. Now: 3 attempts with doubling waits (60s + 120s by default, base tunable via `CODESEARCH_RESTORE_RETRY_INTERVAL_SECS`), after which the rebuild stops with a typed `RestoreExhaustedError`, LMDB stays untouched and the previous index keeps serving. Exhaustion surfaces as yellow `C#⚠ partial` with the reason on every serve path (reindex trigger, FSW full and grouped incremental rebuilds); a real failure still renders red, and a later clean rebuild clears the warning back to Ready.
+
+## [1.5.15]
+
+### Fixed
+
+- **`index add` / `index reindex` stop instead of building locally when the serve reports the alias is already indexing.** A transport-level delegation failure can mean the first POST landed and its 202 never reached the client (field case: the follow-up call got 409 "reindex already in progress", then the CLI built locally anyway and died on the Tantivy lockfile while the serve's own pass was running). On that specific 409 the CLI now exits with "let it finish" guidance; other delegation failures keep the previous local fallback (a registered-but-idle repo indexes locally fine — the pre-push gate depends on it). `--local` remains the explicit escape hatch.
+
+- **Status no longer reports "ready" while a rebuild is running.** MCP `status` (project and group) answers "building" during a rebuild, and the TUI C#/TypeScript indicators show indexing instead of "ready" from an old on-disk index; the fresh-index route and pre-warm no longer set Ready mid-build.
+
+## [1.5.14]
+
+### Fixed
+
+- **The index database directory is now marked hidden on Windows.** The dot in `.codesearch.db` means nothing to Windows: the Search indexer crawled it like any folder, and its scanner holding a freshly created Tantivy segment file is the transient commit race behind the field incidents (os error 5). The indexer skips hidden directories (the `.git` convention), so `SharedStores` now marks the db dir hidden on creation and on every read-write open — existing directories are fixed on the next serve start, best-effort and idempotent.
+
+## [1.5.13]
+
+### Fixed
+
+- **Vanishing repos: failed first builds keep the registration and the transient FTS commit race gets one full-pass retry.** Two field incidents traced to the same root: an indexer (Defender/Search) holds a freshly created Tantivy segment file while the commit opens it (os error 5/32/33), and the add-repo task then silently unregistered the repo and let self-cleanup delete its DB dir — the 202 response was the operator's last word. Now: (1) a full reindex pass is redriven once after a 5s backoff when it fails on exactly that transient class (a pass is idempotent — clear + rebuild — where a commit retry on a half-joined writer is never safe); (2) a failed first build keeps the repo registered with a loud, actionable error (`codesearch index reindex <alias>` heals in place) instead of vanishing.
+
+### Added
+
+- **Symbol-index status surfaces.** The chunk fields on `/repos/:alias/info` and the Info overlay said nothing about the SCIP index that `find_impact` uses, so an agent could not tell a working symbol index from an absent/stale/degraded one before trusting `references: []`. Every info surface now carries `symbol_index[]` — per language a `state` (`ready` / `degraded` / `stale` / `restore-pending` / `absent` / `not-applicable`), the index age and applicability — composed from the same on-disk meta the rebuild gates act on (new shared collector `symbol_index_status`, C# freshness override `index_matches_builder` mirroring the rebuild gate). `find_impact` resolved/empty answers embed the same array (applicable languages only) and the tool description tells agents to check it before concluding "no callers"; both serve TUIs render the status lines with state coloring. Remote-TUI deserialization tolerates older peers (missing field → empty section; null age → unknown).
+
+## [1.5.9]
+
+### Fixed
+
+- **scip-csharp: projects already loaded through a ProjectReference are no longer added twice.** The per-project fallback re-opened them, causing `already part of the workspace` failures and cross-project references missing from the index.
+- **NuGet feed failures and the BuildHost `XMakeElements` crash are logged as `[INFO]`, not index warnings.** They are environment issues; an affected project is skipped in the index and the INFO line records it.
+- **Serve: `q` quits while a C# rebuild waits for `dotnet restore`.** The restore wait polls the shutdown flag and the runtime gives blocking tasks a 5 s grace, instead of joining a rebuild parked for up to 20 minutes.
+
+## [1.5.6]
+
+### Fixed
+
+- **scip-csharp: MSBuild check advisories and BuildHost shutdown chatter no longer surface as index warnings.** Two more noise classes were observed pinning the serve TUI's ⚠ on healthy-but-advised repos: MSBuild check advisories escalated to load "failures" (live: the Grpc.Net.ClientFactory 2.63 version check — product guidance, the project loads fine and the index is unaffected) and BuildHost crash aftermath (`[BuildHost PID N] Exception while shutting down…` / `…not responding`, which trail the failure the load exception already reports and double-count it). Both demote to `[INFO]` in the WorkspaceFailed handler, extending the audit-advisory policy: the index-warning channel carries index health only. The live shapes are pinned verbatim in WorkspaceNoiseTests.
+
+## [1.5.5]
+
+### Fixed
+
+- **Serve TUI: symbol-index warnings are fully readable and copyable.** The Info overlay (`i`) clipped long warning lines at the modal border — the exact feed URLs that explain a degraded C# index were cut off mid-address. Modal content now wraps instead of clipping (the modal grows with the wrapped rows, capped at the terminal), and the key-hint footer moved to the border's bottom title so it stays visible even when wrapped content fills the screen. A new `c` key on the Info overlay copies the repo alias plus every stored warning line to the OS clipboard (PowerShell `Set-Clipboard` with explicit UTF-8 stdin on Windows, `pbcopy`/`wl-copy`/`xclip`/`xsel` elsewhere — no new dependency), with the outcome shown as a feedback line in the overlay. Works in both the embedded serve TUI and the standalone remote TUI.
+
+## [1.5.4]
+
+### Fixed
+
+- **C# indexes are never built while a NuGet restore is still running, and restore freshness now honours central package management.** Under CPM a version bump in `Directory.Packages.props` left `obj/project.assets.json` looking fresh, Roslyn missed the package assemblies, and the degraded index stored CS0246 cascades (seen live on `Azure.Response` unresolved). `NeedsRestore` now treats assets as stale when any `Directory.Packages.props`, `Directory.Build.props`, `Directory.Build.targets`, `NuGet.config` or `global.json` found walking up from the project to the repo root is newer than the assets. When the bounded restore wait expires, the helper no longer loads the workspace degraded: it records the still-running restore in an out-of-repo marker, prints one `[RESTORE-PENDING]` line, writes no output, and exits 75 — and the Rust host maps that to a distinct outcome that retries the same rebuild scope with a bounded backoff (interval tunable via `CODESEARCH_RESTORE_RETRY_INTERVAL_SECS`), leaving the previous good index live and LMDB untouched. `find_impact` answers from the previous index with one explicit "restore in progress" warning; lazy find-refs during a pending restore persists an INCOMPLETE warning and caches nothing; the serve file watcher now triggers a full C# rebuild when a restore input changes, and a resident workspace refuses to come up mid-restore so no answer from a workspace loaded during a restore can be cached. A restore that itself fails (non-zero exit) is not pending: the previous degraded-with-warning behaviour stays.
+
+## [1.5.3]
+
+### Fixed
+
+- **Blazor/Razor projects no longer produce false "Compilation errors" index warnings.** The workspace load never ran source generators, so Razor components' generated partial halves were missing and every code-behind use of an `@code` member collapsed into CS0103/CS0115 cascades while `dotnet build` stayed clean. `scip-csharp` now drives the project's source generators itself (with a tolerant loader for analyzers built against a newer Roslyn than the pinned one) and indexes the generated output compilation; a failed generator pipeline falls back to the plain compilation and downgrades the resulting diagnostics to INFO notes instead of warnings. The index-warning lead entry no longer asserts a user-fixable build problem — it distinguishes real breaks from tool-side gaps — and error specimens are truncated at word boundaries instead of mid-identifier.
+
+## [1.5.2] - 2026-10-05
+
+### Fixed
+
+- **Restore runs only when package assets are missing or stale, and warning-severity workspace diagnostics no longer count as index warnings.** Restoring on every reindex was far too heavy for multi-repo hubs and big solutions legitimately exceed any fixed timeout (`dotnet restore did not finish within 300s` was observed live). Now the helper checks each project's `obj/project.assets.json` against its .csproj and restores only when evidence demands it (the steady state of an actively developed repo is a no-op), the kill timeout is tunable via `CODESEARCH_RESTORE_TIMEOUT_SECS`, and restore uses `--ignore-failed-sources` so an unreachable private feed cannot block indexing. Separately, warning-severity workspace diagnostics (e.g. "Found project reference without a matching metadata reference" for excluded or external projects) are benign resolution notes — they log at INFO and no longer pin the repo's index warning; only true load failures (minus NuGet audit advisories) still do.
+- **C# symbol indexing restores packages before the workspace load, and NuGet audit advisories no longer count as index warnings.** The design-time load does not restore: with stale or missing `project.assets.json`, package-typed references collapsed into CS0246 cascades that flagged whole solution families as degraded (⚠ in the serve TUI) even though `dotnet build` succeeds. The helper now runs `dotnet restore` before opening the solution (bounded, best effort — a failed restore logs and continues, degraded indexing beats no indexing), and when the bounded wait expires the restore is **not killed**: it keeps running in the background, this load proceeds degraded, and the next reindex picks up the fresh assets — a killed restore would waste all of its work and re-pay the same wait on every subsequent reindex. NuGet vulnerability advisories surfacing as Msbuild "failures" are filtered from the warning channel: they are security notes for the product, not index-health signals. Compiler *warnings* were already never counted; genuine project compilation errors still are, and indexing stays as complete as the broken projects allow.
+
+### Changed
+
+- **Dependency refresh:** libc 0.2.190, rmcp 3.5.0, uuid 1.27.0 (#305).
+
+## [1.5.1] - 2026-10-04
+
+### Added
+
+- **`codesearch setup` — download embedding models, and a relocatable global root via `CODESEARCH_HOME`.** The stubbed setup command now resolves `--model` through the shared model parser (unknown names error with the valid list), downloads into the global models cache with a visible progress bar (runtime paths stay silent), and probe-embeds one query so a broken download fails in setup instead of mid-indexing. `CODESEARCH_HOME` relocates the entire global root (repos.json, models cache, logs, serve_url, global ignore/extensions) and is honoured by the hub, db-discovery, every Claude Code guard hook and the OpenCode plugin, with tests pinning each layer. *(Contributed by @belovaf in #298 — in the same PR: find-impact warnings that no longer promise rebuilds nothing will run, group-fan-out hits attributed to their repo, and dependency-lockfile indexing exclusions.)*
+
+*A big thank-you to belovaf ([@belovaf](https://github.com/belovaf)) for his first contribution to this release — a careful, well-tested feature plus four quality fixes landed in one go.*
+
+### Fixed
+
+- **Queued reindexes are no longer cancelled as "leaked", and an unjoinable index task can no longer wedge a hub.** With the process-wide job gate (`CODESEARCH_INDEX_JOBS=1`, the default), tasks queued behind a long-running job held their `active_reindexes` markers past `MAX_INDEXING_SECS` without renewing them, so the lazy stale-marker check evicted the markers and cancelled the parked tasks — leaving empty stores and in-process LMDB handles that made later writes fail with "Database is locked by another process" until a serve restart. Separately, `await_index_task` removed the task entry *before* waiting and dropped the `JoinHandle` on timeout, so a task too deep in the uninterruptible `build_index` to cancel kept its `Arc<SharedStores>` and the single job permit invisibly; the job-gate wait ignored cancellation, parking cancelled tasks on the gate; and `remove_repo` / format recovery could delete the DB directory out from under a still-running task. Now: a marker backed by a live tracked `Reindex` task is renewed (with a throttled wedge warning) instead of reaped; gate acquisition is cancellation-aware (`JobAcquire`) so cancelled or removed queued jobs abort and release their stores; a task that cannot be joined stays tracked and is reaped by a periodic sweeper that also deletes orphaned DB directories and re-asserts cancellation for removed repos; DB deletion is deferred while the task runs; format recovery refuses to wipe in that state; and stale markers from other owners are still evicted.
+
+## [1.5.0] - 2026-10-03
+
+### Added
+
+- **Settable indexing/refresh limits: `CODESEARCH_INDEX_JOBS`, `CODESEARCH_EMBED_THREADS`, `CODESEARCH_EMBED_PAUSE_MS`, `CODESEARCH_MIN_FREE_MB`, `CODESEARCH_MAX_CHUNKS_PER_BATCH` (serve flags `--index-jobs`, `--embed-threads`, `--embed-pause-ms`, `--min-free-mb`).** A multi-repo hub used to start one full refresh/reindex/HNSW-build pass per repo the moment that repo had work, so a mass `git pull`, a burst of first queries or several HTTP reindexes ran many CPU-heavy passes at once, held many file/chunk windows in memory, and queued the (already serialised) ONNX inference behind all of them. A process-wide job gate now bounds concurrent heavy repo jobs (default **1**; queries never take it), the ONNX session's intra-op thread count can be capped (`CODESEARCH_EMBED_THREADS`, previously always all cores), background embedding releases the model lock once per mini-batch with an optional duty-cycle pause so interactive query embeddings are not stuck behind a whole batch, the read/chunk window can be capped by chunks as well as files, and a job can wait for a free-memory floor before starting. See the README section "Indexing limits" for recommended values.
+- **OpenCode plugin integration (`integrations/opencode/`).** codesearch's MCP `initialize` instructions are advisory and connection-scoped: they cannot resolve the session directory to a registered project, see a `grep` return nothing, recover a dead serve hub, notice an unregistered worktree, or keep file outlines alive across compaction. The new self-contained OpenCode v2 plugin (no runtime dependencies, fail-open throughout) adds host-side behaviour around the same MCP server: it resolves the working directory to a project alias and injects scope-aware guidance once per session, turns a zero-hit `grep`/`glob` into index hits, offers `nudge`/`prune`/`block` codesearch-first guards that deny only while the hub is confirmed reachable and the repo is registered, probes `/healthz` and asks OpenCode to reload failed MCP servers (with optional local `codesearch serve` auto-start), warns when a registered index is empty or model-less, notes just-edited files while the watcher catches up, captures `explore` outlines into the compaction prompt, and registers `/codesearch`, `/codesearch-status` and `/codesearch-index` commands, a `codesearch_scope` tool and a `codesearch` skill. Includes a config reference, install/usage docs and a mock-host smoke test.
+
+*A big thank-you to Don Bowman ([@donbowman](https://github.com/donbowman)) for his outstanding, highly value-adding contributions to this release — the indexing-limits rework (#294) and the OpenCode plugin integration (#295), follow-up fixes included.*
+- **Always-on symbol indexes (C# + TypeScript).** Symbol (SCIP) indexes are no longer a manual or incidental artifact: serve warmup, cold opens, file-watcher batches and reindexes each drive a per-language symbol pass wherever chunk indexes are built, so `find_impact` evidence exists without a separate rebuild step. Startup inspects the on-disk symbol indexes with a builder-version stamp and rebuilds those an older binary produced (degraded retry instead of a hard failure), so a upgraded serve never answers from stale symbol data.
+
+### Changed
+
+- **`codesearch serve` runs heavy repo jobs one at a time by default (`CODESEARCH_INDEX_JOBS=1`).** Warmup, cold opens, file-watcher batches and reindexes now queue behind a running refresh instead of all running at once; raise the value deliberately on machines with cores and memory to spare. Standalone `codesearch index` / `codesearch mcp` runs are unchanged (no gate is attached). `CODESEARCH_EMBED_THREADS` unset keeps the previous ONNX default (all cores), so single-repo index throughput is unchanged unless the variable is set.
+- **`find_impact` is honest about partial evidence; the TUI says how healthy the symbol indexes are.** Index-level rebuild warnings (non-compiling C# projects, swallowed resolution failures, non-zero `scip-typescript` exits) ride the `find_impact` answer as an additive `warnings` array instead of vanishing into the log. The scip-csharp helper's workspace-load diagnostics are aggregated into a single warnings line and never escalate to errors during workspace load. The serve TUI's symbol-index indicators use severity language: a degraded C# index renders red (`C#⚠`) and the info line names the failures.
+- **Cloud image: build locally, not via `az acr build`.** The Dockerfile's builder stage compiles the release binary and warms up the embedding model before tarring — memory/disk-heavy, and ACR Basic/Standard build agents reliably fail the model-tar layer after a ~25 min compile (confirmed twice). `integrations/cloud/README.md` now documents building with local Docker Desktop and `docker push` instead.
+
+### Fixed
+
+- **SCIP key-format 2.0 regression: simple-name extraction now strips parameters before segmenting.** Fully qualified symbol keys that carry parameter types (real C# methods do) segmented on the parameter list instead of the path segments, producing wrong simple names for the affected symbols.
+
 ## [1.4.11]
 
 ### Changed
@@ -333,6 +464,12 @@ finalized in place with a date — no renaming/migration step needed.
 
 ## [1.0.72] - 2026-05-01
 - Initial multi-repo release: multi-repo `serve` (HTTP/SSE, per-project/group routing, RRF cross-repo search), stdio MCP proxy with client-side auto-reconnect, tree-sitter chunking (9 langs), persistent SHA-256 embedding cache, repository groups, re-tuned RRF, and LMDB resize crash fix (#30, `MDB_MAP_FULL`).
+
+[1.5.2]: https://github.com/flupkede/codesearch/compare/v1.5.1...v1.5.2
+
+[1.5.1]: https://github.com/flupkede/codesearch/compare/v1.5.0...v1.5.1
+
+[1.5.0]: https://github.com/flupkede/codesearch/compare/v1.4.9...v1.5.0
 
 [1.4.9]: https://github.com/flupkede/codesearch/compare/v1.4.4...v1.4.9
 [1.0.171]: https://github.com/flupkede/codesearch/compare/v1.0.162...v1.0.171

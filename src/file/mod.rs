@@ -322,6 +322,25 @@ mod tests {
         assert_eq!(files[0].path.file_name().unwrap(), "index.js");
     }
 
+    /// Dependency lock files are excluded by exact filename: their extensions
+    /// (.yaml/.json) are indexable on their own, so without the name match the
+    /// walker would index every churn commit of a generated lock file.
+    #[test]
+    fn test_excluded_lock_files() {
+        let dir = TempDir::new().unwrap();
+
+        fs::write(dir.path().join("pnpm-lock.yaml"), "lockVersion: '9.0'").unwrap();
+        fs::write(dir.path().join("package-lock.json"), "{}").unwrap();
+        fs::write(dir.path().join("yarn.lock"), "# yarn lockfile").unwrap();
+        fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+
+        let walker = FileWalker::new(dir.path());
+        let (files, _) = walker.walk().unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path.file_name().unwrap(), "main.rs");
+    }
+
     /// A root whose own name matches an `ALWAYS_EXCLUDED` entry (e.g. `.git`)
     /// must be rejected at `walk()` time — otherwise the depth==0 short-circuit
     /// in `filter_entry` would let every internal file be indexed.

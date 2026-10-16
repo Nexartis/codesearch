@@ -1,0 +1,18 @@
+{
+  "name": "opencode-codesearch-plugin",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenCode v2 plugin that makes codesearch structural: project scope resolution, usage guidance, grep/glob guards with zero-hit rescue, serve health, commands, a scope tool, a skill and compaction assistance.",
+  "license": "Apache-2.0",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "unit": "node test/unit.ts",
+    "smoke": "node test/smoke.ts",
+    "test": "npm run typecheck && npm run unit && npm run smoke"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.6.0"
+  }
+}

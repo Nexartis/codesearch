@@ -1,3 +1,9 @@
 [build]
 # Place target directory outside the repository to keep source tree clean
 target-dir = "../target"
+
+# Fast debug builds: rust-lld links several times faster than link.exe.
+# Debug-only policy (issue #192): release builds ship via release.yml and are
+# built there explicitly, never locally.
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld"

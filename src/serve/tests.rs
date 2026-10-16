@@ -2,13 +2,40 @@ use super::*;
 use serial_test::serial;
 use std::io::Write;
 
+#[tokio::test]
+async fn try_open_stores_attaches_the_serve_job_gate() {
+    // Serve-opened stores must carry the same process-wide gate as the
+    // ServeState, so cold opens, warmup and FSW refreshes all draw from one
+    // heavy-job budget (CODESEARCH_INDEX_JOBS).
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("repo").join(DB_DIR_NAME);
+    let state = std::sync::Arc::new(ServeState::new(ReposConfig::default(), None));
+
+    let stores = match state
+        .try_open_stores("repo", &db_path, true, false, None)
+        .expect("a fresh repo must open in write mode")
+    {
+        OpenedStores::Write(s) => s,
+        OpenedStores::Readonly(_) => panic!("allow_create=true must open write mode"),
+    };
+
+    let store_gate = stores
+        .job_gate
+        .as_ref()
+        .expect("serve-opened stores must carry the job gate");
+    assert!(
+        std::sync::Arc::ptr_eq(store_gate, &state.job_gate),
+        "the store gate must be the ServeState gate"
+    );
+}
+
 #[test]
 fn test_api_key_matches() {
     assert!(api_key_matches("secret-key", "secret-key"));
     assert!(!api_key_matches("secret-key", "secret-keX"));
     assert!(!api_key_matches("secret", "secret-key")); // different length
     assert!(!api_key_matches("", "secret-key"));
-    assert!(api_key_matches("", "")); // both empty digests are equal
+    assert!(api_key_matches("", "")); // both empty keys compare equal
                                       // Case-sensitive and exact.
     assert!(!api_key_matches("Secret-Key", "secret-key"));
 }
@@ -163,9 +190,15 @@ async fn await_index_task_cancels_and_joins_indexing_task() {
         }
         done_clone.store(true, std::sync::atomic::Ordering::SeqCst);
     });
-    state
-        .index_tasks
-        .insert("repo-x".to_string(), (handle, token));
+    state.index_tasks.insert(
+        "repo-x".to_string(),
+        IndexTask {
+            handle,
+            token,
+            db_path: std::path::PathBuf::from("/nonexistent-db"),
+            started_at: Instant::now(),
+        },
+    );
     state.await_index_task("repo-x").await;
     assert!(
         !state.index_tasks.contains_key("repo-x"),
@@ -302,9 +335,15 @@ async fn remove_repo_during_active_build_self_cleans_db_dir() {
         // orphaned — self-clean it now that the build's handles are released.
         ServeState::remove_orphaned_db_dir("buildrepo", &db_path_for_cleanup);
     });
-    state
-        .index_tasks
-        .insert("buildrepo".to_string(), (handle, token));
+    state.index_tasks.insert(
+        "buildrepo".to_string(),
+        IndexTask {
+            handle,
+            token,
+            db_path: db_path.clone(),
+            started_at: Instant::now(),
+        },
+    );
 
     // remove_repo lands WHILE the spawn_blocking build is still sleeping.
     let outcome = state
@@ -911,7 +950,12 @@ async fn add_repo_handler_registers_brand_new_repo_without_rollback() {
 /// serve-wide default's dimension (`codesearch serve --model X`), not the
 /// built-in 384-dim default. This is the write-side counterpart of the per-repo
 /// query-model contract.
+///
+/// `#[serial]`: the handler reads `CODESEARCH_ALLOWED_ROOTS`, so this test
+/// must exclude the mutating `allowed_roots_tests` group — the 403 flake
+/// named in that module's comment is a serial-vs-non-serial race.
 #[tokio::test]
+#[serial]
 async fn add_repo_handler_uses_serve_default_model_for_new_index() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_path = tmp.path().join("defaulted");
@@ -958,8 +1002,10 @@ async fn add_repo_handler_uses_serve_default_model_for_new_index() {
 
 /// The serve-wide default must NOT override an index that already records its
 /// own model: re-adding a repo whose `.codesearch.db` is still on disk keeps the
-/// recorded model and dimension.
+/// recorded model and dimension. `#[serial]` for the same allowed-roots read
+/// as its sibling above.
 #[tokio::test]
+#[serial]
 async fn add_repo_handler_keeps_recorded_model_over_serve_default() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_path = tmp.path().join("existing");
@@ -2705,6 +2751,73 @@ fn evicting_idle_repo_clears_frozen_csharp_error_state() {
     );
 }
 
+/// A build longer than the idle timeout must not leave the repo "idle" the
+/// instant it finishes: the reaper skips an indexing repo AND restarts its idle
+/// clock, so the first sweep after the build still finds it fresh.
+///
+/// Regression guard: the reaper used to skip indexing repos without touching
+/// `last_access`, so a 30+ minute SCIP/index run ended with the repo already
+/// past the timeout and the very next sweep evicted it.
+#[tokio::test]
+#[serial]
+async fn idle_reaper_restarts_the_idle_clock_of_an_indexing_repo() {
+    let _env = crate::testing::EnvRestore::set(&[
+        (crate::constants::REPO_IDLE_TIMEOUT_ENV, "60"),
+        (crate::constants::MAX_INDEXING_SECS_ENV, "600"),
+    ]);
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = crate::cache::safe_canonicalize(tmp.path())
+        .unwrap()
+        .join(DB_DIR_NAME);
+    let OpenedStores::Write(stores) = state
+        .try_open_stores("longbuild", &db_path, true, false, None)
+        .expect("open must succeed")
+    else {
+        panic!("brand-new repo must open Write");
+    };
+    state
+        .repos
+        .insert("longbuild".to_string(), RepoState::Warm { stores });
+    let long_ago = || {
+        Instant::now()
+            .checked_sub(Duration::from_secs(120))
+            .expect("monotonic clock at least 2 minutes old")
+    };
+    state
+        .last_access
+        .insert("longbuild".to_string(), long_ago());
+    assert!(state.begin_indexing("longbuild", IndexingOwner::Reindex));
+
+    state.evict_idle_repos();
+    assert!(
+        state.repos.contains_key("longbuild"),
+        "a repo past the idle timeout must not be evicted while it is indexing"
+    );
+    let age = state.last_access.get("longbuild").unwrap().elapsed();
+    assert!(
+        age < Duration::from_secs(60),
+        "a sweep that sees the repo indexing must restart its idle clock, age was {age:?}"
+    );
+
+    state.end_indexing("longbuild", IndexingOwner::Reindex);
+    state.evict_idle_repos();
+    assert!(
+        state.repos.contains_key("longbuild"),
+        "the first sweep after the build must find the repo fresh, not idle"
+    );
+
+    // Control: once the idle period really passes, the reaper still evicts.
+    state
+        .last_access
+        .insert("longbuild".to_string(), long_ago());
+    state.evict_idle_repos();
+    assert!(
+        !state.repos.contains_key("longbuild"),
+        "a repo idle past the timeout with no build running must still be evicted"
+    );
+}
+
 /// The model a serve query is embedded with is read from the routed repo's own
 /// index metadata — never assumed to be the hub-wide default.
 ///
@@ -2998,13 +3111,15 @@ async fn a_second_format_recovery_for_the_same_alias_is_refused() {
 
 #[tokio::test]
 #[serial]
-async fn stale_indexing_marker_cancels_the_leaked_index_task() {
-    // Regression: evicting the stale marker used to fix only what the TUI
-    // believed. The task itself kept running and kept its `Arc<SharedStores>`
-    // — so the LMDB env and `.writer.lock` stayed held and every later write
-    // failed with "Database is locked by another process" on a repo that
-    // logged as idle and closed.
-    let _env = crate::testing::EnvRestore::set(&[(crate::constants::MAX_INDEXING_SECS_ENV, "1")]);
+async fn await_index_task_cancels_and_releases_the_task_handles() {
+    // Regression: a leaked index task used to keep its `Arc<SharedStores>`
+    // after every cooperative path forgot it — the LMDB env and
+    // `.writer.lock` stayed held, and later writes failed with "Database is
+    // locked by another process" on a repo that logged as idle. Cancellation
+    // must be delivered AND the handle joined (not detached), so the stores
+    // are released. The staleness check no longer cancels live tasks (see
+    // `stale_marker_with_live_task_is_renewed_not_cancelled`);
+    // `await_index_task` is the cancellation trigger.
     let state = Arc::new(ServeState::new(ReposConfig::default(), None));
 
     // Stand-in for the store handles the real task captures.
@@ -3016,39 +3131,32 @@ async fn stale_indexing_marker_cancels_the_leaked_index_task() {
         task_token.cancelled().await;
         drop(stores_task);
     });
-    state
-        .index_tasks
-        .insert("leaky".to_string(), (handle, token.clone()));
-    state.active_reindexes.insert(
+    state.index_tasks.insert(
         "leaky".to_string(),
-        std::iter::once((
-            IndexingOwner::Reindex,
-            Instant::now()
-                .checked_sub(Duration::from_secs(2))
-                .expect("monotonic clock at least 2s old"),
-        ))
-        .collect(),
+        IndexTask {
+            handle,
+            token: token.clone(),
+            db_path: std::path::PathBuf::from("/nonexistent-db"),
+            started_at: Instant::now(),
+        },
     );
 
     assert!(
-        !state.is_indexing("leaky"),
-        "a marker older than the timeout must not read as indexing"
+        state.await_index_task("leaky").await,
+        "a task observing cancellation must join within the cooperative budget"
     );
     assert!(
         token.is_cancelled(),
-        "the leaked task must be cancelled, not merely forgotten"
+        "the cancelled task must observe cancellation"
     );
-
-    let (handle, _) = state
-        .index_tasks
-        .remove("leaky")
-        .expect("task entry kept")
-        .1;
-    handle.await.expect("cancelled task joins cleanly");
+    assert!(
+        !state.index_tasks.contains_key("leaky"),
+        "a joined task must be reaped from index_tasks"
+    );
     assert_eq!(
         Arc::strong_count(&stores),
         1,
-        "the leaked task must have released its store handle"
+        "the cancelled task must have released its store handle"
     );
 }
 
@@ -3061,9 +3169,15 @@ async fn fresh_indexing_marker_leaves_its_index_task_running() {
     let token = CancellationToken::new();
     let task_token = token.clone();
     let handle = tokio::spawn(async move { task_token.cancelled().await });
-    state
-        .index_tasks
-        .insert("busy".to_string(), (handle, token.clone()));
+    state.index_tasks.insert(
+        "busy".to_string(),
+        IndexTask {
+            handle,
+            token: token.clone(),
+            db_path: std::path::PathBuf::from("/nonexistent-db"),
+            started_at: Instant::now(),
+        },
+    );
     state.begin_indexing("busy", IndexingOwner::Reindex);
 
     assert!(
@@ -3206,6 +3320,80 @@ async fn indexing_marker_heartbeat_survives_past_max() {
 
 #[tokio::test]
 #[serial]
+async fn symbol_marker_guard_keeps_the_marker_alive_until_dropped() {
+    // Regression: the SCIP rebuild is one opaque blocking call with no
+    // per-batch heartbeat, so its Symbol marker aged out at MAX_INDEXING_SECS
+    // and the reaper evicted the repo mid-build. The guard renews it for the
+    // whole run and ends it (and the heartbeat) on drop.
+    let _env = crate::testing::EnvRestore::set(&[(crate::constants::MAX_INDEXING_SECS_ENV, "1")]);
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+
+    // Control: a bare Symbol marker expires at the threshold.
+    assert!(state.begin_indexing("ctrl", IndexingOwner::Symbol));
+    let guard = IndexingMarkerGuard::begin(
+        &state,
+        "guarded",
+        IndexingOwner::Symbol,
+        Duration::from_millis(100),
+    );
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        !state.is_indexing("ctrl"),
+        "an unrenewed Symbol marker must expire at the threshold"
+    );
+    assert!(
+        state.is_indexing("guarded"),
+        "the guard's heartbeat must keep the marker alive past the threshold"
+    );
+
+    drop(guard);
+    assert!(
+        !state.is_indexing("guarded"),
+        "dropping the guard must end the marker"
+    );
+    // A heartbeat tick racing the drop must not resurrect the marker.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !state.active_reindexes.contains_key("guarded"),
+        "the heartbeat must stop with the guard"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn symbol_marker_guard_is_inert_while_another_owner_holds_the_alias() {
+    // Nested rebuilds run under the Reindex marker: the guard must neither
+    // add a Symbol marker nor end anyone else's on drop.
+    let _env = crate::testing::EnvRestore::set(&[(crate::constants::MAX_INDEXING_SECS_ENV, "600")]);
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+
+    assert!(state.begin_indexing("nested", IndexingOwner::Reindex));
+    let guard = IndexingMarkerGuard::begin(
+        &state,
+        "nested",
+        IndexingOwner::Symbol,
+        Duration::from_millis(50),
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let owners: Vec<IndexingOwner> = state
+        .active_reindexes
+        .get("nested")
+        .unwrap()
+        .keys()
+        .copied()
+        .collect();
+    assert_eq!(owners, vec![IndexingOwner::Reindex]);
+
+    drop(guard);
+    assert!(
+        state.is_indexing("nested"),
+        "an inert guard must leave the holder's marker alone"
+    );
+    state.end_indexing("nested", IndexingOwner::Reindex);
+}
+
+#[tokio::test]
+#[serial]
 async fn fsw_callback_end_cannot_clear_a_concurrent_reindex_marker() {
     // Regression: the FSW completion callback cleared the whole alias entry
     // with a plain bool, so a watcher refresh finishing mid-run erased a
@@ -3286,4 +3474,1497 @@ async fn stale_eviction_is_scoped_to_the_stale_owner() {
         !state.active_reindexes.contains_key("scoped"),
         "an empty owner map must be removed, not left behind"
     );
+}
+
+// ── Always-on symbol indexes (features/always-on-symbol-indexes) ──────────
+
+/// The per-(alias, language) claim must reject a second fresh claim, accept
+/// one per language independently, become claimable after release, and take
+/// over a claim older than the indexing timeout (leaked by a crashed task).
+#[test]
+fn symbol_rebuild_claim_rejects_fresh_and_takes_over_stale() {
+    let state = ServeState::new(ReposConfig::default(), None);
+
+    assert!(
+        state.begin_symbol_rebuild("repo", "csharp"),
+        "first claim must succeed"
+    );
+    assert!(
+        !state.begin_symbol_rebuild("repo", "csharp"),
+        "a second fresh claim must be rejected"
+    );
+    assert!(
+        state.begin_symbol_rebuild("repo", "typescript"),
+        "a different language must claim independently"
+    );
+
+    state.end_symbol_rebuild("repo", "csharp");
+    assert!(
+        state.begin_symbol_rebuild("repo", "csharp"),
+        "a released slot must be claimable again"
+    );
+
+    // Stale takeover: a claim past the indexing timeout is taken over.
+    let max = state.indexing_timeout();
+    state.symbol_rebuild_in_flight.insert(
+        "csharp:stale".to_string(),
+        std::time::Instant::now() - max - std::time::Duration::from_secs(1),
+    );
+    assert!(
+        state.begin_symbol_rebuild("stale", "csharp"),
+        "a stale claim must be taken over"
+    );
+}
+
+/// The generic gate must answer NotApplicable for a repo without the
+/// language's entrypoint (no tsconfig.json) — deterministically, before the
+/// machine-dependent helper check — and route C# through its dedicated
+/// evaluator (.sln check → NoSolutionFile).
+#[test]
+fn evaluate_symbol_rebuild_gates_applicability_before_availability() {
+    // `evaluate_symbol_rebuild` takes `self: &Arc<Self>` (it may be forwarded
+    // to spawn_blocking by callers), so the probe state lives in an Arc.
+    let state = std::sync::Arc::new(ServeState::new(ReposConfig::default(), None));
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join(DB_DIR_NAME);
+
+    assert_eq!(
+        state.evaluate_symbol_rebuild("typescript", "x", tmp.path(), &db),
+        RebuildDecision::NotApplicable,
+        "a repo without tsconfig.json is not applicable, helper or not"
+    );
+    assert_eq!(
+        state.evaluate_symbol_rebuild("csharp", "x", tmp.path(), &db),
+        RebuildDecision::NoSolutionFile,
+        "C# must keep its dedicated .sln-first evaluator"
+    );
+}
+
+/// The find_impact self-heal must no-op quietly for an unknown alias (remote
+/// mounts, typos) and for a registered repo the language does not apply to —
+/// no claim taken, no C# status touched, no panic.
+#[tokio::test]
+async fn heal_missing_symbol_index_noops_outside_its_remit() {
+    // Unknown alias.
+    let state = std::sync::Arc::new(ServeState::new(ReposConfig::default(), None));
+    heal_missing_symbol_index(&state, "ghost", "csharp").await;
+    assert!(
+        state.symbol_rebuild_in_flight.is_empty(),
+        "unknown alias must not take a claim"
+    );
+
+    // Registered alias, non-applicable language (no .sln / tsconfig.json).
+    let (_tmp, _path, bare) = state_with_repo("plainrepo");
+    let state = std::sync::Arc::new(bare);
+    heal_missing_symbol_index(&state, "plainrepo", "csharp").await;
+    heal_missing_symbol_index(&state, "plainrepo", "typescript").await;
+    assert!(
+        state.symbol_rebuild_in_flight.is_empty(),
+        "non-applicable repo must not take a claim"
+    );
+    assert!(
+        !state.csharp_index_status.contains_key("plainrepo"),
+        "non-applicable repo must not flip the C# indicator"
+    );
+}
+
+/// `maybe_rebuild_symbols` on a repo no language applies to must neither
+/// panic nor leave claims behind — with and without force (the force path
+/// skips the gate but trigger_symbol_rebuild still skips non-applicable
+/// repos before claiming).
+#[tokio::test]
+async fn maybe_rebuild_symbols_skips_non_applicable_repo_under_force() {
+    let (_tmp, _path, bare) = state_with_repo("plainrepo2");
+    let state = std::sync::Arc::new(bare);
+    let path = state.config.read().unwrap().resolve("plainrepo2").unwrap();
+    let db = path.join(DB_DIR_NAME);
+    maybe_rebuild_symbols("plainrepo2", &path, &db, &state, true).await;
+    assert!(
+        state.symbol_rebuild_in_flight.is_empty(),
+        "force must not claim a slot for a non-applicable repo"
+    );
+}
+
+/// A dummy `scip-csharp` helper at the env-override path: available for
+/// detection, fails on execution — which flips the C# status to Error while
+/// proving a rebuild was actually attempted. The helper file lives in
+/// `root`, which the caller keeps alive via its TempDir.
+fn dummy_csharp_helper(root: &std::path::Path) -> crate::testing::EnvRestore {
+    let helper = root.join(if cfg!(windows) {
+        "scip-csharp.exe"
+    } else {
+        "scip-csharp"
+    });
+    std::fs::write(&helper, b"dummy").expect("dummy helper file");
+    crate::testing::EnvRestore::set(&[(
+        crate::constants::SCIP_CSHARP_HELPER_ENV,
+        helper.to_string_lossy().as_ref(),
+    )])
+}
+
+/// Phase-2 composition wiring: a registered repo whose language applies and
+/// whose index is missing must flow gate → queue → trigger end-to-end. The
+/// dummy helper makes the rebuild FAIL, observable as C# status Error once
+/// `run_phase_2_symbols` completes — None would mean the candidate was never
+/// queued (the composition gap this test pins).
+#[tokio::test]
+#[serial]
+async fn run_phase_2_symbols_wires_candidate_through_to_trigger() {
+    let helper_root = tempfile::tempdir().unwrap();
+    let _env = dummy_csharp_helper(helper_root.path());
+
+    let (_tmp, repo_path, bare) = state_with_repo("phase2repo");
+    std::fs::write(
+        repo_path.join("test.sln"),
+        b"Microsoft Visual Studio Solution File",
+    )
+    .unwrap();
+
+    let state = std::sync::Arc::new(bare);
+    state.run_phase_2_symbols().await;
+
+    assert_eq!(
+        state
+            .csharp_index_status
+            .get("phase2repo")
+            .map(|e| *e.value()),
+        Some(CSharpIndexStatus::Error),
+        "the missing C# index must be queued and the rebuild attempted \
+         (dummy helper → Error); None means never queued"
+    );
+    assert!(
+        state.symbol_rebuild_in_flight.is_empty(),
+        "the claim must be released after the failed rebuild"
+    );
+}
+
+/// A successful rebuild WITHOUT survived failures is Ready with the error
+/// cleared; one WITH survived workspace failures is Partial (red `C#⚠` in
+/// the TUI) with a bounded detail line for the info panel — capped at the
+/// first three entries so the detail row stays readable.
+#[test]
+fn csharp_success_outcome_partial_when_warnings_survived() {
+    assert_eq!(
+        csharp_success_outcome(&[]),
+        (CSharpIndexStatus::Ready, None),
+        "a clean rebuild must read Ready with no error detail"
+    );
+
+    let degraded = [
+        "summary".to_string(),
+        "A.csproj: failure one".to_string(),
+        "B.csproj: failure two".to_string(),
+        "C.csproj: failure three".to_string(),
+        "D.csproj: failure four".to_string(),
+    ];
+    let (status, detail) = csharp_success_outcome(&degraded);
+    assert_eq!(status, CSharpIndexStatus::Partial);
+    let detail = detail.expect("partial carries detail");
+    assert!(
+        detail.contains("summary") && detail.contains("B.csproj"),
+        "detail joins the leading entries, got: {detail}"
+    );
+    assert!(
+        !detail.contains("D.csproj"),
+        "detail is capped at three entries, got: {detail}"
+    );
+}
+
+/// A running build wins over a cached (stale) Ready and over the probe, and
+/// skips the probe entirely; idle falls back cache → probe.
+#[test]
+fn resolve_csharp_status_precedence() {
+    use CSharpIndexStatus as S;
+    // (cached, indexing, probe result, expected, probe expected to run)
+    let cases = [
+        (Some(S::Ready), true, S::Ready, S::Indexing, false),
+        (None, true, S::Ready, S::Indexing, false),
+        (Some(S::Ready), false, S::None, S::Ready, false),
+        (None, false, S::Ready, S::Ready, true),
+        (None, false, S::None, S::None, true),
+    ];
+    for (cached, indexing, probe_result, expected, probe_runs) in cases {
+        let mut probed = false;
+        let got = resolve_csharp_status(cached, indexing, || {
+            probed = true;
+            probe_result
+        });
+        assert_eq!(
+            got, expected,
+            "cached={cached:?} indexing={indexing} probe={probe_result:?}"
+        );
+        assert_eq!(
+            probed, probe_runs,
+            "probe invocation for cached={cached:?} indexing={indexing}"
+        );
+    }
+}
+
+/// The watcher notifier must apply the SAME status contract as
+/// trigger_symbol_rebuild's success arm: Succeeded-with-warnings → Partial
+/// (red C#⚠) with bounded detail — never green — and a clean Succeeded →
+/// Ready with the detail cleared. Reverting the arm to insert(Ready) ships
+/// the round-1 defect (green indicator on a degraded index) with a green
+/// suite.
+#[test]
+fn csharp_notifier_partial_on_succeeded_with_warnings() {
+    let state = ServeState::new(ReposConfig::default(), None);
+    let notifier = state.make_csharp_notifier("wrepo");
+
+    notifier(SymbolRebuildSignal::Started);
+    assert_eq!(
+        state.csharp_index_status.get("wrepo").map(|e| *e.value()),
+        Some(CSharpIndexStatus::Indexing)
+    );
+
+    notifier(SymbolRebuildSignal::Succeeded {
+        index_warnings: vec![
+            "summary".to_string(),
+            "A.csproj: boom".to_string(),
+            "B.csproj: boom2".to_string(),
+            "C.csproj: boom3".to_string(),
+        ],
+    });
+    assert_eq!(
+        state.csharp_index_status.get("wrepo").map(|e| *e.value()),
+        Some(CSharpIndexStatus::Partial),
+        "a degraded watcher rebuild must render Partial, never green"
+    );
+    let detail = state
+        .csharp_index_error
+        .get("wrepo")
+        .map(|e| e.value().clone())
+        .expect("detail stored");
+    assert!(detail.contains("summary") && !detail.contains("C.csproj"));
+
+    notifier(SymbolRebuildSignal::Succeeded {
+        index_warnings: Vec::new(),
+    });
+    assert_eq!(
+        state.csharp_index_status.get("wrepo").map(|e| *e.value()),
+        Some(CSharpIndexStatus::Ready)
+    );
+    assert!(
+        !state.csharp_index_error.contains_key("wrepo"),
+        "a clean rebuild must clear the detail"
+    );
+}
+
+/// A rebuild abandoned because `dotnet restore` never finished within the
+/// retry cap leaves the previous index live — so the notifier must render
+/// a WARNING (Partial, yellow `C#⚠`, with the abandonment detail), never a
+/// red Error: a hung restore is an environment condition, not a broken
+/// index.
+#[test]
+fn csharp_notifier_renders_restore_exhaustion_as_partial_not_error() {
+    let state = ServeState::new(ReposConfig::default(), None);
+    let notifier = state.make_csharp_notifier("bayr");
+
+    notifier(SymbolRebuildSignal::Started);
+    notifier(SymbolRebuildSignal::Abandoned(
+        "dotnet restore for this solution did not finish within 3 attempts \
+         (backoff 60s + 120s) — rebuild abandoned, the previous index stays live (issue #225)"
+            .to_string(),
+    ));
+    assert_eq!(
+        state.csharp_index_status.get("bayr").map(|e| *e.value()),
+        Some(CSharpIndexStatus::Partial),
+        "restore exhaustion is a warning — the previous index stays live"
+    );
+    let detail = state
+        .csharp_index_error
+        .get("bayr")
+        .map(|e| e.value().clone())
+        .expect("the abandonment reason must be the info-panel detail");
+    assert!(
+        detail.contains("did not finish within 3 attempts"),
+        "{detail}"
+    );
+
+    // A later clean rebuild clears the warning again.
+    notifier(SymbolRebuildSignal::Succeeded {
+        index_warnings: Vec::new(),
+    });
+    assert_eq!(
+        state.csharp_index_status.get("bayr").map(|e| *e.value()),
+        Some(CSharpIndexStatus::Ready)
+    );
+    assert!(!state.csharp_index_error.contains_key("bayr"));
+}
+
+/// The failure classifier must keep the three outcomes apart — and check
+/// restore-exhaustion FIRST: the typed error carries its own contract
+/// (LMDB untouched, previous index live) that the corruption matcher must
+/// not override. Reordering the checks or flipping the restore arm back to
+/// Error ships the red-error regression with a green suite.
+#[test]
+fn symbol_rebuild_failure_classification_keeps_restore_exhaustion_a_warning() {
+    let exhausted: anyhow::Error = csharp::RestoreExhaustedError {
+        attempts: 3,
+        backoff: "60s + 120s".to_string(),
+    }
+    .into();
+    assert_eq!(
+        classify_symbol_rebuild_failure(&format!("{exhausted:#}"), &exhausted, true),
+        SymbolRebuildFailureKind::RestoreExhausted,
+        "a C# restore-exhausted rebuild must classify as the warning path"
+    );
+    // Not C#: the restore gate is C#-only, the same error falls through.
+    assert_eq!(
+        classify_symbol_rebuild_failure(&format!("{exhausted:#}"), &exhausted, false),
+        SymbolRebuildFailureKind::Generic
+    );
+    // Corruption keeps its own path for a non-exhausted error.
+    let corrupt: anyhow::Error = anyhow::anyhow!("heed -> MDB_BAD_VALSIZE");
+    assert_eq!(
+        classify_symbol_rebuild_failure(&format!("{corrupt:#}"), &corrupt, true),
+        SymbolRebuildFailureKind::LmdbCorruption
+    );
+    // Everything else stays a red Error.
+    let generic: anyhow::Error = anyhow::anyhow!("helper exited with 1");
+    assert_eq!(
+        classify_symbol_rebuild_failure(&format!("{generic:#}"), &generic, true),
+        SymbolRebuildFailureKind::Generic
+    );
+}
+
+/// `repo_statuses_lightweight()` must carry the Partial status AND its
+/// detail message — that pair is what renders the red `C#⚠` and the info
+/// panel's failure line.
+#[test]
+fn repo_statuses_lightweight_carries_partial_with_detail() {
+    let (_tmp, _path, bare) = state_with_repo("partialrepo");
+    let state = std::sync::Arc::new(bare);
+    state
+        .csharp_index_status
+        .insert("partialrepo".to_string(), CSharpIndexStatus::Partial);
+    state.csharp_index_error.insert(
+        "partialrepo".to_string(),
+        "summary | A.csproj: failure one".to_string(),
+    );
+
+    let statuses = state.repo_statuses_lightweight();
+    let (_, info) = statuses
+        .iter()
+        .find(|(alias, _)| alias == "partialrepo")
+        .expect("partialrepo row");
+    assert_eq!(info.csharp_index, CSharpIndexStatus::Partial);
+    assert_eq!(
+        info.csharp_error.as_deref(),
+        Some("summary | A.csproj: failure one"),
+        "the detail message must ride on the status row"
+    );
+}
+
+/// Owner-scoped status: a TEXT reindex lights the general `Indexing` label
+/// and never the symbol columns; a SYMBOL marker lights the applicable
+/// language column only and leaves the general label on the repo's resting
+/// state. A Rust-only repo keeps `None` in both symbol columns either way.
+#[test]
+#[serial]
+fn indexing_labels_are_owner_scoped_in_status() {
+    let (_tmp, repo_path, bare) = state_with_repo("langrepo");
+    let state = std::sync::Arc::new(bare);
+    assert!(state.begin_indexing("langrepo", IndexingOwner::Reindex));
+
+    let row = |state: &ServeState| {
+        state
+            .repo_statuses_lightweight()
+            .into_iter()
+            .find(|(alias, _)| alias == "langrepo")
+            .expect("langrepo row")
+            .1
+    };
+
+    let info = row(&state);
+    assert_eq!(info.status, RepoStateLabel::Indexing);
+    assert_eq!(info.csharp_index, CSharpIndexStatus::None);
+    assert_eq!(info.typescript_index, CSharpIndexStatus::None);
+
+    // A .sln alone does not make a text reindex a C# rebuild: the C# column
+    // lights only when a symbol marker is present.
+    std::fs::write(repo_path.join("App.sln"), "").unwrap();
+    assert_eq!(row(&state).csharp_index, CSharpIndexStatus::None);
+
+    state.end_indexing("langrepo", IndexingOwner::Reindex);
+    // An on-disk db makes the resting state Idle (not NoIndex).
+    std::fs::create_dir_all(repo_path.join(DB_DIR_NAME)).unwrap();
+    assert!(state.begin_indexing("langrepo", IndexingOwner::Symbol));
+    let info = row(&state);
+    assert_eq!(info.csharp_index, CSharpIndexStatus::Indexing);
+    assert_eq!(
+        info.status,
+        RepoStateLabel::Idle,
+        "a pure SCIP rebuild must not light the general Indexing label"
+    );
+
+    state.end_indexing("langrepo", IndexingOwner::Symbol);
+}
+
+/// TS twin of the owner-scoping test above: with a resolvable helper env
+/// override, a SYMBOL marker lights the TS column while the general label
+/// rests; a TEXT reindex never lights the TS column, tsconfig or not.
+/// `#[serial]` + `EnvRestore`: the helper override is process env.
+#[test]
+#[serial]
+fn typescript_column_is_symbol_owner_scoped() {
+    let (_tmp, repo_path, bare) = state_with_repo("tsrepo");
+    let state = std::sync::Arc::new(bare);
+    std::fs::create_dir_all(repo_path.join(DB_DIR_NAME)).unwrap();
+    std::fs::write(repo_path.join("tsconfig.json"), "{}").unwrap();
+    // The env override must point at a regular file; content is never run.
+    let helper = repo_path.join("fake-scip-typescript");
+    std::fs::write(&helper, "").unwrap();
+    let helper_env = crate::constants::SCIP_TYPESCRIPT_HELPER_ENV;
+    let helper_path = helper.display().to_string();
+
+    let row = |state: &ServeState| {
+        state
+            .repo_statuses_lightweight()
+            .into_iter()
+            .find(|(alias, _)| alias == "tsrepo")
+            .expect("tsrepo row")
+            .1
+    };
+
+    assert!(state.begin_indexing("tsrepo", IndexingOwner::Reindex));
+    {
+        let _env = crate::testing::EnvRestore::set(&[(helper_env, helper_path.as_str())]);
+        let info = row(&state);
+        assert_eq!(info.status, RepoStateLabel::Indexing);
+        assert_eq!(
+            info.typescript_index,
+            CSharpIndexStatus::None,
+            "a text reindex must not light the TS column"
+        );
+    }
+    state.end_indexing("tsrepo", IndexingOwner::Reindex);
+
+    assert!(state.begin_indexing("tsrepo", IndexingOwner::Symbol));
+    let _env = crate::testing::EnvRestore::set(&[(helper_env, helper_path.as_str())]);
+    let info = row(&state);
+    assert_eq!(info.typescript_index, CSharpIndexStatus::Indexing);
+    assert_eq!(
+        info.status,
+        RepoStateLabel::Idle,
+        "a pure SCIP rebuild must not light the general Indexing label"
+    );
+    state.end_indexing("tsrepo", IndexingOwner::Symbol);
+}
+
+/// A queued phase-2 rebuild holds no active_reindexes marker yet: the C#
+/// cache pre-mark alone must light the C# COLUMN (queued work stays visible)
+/// while the general label stays on the repo's resting state — a pure SCIP
+/// pass never made the text index busy.
+#[test]
+fn queued_rebuild_pre_mark_shows_in_the_csharp_column_only() {
+    let (_tmp, repo_path, bare) = state_with_repo("queuedrepo");
+    let state = std::sync::Arc::new(bare);
+    std::fs::create_dir_all(repo_path.join(DB_DIR_NAME)).unwrap();
+
+    // The phase-2 queue pre-mark — no begin_indexing, the task hasn't started.
+    state
+        .csharp_index_status
+        .insert("queuedrepo".to_string(), CSharpIndexStatus::Indexing);
+
+    let row = || {
+        state
+            .repo_statuses_lightweight()
+            .into_iter()
+            .find(|(alias, _)| alias == "queuedrepo")
+            .expect("queuedrepo row")
+            .1
+    };
+
+    let info = row();
+    assert_eq!(info.csharp_index, CSharpIndexStatus::Indexing);
+    assert_eq!(
+        info.status,
+        RepoStateLabel::Idle,
+        "a queued symbol rebuild must not light the general Indexing label"
+    );
+
+    // Completed rebuilds overwrite the cache; without pending work the same
+    // closed repo reads Idle again.
+    state.csharp_index_status.remove("queuedrepo");
+    assert_eq!(row().status, RepoStateLabel::Idle);
+}
+
+/// The `!applies` skip in trigger_symbol_rebuild must drop a queued pre-mark:
+/// applicability can change while the task waits for its semaphore slot, and
+/// no rebuild will start to overwrite the mark.
+#[tokio::test]
+async fn trigger_symbol_rebuild_clears_a_pre_mark_when_not_applicable() {
+    let (_tmp, repo_path, bare) = state_with_repo("naq");
+    let state = std::sync::Arc::new(bare);
+    // No .sln written → C# does not apply to this repo.
+    state
+        .csharp_index_status
+        .insert("naq".to_string(), CSharpIndexStatus::Indexing);
+
+    trigger_symbol_rebuild(
+        "naq",
+        &repo_path,
+        &repo_path.join(DB_DIR_NAME),
+        &state,
+        LANG_CSHARP,
+    )
+    .await;
+
+    assert!(
+        state.csharp_index_status.get("naq").is_none(),
+        "a skipped rebuild must not leave the queue pre-mark behind"
+    );
+}
+
+/// A repo whose directory is gone by the time phase-2 runs must never show
+/// indexing: either candidacy filtering skips it or the task's skip guard
+/// drops the pre-mark. No helper env is set (applicability gates before
+/// availability, so a missing dir is decided without probing a helper) —
+/// env-mutating variants of this test must stay `#[serial]`.
+#[tokio::test]
+async fn phase_2_never_marks_a_missing_repo_indexing() {
+    let (_tmp, repo_path, bare) = state_with_repo("gone");
+    std::fs::remove_dir_all(&repo_path).unwrap();
+    let state = std::sync::Arc::new(bare);
+
+    state.run_phase_2_symbols().await;
+
+    assert!(
+        state.csharp_index_status.get("gone").is_none(),
+        "a missing repo must not end up marked indexing"
+    );
+}
+
+/// The serve-tui `i` overlay reads the DURABLE warnings from the on-disk
+/// meta (survives a restart, unlike the in-memory status) and prefixes them
+/// with the language. A repo whose meta carries no warnings yields none.
+#[test]
+fn build_info_overlay_reads_symbol_warnings_from_meta() {
+    use crate::serve::tui::build_info_overlay;
+
+    let (_tmp, repo_path, bare) = state_with_repo("inforepo");
+    let db = repo_path.join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db).unwrap();
+    std::fs::write(
+        db.join("metadata.json"),
+        r#"{"schema_version":1,"dimensions":2,"model_short_name":"minilm-l6-q"}"#,
+    )
+    .unwrap();
+    // Seed the meta the way a degraded rebuild does (see the roundtrip test
+    // in csharp_tests for the read side).
+    let env = crate::symbols::get_shared_scip_env(&db).unwrap();
+    let mut wtxn = env.write_txn().unwrap();
+    let meta: heed::Database<heed::types::Str, heed::types::Str> = env
+        .create_database(&mut wtxn, Some(crate::constants::SCIP_META_DB_NAME))
+        .unwrap();
+    meta.put(
+        &mut wtxn,
+        crate::constants::SCIP_INDEX_WARNINGS_KEY,
+        r#"["summary","A.csproj: failure one"]"#,
+    )
+    .unwrap();
+    wtxn.commit().unwrap();
+
+    let state = std::sync::Arc::new(bare);
+    let statuses = state.repo_statuses_lightweight();
+    let idx = statuses
+        .iter()
+        .position(|(alias, _)| alias == "inforepo")
+        .expect("inforepo row");
+    let overlay = build_info_overlay(idx, &statuses, &state).expect("overlay");
+    match overlay {
+        crate::serve::tui_common::OverlayState::Info {
+            symbol_warnings, ..
+        } => {
+            assert!(
+                symbol_warnings.len() == 2 && symbol_warnings[0].starts_with("[csharp] summary"),
+                "warnings must be language-prefixed from meta, got: {symbol_warnings:?}"
+            );
+        }
+        other => panic!("expected Info overlay, got {other:?}"),
+    }
+}
+
+/// A failed first build must KEEP the registration and release the marker:
+/// the old rollback unregistered the alias and let self-cleanup delete the
+/// DB dir — the vanishing-repo defect (a 202 was the operator's last
+/// word). A registered half-built store heals via reindex.
+#[test]
+fn note_add_index_failure_keeps_the_repo_registered() {
+    let (_tmp, repo_path, state) = state_with_repo("addfail");
+    let alias = "addfail";
+    // The add handler begins indexing before spawning the build task.
+    assert!(state.begin_indexing(alias, IndexingOwner::Reindex));
+
+    state.note_add_index_failure(
+        alias,
+        &repo_path,
+        &anyhow::anyhow!("FTS commit failed: Access is denied. (os error 5)"),
+    );
+
+    assert!(
+        state.config_snapshot().resolve(alias).is_some(),
+        "the repo must stay registered after a failed first build"
+    );
+    assert!(
+        state.begin_indexing(alias, IndexingOwner::Reindex),
+        "the failed marker must be released so a retry can start immediately"
+    );
+}
+
+/// The symbol-index status collector reads plain meta (never a helper):
+/// stale without a current builder stamp, ready with one, degraded with
+/// warnings — and a repo without entrypoints reads not-applicable instead
+/// of blaming an absent index.
+#[test]
+#[serial]
+fn symbol_index_status_reflects_the_on_disk_meta() {
+    use crate::constants::{INDEX_BUILDER_VERSION, SCIP_INDEX_BUILDER_VERSION_KEY};
+
+    let (_tmp, repo_path, state) = state_with_repo("syminfo");
+    let db = repo_path.join(DB_DIR_NAME);
+    let registry = state.symbol_registry();
+
+    // No entrypoints at all: both languages are explicitly not-applicable.
+    let statuses = crate::symbols::symbol_index_status(&registry, &repo_path, &db);
+    assert!(
+        statuses.iter().all(|s| s.not_applicable),
+        "a repo without entrypoints must not blame an absent index: {statuses:?}"
+    );
+
+    // Applicable from here on: a solution file.
+    std::fs::write(repo_path.join("test.sln"), b"Solution File").unwrap();
+
+    // Key-format stamp only (no builder stamp): has_index accepts it, the
+    // builder check reads stale — the inherited-index class.
+    seed_scip_meta(&db, &[]);
+    let csharp = crate::symbols::symbol_index_status(&registry, &repo_path, &db)
+        .into_iter()
+        .find(|s| s.language == "csharp")
+        .expect("csharp status entry");
+    assert_eq!(csharp.state, "stale", "{csharp:?}");
+
+    // A rebuild by THIS binary (current stamp): ready.
+    seed_scip_meta(
+        &db,
+        &[(SCIP_INDEX_BUILDER_VERSION_KEY, INDEX_BUILDER_VERSION)],
+    );
+    let csharp = crate::symbols::symbol_index_status(&registry, &repo_path, &db)
+        .into_iter()
+        .find(|s| s.language == "csharp")
+        .expect("csharp status entry");
+    assert_eq!(csharp.state, "ready", "{csharp:?}");
+    assert!(!csharp.not_applicable);
+
+    // Survived build failures in meta: degraded — serving but incomplete.
+    seed_scip_meta(
+        &db,
+        &[
+            (SCIP_INDEX_BUILDER_VERSION_KEY, INDEX_BUILDER_VERSION),
+            (
+                crate::constants::SCIP_INDEX_WARNINGS_KEY,
+                r#"["Broken.csproj: Msbuild failed when processing the file"]"#,
+            ),
+        ],
+    );
+    let csharp = crate::symbols::symbol_index_status(&registry, &repo_path, &db)
+        .into_iter()
+        .find(|s| s.language == "csharp")
+        .expect("csharp status entry");
+    assert_eq!(csharp.state, "degraded", "{csharp:?}");
+}
+
+/// The overlay's age renderer must turn the unknown-age sentinel into
+/// words — a consumer must never read "18446744073709551615" as an age.
+#[test]
+fn human_age_seconds_renders_the_unknown_sentinel_as_words() {
+    assert_eq!(crate::serve::tui::human_age_seconds(0), "0s");
+    assert_eq!(crate::serve::tui::human_age_seconds(59), "59s");
+    assert_eq!(crate::serve::tui::human_age_seconds(120), "2m");
+    assert_eq!(crate::serve::tui::human_age_seconds(3 * 3600), "3h");
+    assert_eq!(crate::serve::tui::human_age_seconds(72 * 3600), "3d");
+    assert_eq!(
+        crate::serve::tui::human_age_seconds(u64::MAX),
+        "unknown age"
+    );
+}
+
+/// `c` copies the warnings of an Info overlay — and nothing else: other
+/// overlays ignore the key, Esc still dismisses everywhere.
+#[test]
+fn overlay_copy_key_only_fires_on_info_overlays() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let info = crate::serve::tui_common::OverlayState::Info {
+        alias: "demo.app".to_string(),
+        path: String::new(),
+        chunks: 0,
+        files: 0,
+        max_chunk_id: 0,
+        db_size_human: String::new(),
+        model: String::new(),
+        dims: 0,
+        lock: "write".to_string(),
+        index_age: String::new(),
+        symbol_warnings: vec!["w1".to_string()],
+        symbol_index: Vec::new(),
+        copy_feedback: None,
+    };
+    let copy_key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
+    assert!(matches!(
+        crate::serve::tui_common::handle_overlay_key(copy_key, &info),
+        Some(crate::serve::tui_common::OverlayKeyAction::CopyWarnings)
+    ));
+
+    let doctor = crate::serve::tui_common::OverlayState::Doctor {
+        alias: "x".to_string(),
+        results: vec![],
+    };
+    assert!(
+        crate::serve::tui_common::handle_overlay_key(copy_key, &doctor).is_none(),
+        "'c' must not fire outside the Info overlay"
+    );
+    let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    assert!(matches!(
+        crate::serve::tui_common::handle_overlay_key(esc, &doctor),
+        Some(crate::serve::tui_common::OverlayKeyAction::Dismiss)
+    ));
+}
+
+/// The clipboard text is the full record: alias header naming the subject,
+/// then every stored warning line verbatim.
+#[test]
+fn symbol_warnings_copy_text_heads_with_alias_and_carries_every_line() {
+    let text = crate::serve::tui_common::symbol_warnings_copy_text(
+        "acme-web",
+        &["summary line".to_string(), "A.csproj: boom".to_string()],
+    );
+    assert!(text.starts_with("acme-web — symbol index warnings (2):"));
+    assert!(text.contains("\nsummary line\nA.csproj: boom"));
+}
+
+/// An empty warnings list must report honestly instead of copying a bare
+/// header — a silent "success" would read as copied content.
+#[test]
+fn apply_copy_warnings_reports_when_nothing_is_recorded() {
+    let mut info = crate::serve::tui_common::OverlayState::Info {
+        alias: "acme-web".to_string(),
+        path: String::new(),
+        chunks: 0,
+        files: 0,
+        max_chunk_id: 0,
+        db_size_human: String::new(),
+        model: String::new(),
+        dims: 0,
+        lock: "write".to_string(),
+        index_age: String::new(),
+        symbol_warnings: vec![],
+        symbol_index: Vec::new(),
+        copy_feedback: None,
+    };
+    crate::serve::tui_common::apply_copy_warnings(&mut info);
+    match info {
+        crate::serve::tui_common::OverlayState::Info { copy_feedback, .. } => {
+            assert_eq!(
+                copy_feedback.as_deref(),
+                Some("no symbol warnings recorded")
+            );
+        }
+        other => panic!("expected Info overlay, got {other:?}"),
+    }
+}
+
+/// Both clipboard outcomes surface as the overlay's feedback line: success
+/// confirms the copy, failure names the reason. The clipboard write is
+/// injected so the test pins the feedback contract, not the OS clipboard.
+#[test]
+fn apply_copy_warnings_feedback_covers_success_and_failure() {
+    fn info() -> crate::serve::tui_common::OverlayState {
+        crate::serve::tui_common::OverlayState::Info {
+            alias: "acme-web".to_string(),
+            path: String::new(),
+            chunks: 0,
+            files: 0,
+            max_chunk_id: 0,
+            db_size_human: String::new(),
+            model: String::new(),
+            dims: 0,
+            lock: "write".to_string(),
+            index_age: String::new(),
+            symbol_warnings: vec!["summary".to_string()],
+            symbol_index: Vec::new(),
+            copy_feedback: None,
+        }
+    }
+
+    let mut overlay = info();
+    let seen_text = std::cell::RefCell::new(String::new());
+    crate::serve::tui_common::apply_copy_warnings_with(&mut overlay, |text| {
+        *seen_text.borrow_mut() = text.to_string();
+        Ok(())
+    });
+    match &overlay {
+        crate::serve::tui_common::OverlayState::Info { copy_feedback, .. } => {
+            assert_eq!(
+                copy_feedback.as_deref(),
+                Some("✓ symbol warnings copied to clipboard")
+            );
+        }
+        other => panic!("expected Info overlay, got {other:?}"),
+    }
+    assert_eq!(
+        seen_text.into_inner(),
+        "acme-web — symbol index warnings (1):\nsummary"
+    );
+
+    let mut overlay = info();
+    crate::serve::tui_common::apply_copy_warnings_with(&mut overlay, |_| {
+        Err("powershell: not found".to_string())
+    });
+    match overlay {
+        crate::serve::tui_common::OverlayState::Info { copy_feedback, .. } => {
+            assert_eq!(
+                copy_feedback.as_deref(),
+                Some("copy failed: powershell: not found")
+            );
+        }
+        other => panic!("expected Info overlay, got {other:?}"),
+    }
+}
+
+/// Greedy word-wrap row estimate: words that do not fit start a new row, a
+/// word longer than the row hard-splits, every line takes at least one row.
+/// A char-based ceiling would undershoot the URL case (break lands just
+/// before the row end) and clip the modal's last content row.
+#[test]
+fn estimate_wrapped_height_counts_multi_row_lines() {
+    use ratatui::text::Line;
+    let lines = vec![Line::raw("short"), Line::raw("x".repeat(120))];
+    assert_eq!(
+        crate::serve::tui_common::estimate_wrapped_height(&lines, 56),
+        4
+    );
+    assert_eq!(
+        crate::serve::tui_common::estimate_wrapped_height(&lines, 200),
+        2
+    );
+    // Word wrap: "aaa" + "bbb" does not fit side by side in 5 columns.
+    assert_eq!(
+        crate::serve::tui_common::estimate_wrapped_height(&[Line::raw("aaa bbb")], 5),
+        2
+    );
+    // Hard split: a 60-char URL word across 58 columns takes 2 rows on its
+    // own even though ceil(60/58) would also say 2 — the pinned case is the
+    // prose line that leaves the URL to start a fresh row.
+    assert_eq!(
+        crate::serve::tui_common::estimate_wrapped_height(
+            &[Line::raw(
+                "src index for source https://pkgs/nuget/v3/index.json"
+            )],
+            50
+        ),
+        2
+    );
+    // trim: false keeps the warning line's 4-space indent on the first row,
+    // so an indent-width word that would fit on its own needs two rows.
+    assert_eq!(
+        crate::serve::tui_common::estimate_wrapped_height(
+            &[Line::raw(format!("    {}", "a".repeat(58)))],
+            58
+        ),
+        2
+    );
+    // A mid-line separator run is real columns: "a  b" fits exactly in 4,
+    // wraps in 3.
+    assert_eq!(
+        crate::serve::tui_common::estimate_wrapped_height(&[Line::raw("a  b")], 4),
+        1
+    );
+    assert_eq!(
+        crate::serve::tui_common::estimate_wrapped_height(&[Line::raw("a  b")], 3),
+        2
+    );
+}
+
+/// Long warning lines must WRAP inside the modal, not clip at the border:
+/// the tail of the failure text (the feed URL) stays readable, and the
+/// key-hint footer survives on the border's bottom title.
+#[test]
+fn modal_wraps_long_warning_lines_instead_of_clipping() {
+    use ratatui::backend::TestBackend;
+    use ratatui::text::{Line, Span};
+    use ratatui::Terminal;
+
+    let warning = "Sample.Web.csproj: Unable to load the service index for source https://pkgs.example.com/private-feed/nuget/v3/index.json";
+    let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+    terminal
+        .draw(|f| {
+            let lines = vec![Line::from(Span::raw(format!("    {warning}")))];
+            crate::serve::tui_common::render_centered_modal_with_footer(
+                f,
+                f.area(),
+                " acme-web — Index Info ",
+                Some(" [Esc] close · [c] copy warnings "),
+                lines,
+                ratatui::style::Color::Cyan,
+            );
+        })
+        .unwrap();
+
+    let buffer = terminal.backend().buffer().clone();
+    let mut rendered = String::new();
+    for y in 0..buffer.area.height {
+        for x in 0..buffer.area.width {
+            rendered.push_str(buffer[(x, y)].symbol());
+        }
+        rendered.push('\n');
+    }
+    // Wrapping splits the text at arbitrary columns and the modal border
+    // characters sit between the wrapped segments, so compare with all
+    // whitespace and box-drawing characters stripped: every character of
+    // the warning must be rendered somewhere in order — with clipping (the
+    // old behaviour) the tail past the modal edge is simply gone.
+    let flat: String = rendered
+        .chars()
+        .filter(|c| !c.is_whitespace() && !matches!(c, '│' | '┌' | '┐' | '└' | '┘' | '─'))
+        .collect();
+    let want: String = warning.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains(&want),
+        "the full warning must wrap inside the modal, got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("[c] copy warnings"),
+        "the copy-hint footer must stay visible, got:\n{rendered}"
+    );
+}
+
+/// The serve-mode find_impact self-heal spawn must reach
+/// `trigger_symbol_rebuild` for a registered, applicable repo: after the
+/// warned empty answer, the C# status eventually flips to Error (dummy
+/// helper) in the serve state the heal captured.
+#[tokio::test]
+#[serial]
+async fn find_impact_self_heal_runs_the_rebuild_in_serve_mode() {
+    let helper_root = tempfile::tempdir().unwrap();
+    let _env = dummy_csharp_helper(helper_root.path());
+
+    let (_tmp, repo_path, bare) = state_with_repo("healrepo");
+    std::fs::write(
+        repo_path.join("test.sln"),
+        b"Microsoft Visual Studio Solution File",
+    )
+    .unwrap();
+    // The routing layer requires an existing index dir before it will open
+    // the repo (seed like the find_impact fixtures do).
+    let db = repo_path.join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db).unwrap();
+    std::fs::write(
+        db.join("metadata.json"),
+        r#"{"schema_version":1,"dimensions":2,"model_short_name":"minilm-l6-q"}"#,
+    )
+    .unwrap();
+    let state = std::sync::Arc::new(bare);
+
+    let request = crate::mcp::types::FindImpactRequest {
+        symbol_name: Some("ResolveLinkedActivityAsync".to_string()),
+        file: None,
+        line: None,
+        symbol_key: None,
+        language: Some("csharp".to_string()),
+        project: Some("healrepo".to_string()),
+        group: None,
+    };
+    // The REST mirror builds its own serve-mode service from the state —
+    // the same path the MCP tool takes for a project-scoped query.
+    let v = crate::mcp::rest_find_impact_handler(
+        axum::extract::State(state.clone()),
+        axum::Json(request),
+    )
+    .await
+    .expect("rest mirror result")
+    .0;
+    let out = v.to_string();
+    assert!(
+        v["warnings"]
+            .as_array()
+            .is_some_and(|w| !w.is_empty() && w[0].as_str().is_some_and(|s| s.contains("UNKNOWN"))),
+        "the never-built index answer must carry the UNKNOWN warning, got: {out}"
+    );
+
+    // The detached heal task runs the rebuild (dummy helper → Error).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if state
+            .csharp_index_status
+            .get("healrepo")
+            .map(|e| *e.value())
+            == Some(CSharpIndexStatus::Error)
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the self-heal never flipped the C# status — spawn branch not wired"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+// ── Rebuild gate: builder-version stamp + degraded retry ─────────────────
+
+/// Seeds the SCIP meta for `db` exactly like `rebuild` stamps it (rebuild
+/// timestamp + key format), plus the caller's extra key/values — so gate
+/// tests can shape a fresh, stale or degraded index without the helper.
+fn seed_scip_meta(db: &std::path::Path, extra: &[(&str, &str)]) {
+    let env = crate::symbols::get_shared_scip_env(db).unwrap();
+    let mut wtxn = env.write_txn().unwrap();
+    let meta: heed::Database<heed::types::Str, heed::types::Str> = env
+        .open_database(&wtxn, Some(crate::constants::SCIP_META_DB_NAME))
+        .unwrap()
+        .unwrap();
+    meta.put(&mut wtxn, crate::constants::SCIP_REBUILD_TIMESTAMP_KEY, "0")
+        .unwrap();
+    meta.put(
+        &mut wtxn,
+        crate::constants::SCIP_KEY_FORMAT_KEY,
+        crate::constants::SCIP_KEY_FORMAT,
+    )
+    .unwrap();
+    for (key, value) in extra {
+        meta.put(&mut wtxn, *key, *value).unwrap();
+    }
+    wtxn.commit().unwrap();
+}
+
+/// Shared arrangement: applicable repo (`.sln`), dummy helper, seeded SCIP
+/// meta, config timestamps showing a fresh build (last_scip ≥ last_changed)
+/// so ONLY the builder-version / degraded-retry checks can move the gate.
+/// The helper-env guard and both tempdirs are returned so they outlive the
+/// fixture.
+#[allow(clippy::type_complexity)]
+fn gate_fixture(
+    alias: &str,
+    meta_extra: &[(&str, &str)],
+) -> (
+    crate::testing::EnvRestore,
+    tempfile::TempDir,
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::sync::Arc<ServeState>,
+) {
+    let helper_root = tempfile::tempdir().unwrap();
+    let env_guard = dummy_csharp_helper(helper_root.path());
+    let (tmp, repo_path, bare) = state_with_repo(alias);
+    std::fs::write(repo_path.join("test.sln"), b"Solution File").unwrap();
+    let db = repo_path.join(DB_DIR_NAME);
+    seed_scip_meta(&db, meta_extra);
+    let state = std::sync::Arc::new(bare);
+    let now = ServeState::now_unix_secs();
+    {
+        let mut cfg = state.config.write().unwrap();
+        cfg.touch_last_changed(alias, now - 100);
+        cfg.touch_last_scip(alias, now);
+    }
+    (env_guard, helper_root, tmp, repo_path, state)
+}
+
+/// An index this binary never produced (no builder stamp — anything built
+/// before the stamp existed) must read as stale: a deployed binary rebuilds
+/// the indexes it inherited itself at startup, never waits for a manual
+/// command. This is the DRM-24427_Versioning defect class.
+#[test]
+#[serial]
+fn evaluate_rebuilds_an_index_from_an_older_binary() {
+    let (_env, _h, _tmp, repo_path, state) = gate_fixture("oldbinary", &[]);
+
+    assert_eq!(
+        state.evaluate_symbol_rebuild(
+            "csharp",
+            "oldbinary",
+            &repo_path,
+            &repo_path.join(DB_DIR_NAME)
+        ),
+        RebuildDecision::ChangedSinceLastBuild,
+        "absent builder stamp must read as stale"
+    );
+}
+
+/// A degraded index (warnings in meta, current builder version) rebuilds
+/// exactly once per serve process: the second evaluation is Fresh (no loop
+/// while the environment stays broken); a fresh process gets a fresh set.
+#[test]
+#[serial]
+fn evaluate_retries_a_degraded_index_once_per_process() {
+    let (_env, _h, _tmp, repo_path, state) = gate_fixture(
+        "degraded",
+        &[(
+            crate::constants::SCIP_INDEX_BUILDER_VERSION_KEY,
+            crate::constants::INDEX_BUILDER_VERSION,
+        )],
+    );
+    let db = repo_path.join(DB_DIR_NAME);
+    // Re-seed WITH warnings (the fixture seeded only the version stamp).
+    seed_scip_meta(
+        &db,
+        &[(
+            crate::constants::SCIP_INDEX_WARNINGS_KEY,
+            r#"["Broken.csproj: Msbuild failed when processing the file"]"#,
+        )],
+    );
+
+    assert_eq!(
+        state.evaluate_symbol_rebuild("csharp", "degraded", &repo_path, &db),
+        RebuildDecision::ChangedSinceLastBuild,
+        "a degraded index must get its one automatic retry"
+    );
+    assert_eq!(
+        state.evaluate_symbol_rebuild("csharp", "degraded", &repo_path, &db),
+        RebuildDecision::Fresh,
+        "the retry must not loop within one serve process"
+    );
+}
+
+/// A clean index with the current builder stamp and fresh timestamps stays
+/// Fresh — the gate must not churn indexes that are actually fine.
+#[test]
+#[serial]
+fn evaluate_stays_fresh_when_index_is_current_and_clean() {
+    let (_env, _h, _tmp, repo_path, state) = gate_fixture(
+        "cleanidx",
+        &[(
+            crate::constants::SCIP_INDEX_BUILDER_VERSION_KEY,
+            crate::constants::INDEX_BUILDER_VERSION,
+        )],
+    );
+
+    assert_eq!(
+        state.evaluate_symbol_rebuild(
+            "csharp",
+            "cleanidx",
+            &repo_path,
+            &repo_path.join(DB_DIR_NAME)
+        ),
+        RebuildDecision::Fresh,
+        "current + clean + fresh timestamps must not rebuild"
+    );
+    assert!(
+        !state.degraded_rebuild_attempted.contains("cleanidx"),
+        "a clean index must not consume the degraded retry"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Queue-backlog regressions: tracked index tasks, stale-marker liveness,
+// deferred DB cleanup.
+// ---------------------------------------------------------------------------
+
+/// Age `alias`'s Reindex marker past the stale threshold.
+fn aged_marker(state: &ServeState, alias: &str) {
+    state
+        .active_reindexes
+        .entry(alias.to_string())
+        .or_default()
+        .insert(
+            IndexingOwner::Reindex,
+            Instant::now() - Duration::from_secs(MAX_INDEXING_SECS * 2),
+        );
+}
+
+/// A handle whose task has already completed (the handle is kept, not awaited).
+async fn finished_handle() -> tokio::task::JoinHandle<()> {
+    let handle = tokio::spawn(async {});
+    while !handle.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    handle
+}
+
+fn tracked_task(handle: tokio::task::JoinHandle<()>, db_path: std::path::PathBuf) -> IndexTask {
+    IndexTask {
+        handle,
+        token: CancellationToken::new(),
+        db_path,
+        started_at: Instant::now(),
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn stale_marker_with_live_task_is_renewed_not_cancelled() {
+    // Regression: a reindex task queued behind the process-wide job gate can
+    // outlive MAX_INDEXING_SECS without being a leak. Evicting its marker and
+    // cancelling the task cancels healthy queued work whenever a backlog
+    // outlives the threshold.
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+    let alias = "live-task-repo";
+    let handle = tokio::spawn(async { std::future::pending::<()>().await });
+    let token = CancellationToken::new();
+    state.index_tasks.insert(
+        alias.to_string(),
+        IndexTask {
+            handle,
+            token: token.clone(),
+            db_path: std::path::PathBuf::from("/nonexistent-db"),
+            started_at: Instant::now(),
+        },
+    );
+
+    aged_marker(&state, alias);
+    assert!(
+        !state.begin_indexing(alias, IndexingOwner::Reindex),
+        "a live task must block a second run even with a stale marker"
+    );
+
+    // A stale marker owned by another flow (Watcher) carries no liveness
+    // evidence of its own and must still be evicted, even while the index
+    // task lives.
+    state
+        .active_reindexes
+        .entry(alias.to_string())
+        .or_default()
+        .insert(
+            IndexingOwner::Watcher,
+            Instant::now() - Duration::from_secs(MAX_INDEXING_SECS * 2),
+        );
+    aged_marker(&state, alias);
+    assert!(
+        state.is_indexing(alias),
+        "a live task must keep reporting indexing"
+    );
+    assert!(
+        state
+            .active_reindexes
+            .get(alias)
+            .is_some_and(|owners| !owners.contains_key(&IndexingOwner::Watcher)),
+        "a stale non-Reindex marker must still be evicted"
+    );
+    assert!(
+        !token.is_cancelled(),
+        "the marker check must never cancel a live task"
+    );
+    let renewed = state
+        .active_reindexes
+        .get(alias)
+        .and_then(|owners| owners.get(&IndexingOwner::Reindex).copied())
+        .expect("the marker must survive the check");
+    assert!(
+        Instant::now().duration_since(renewed) < Duration::from_secs(5),
+        "a live marker must be renewed, not evicted"
+    );
+
+    {
+        let entry = state.index_tasks.get(alias);
+        if let Some(entry) = entry {
+            entry.value().handle.abort();
+        }
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn stale_marker_without_live_task_is_evicted_and_entry_reaped() {
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+    let alias = "dead-task-repo";
+    let handle = finished_handle().await;
+    state.index_tasks.insert(
+        alias.to_string(),
+        tracked_task(handle, std::path::PathBuf::from("/nonexistent-db")),
+    );
+    aged_marker(&state, alias);
+
+    assert!(
+        !state.is_indexing(alias),
+        "with no live task the stale marker must be evicted"
+    );
+    assert!(
+        !state.index_tasks.contains_key(alias),
+        "the finished entry must be reaped"
+    );
+    assert!(
+        !state.active_reindexes.contains_key(alias),
+        "the evicted marker must be cleaned up"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn sweeper_reaps_finished_unregistered_task_and_cleans_db() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("gone-repo").join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db_path).unwrap();
+    std::fs::write(db_path.join("metadata.json"), b"{}").unwrap();
+
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+    let handle = finished_handle().await;
+    state.index_tasks.insert(
+        "gone-repo".to_string(),
+        tracked_task(handle, db_path.clone()),
+    );
+    state
+        .active_reindexes
+        .entry("gone-repo".to_string())
+        .or_default()
+        .insert(IndexingOwner::Reindex, Instant::now());
+
+    state.sweep_index_tasks();
+
+    assert!(!state.index_tasks.contains_key("gone-repo"));
+    assert!(!db_path.exists(), "the orphaned DB dir must be deleted");
+    assert!(!state.active_reindexes.contains_key("gone-repo"));
+}
+
+#[tokio::test]
+#[serial]
+async fn await_index_task_timeout_keeps_task_tracked() {
+    // Regression: the old code removed the entry before waiting and dropped
+    // the handle on timeout, making the detached task invisible while it held
+    // its stores and the job permit.
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+    let alias = "parked-task";
+    let token = CancellationToken::new();
+    let handle = tokio::spawn(async { std::future::pending::<()>().await });
+    state.index_tasks.insert(
+        alias.to_string(),
+        IndexTask {
+            handle,
+            token: token.clone(),
+            db_path: std::path::PathBuf::from("/nonexistent-db"),
+            started_at: Instant::now(),
+        },
+    );
+
+    let exited = state
+        .await_index_task_with_budget(alias, Duration::from_millis(50))
+        .await;
+    assert!(!exited, "a parked task cannot exit within the budget");
+    assert!(
+        state.index_tasks.contains_key(alias),
+        "the task must stay tracked — never invisible"
+    );
+    assert!(token.is_cancelled(), "cancellation must still be signalled");
+
+    {
+        let entry = state.index_tasks.get(alias);
+        if let Some(entry) = entry {
+            entry.value().handle.abort();
+        }
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn await_index_task_returns_true_when_task_exits() {
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+    let handle = tokio::spawn(async {});
+    state.index_tasks.insert(
+        "quick-task".to_string(),
+        tracked_task(handle, std::path::PathBuf::from("/nonexistent-db")),
+    );
+    assert!(
+        state
+            .await_index_task_with_budget("quick-task", Duration::from_secs(5))
+            .await
+    );
+    assert!(!state.index_tasks.contains_key("quick-task"));
+}
+
+#[tokio::test]
+#[serial]
+async fn remove_repo_defers_db_delete_while_index_task_is_still_running() {
+    // Regression: deleting the DB dir under a live (uninterruptible) index
+    // task is what can wedge a hub — the task never reaches a cancellation
+    // point and keeps its stores and the job permit for the process lifetime.
+    let (_tmp, repo_path, state) = state_with_repo("slowrepo");
+    let db_path = repo_path.join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db_path).unwrap();
+    std::fs::write(db_path.join("data.mdb"), "fake").unwrap();
+
+    // A task that ignores cancellation entirely, like a parked build.
+    let token = CancellationToken::new();
+    let handle = tokio::spawn(async { std::future::pending::<()>().await });
+    state.index_tasks.insert(
+        "slowrepo".to_string(),
+        IndexTask {
+            handle,
+            token,
+            db_path: db_path.clone(),
+            started_at: Instant::now(),
+        },
+    );
+
+    let outcome = state
+        .remove_repo_with_budget("slowrepo", Duration::from_millis(100))
+        .await
+        .expect("remove_repo should succeed");
+
+    assert!(
+        !outcome.db_deleted,
+        "the DB dir must NOT be deleted out from under a live task"
+    );
+    assert!(db_path.exists(), "the dir stays until the task exits");
+    assert!(
+        state.index_tasks.contains_key("slowrepo"),
+        "the running task must stay tracked for the sweeper"
+    );
+
+    // Simulate the task finally exiting (aborted here; a real one would run
+    // its post-build guard): the sweeper is the backstop that reaps the entry
+    // and deletes the orphaned dir.
+    if let Some(entry) = state.index_tasks.get("slowrepo") {
+        entry.value().handle.abort();
+    }
+    loop {
+        let finished = state
+            .index_tasks
+            .get("slowrepo")
+            .is_some_and(|entry| entry.value().handle.is_finished());
+        if finished {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    state.sweep_index_tasks();
+
+    assert!(!state.index_tasks.contains_key("slowrepo"));
+    assert!(
+        !db_path.exists(),
+        "the sweeper must clean the orphaned DB dir"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn sweeper_reasserts_cancellation_for_a_removed_live_task() {
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+    let token = CancellationToken::new();
+    let handle = tokio::spawn(async { std::future::pending::<()>().await });
+    state.index_tasks.insert(
+        "removed-repo".to_string(),
+        IndexTask {
+            handle,
+            token: token.clone(),
+            db_path: std::path::PathBuf::from("/nonexistent-db"),
+            started_at: Instant::now(),
+        },
+    );
+
+    state.sweep_index_tasks();
+
+    assert!(
+        token.is_cancelled(),
+        "a removed repo's live task must have cancellation re-asserted"
+    );
+    assert!(
+        state.index_tasks.contains_key("removed-repo"),
+        "a live task must stay tracked until it exits"
+    );
+
+    {
+        let entry = state.index_tasks.get("removed-repo");
+        if let Some(entry) = entry {
+            entry.value().handle.abort();
+        }
+    }
 }

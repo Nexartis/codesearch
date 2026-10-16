@@ -5,7 +5,8 @@
 #
 # When the edited file's repo is codesearch-registered (shared coverage model
 # with grep-guard: git root listed in ~/.codesearch/repos.json, honoring
-# CODESEARCH_REPOS_CONFIG, or a CODESEARCH_SERVER opt-in), every touched file
+# CODESEARCH_REPOS_CONFIG / CODESEARCH_HOME, or a CODESEARCH_SERVER opt-in),
+# every touched file
 # needs a marker proving the agent consulted codesearch for exactly that path
 # within the last 5 minutes: mcp__codesearch__find_impact for SCIP-backed
 # languages (.cs .ts .tsx .mts .cts), mcp__codesearch__find kind="usages" for

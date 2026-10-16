@@ -46,6 +46,10 @@ fn init_git_remote(dir: &Path, url: &str) {
                 .arg("-C")
                 .arg(dir)
                 .args(args)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_OBJECT_DIRECTORY")
                 .output()
             {
                 Ok(o) => return o,
@@ -294,14 +298,20 @@ fn register_leaves_unix_path_untouched() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("propagate-tmp-repo");
     std::fs::create_dir(&repo).unwrap();
-    let path_str = repo.to_string_lossy().to_string();
+    // register() canonicalizes its input; on macOS the temp dir lives under the
+    // /var -> /private/var symlink, so the raw temp path is not the canonical
+    // one. Compare against the canonical path so this test pins its real
+    // intent — register() applies no Windows/MSYS rewrite on Unix — rather
+    // than the host's temp-dir symlink layout (which made it fail on macOS,
+    // blocking the local QC gate on every push).
+    let expected = std::fs::canonicalize(&repo).unwrap();
 
     let mut cfg = ReposConfig::default();
     let alias = cfg.register(repo.clone());
     let stored = cfg.repos.get(&alias).expect("alias must be registered");
     assert_eq!(
         stored.to_string_lossy(),
-        path_str,
+        expected.to_string_lossy(),
         "register() must not rewrite Unix paths"
     );
 }

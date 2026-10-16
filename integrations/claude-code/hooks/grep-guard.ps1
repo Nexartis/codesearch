@@ -82,7 +82,8 @@ $targetRoot = Resolve-TargetGitRoot $path
 if (-not $targetRoot) { exit 0 }
 
 # Coverage: the TARGET repo's git root is REGISTERED with the serve hub
-# (~/.codesearch/repos.json — the same list the hub itself resolves by),
+# (~/.codesearch/repos.json, honoring the CODESEARCH_REPOS_CONFIG /
+# CODESEARCH_HOME overrides — the same list the hub itself resolves by),
 # matching the bash twin and edit-guard; a running serve hub alone is NOT a
 # signal (it covers many repos and being alive says nothing about this one).
 # CODESEARCH_SERVER stays the explicit opt-in for pure remote-serve setups.

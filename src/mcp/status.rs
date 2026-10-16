@@ -220,8 +220,17 @@ impl CodesearchService {
                 }
             }
 
-            let (status, status_message) =
-                index_status_summary(sv.len(), failed_count, total_chunks, all_built);
+            let any_indexing = self
+                .serve_state
+                .as_ref()
+                .is_some_and(|s| ctx.aliases().iter().any(|a| s.is_indexing(a)));
+            let (status, status_message) = index_status_summary(
+                sv.len(),
+                failed_count,
+                total_chunks,
+                all_built,
+                any_indexing,
+            );
 
             let response = IndexStatusResponse {
                 indexed: all_indexed,
@@ -275,7 +284,13 @@ impl CodesearchService {
 
         // Determine status based on database state. `stats.indexed` (the HNSW
         // graph is built) is load-bearing — see `single_index_status`.
-        let (status, status_message) = single_index_status(stats.total_chunks, stats.indexed);
+        let indexing = self
+            .serve_state
+            .as_ref()
+            .zip(ctx.project_alias.as_deref())
+            .is_some_and(|(s, a)| s.is_indexing(a));
+        let (status, status_message) =
+            single_index_status(stats.total_chunks, stats.indexed, indexing);
 
         let response = IndexStatusResponse {
             indexed: stats.indexed,

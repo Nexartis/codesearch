@@ -5,12 +5,14 @@
 # PowerShell twin of codesearch-common.sh — keep the two behaviorally
 # equivalent. Coverage model: a repo is covered when its git root is
 # REGISTERED in ~/.codesearch/repos.json (CODESEARCH_REPOS_CONFIG overrides
-# the location), or when CODESEARCH_SERVER opts a pure remote-serve setup
+# the location, CODESEARCH_HOME relocates the whole global root), or when
+# CODESEARCH_SERVER opts a pure remote-serve setup
 # in. Everything here fails open: an unresolvable coverage question must
 # allow, never deny.
 
 function Get-CodesearchReposConfigFile {
     if ($env:CODESEARCH_REPOS_CONFIG) { return $env:CODESEARCH_REPOS_CONFIG }
+    if ($env:CODESEARCH_HOME) { return (Join-Path $env:CODESEARCH_HOME 'repos.json') }
     return (Join-Path $HOME '.codesearch/repos.json')
 }
 

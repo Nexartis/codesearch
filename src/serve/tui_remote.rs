@@ -264,6 +264,11 @@ async fn run_remote_tui_loop(
                     if let Some(action) = tui_common::handle_overlay_key(key, ov) {
                         match action {
                             OverlayKeyAction::Dismiss => overlay = None,
+                            OverlayKeyAction::CopyWarnings => {
+                                if let Some(ov) = overlay.as_mut() {
+                                    tui_common::apply_copy_warnings(ov);
+                                }
+                            }
                             OverlayKeyAction::ConfirmRemove => {
                                 if let Some(OverlayState::ConfirmRemove { alias }) = overlay.take()
                                 {
@@ -358,6 +363,9 @@ async fn run_remote_tui_loop(
                                                 dims: info.dims,
                                                 lock: info.lock,
                                                 index_age: info.index_age,
+                                                symbol_warnings: info.symbol_warnings,
+                                                symbol_index: info.symbol_index,
+                                                copy_feedback: None,
                                             },
                                             Err(e) => OverlayState::Doctor {
                                                 alias,
@@ -503,6 +511,14 @@ struct InfoResponse {
     dims: usize,
     lock: String,
     index_age: String,
+    /// Index-level symbol warnings from the peer's on-disk meta. `default` for
+    /// the same older-serve compatibility as `path`.
+    #[serde(default)]
+    symbol_warnings: Vec<String>,
+    /// Per-language symbol-index status from the peer. `default` so a client
+    /// talking to an older serve still deserializes (renders no section).
+    #[serde(default)]
+    symbol_index: Vec<crate::symbols::SymbolIndexStatus>,
 }
 
 #[derive(Debug, Deserialize)]

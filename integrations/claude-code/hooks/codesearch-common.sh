@@ -5,7 +5,8 @@
 #
 # Coverage model (shared with the Rust serve hub, src/db_discovery/repos.rs):
 # a repo is covered when its git root is REGISTERED in
-# ~/.codesearch/repos.json (CODESEARCH_REPOS_CONFIG overrides the location),
+# ~/.codesearch/repos.json (CODESEARCH_REPOS_CONFIG overrides the location,
+# CODESEARCH_HOME relocates the whole global root),
 # or when CODESEARCH_SERVER opts a pure remote-serve setup in. Everything
 # here fails open: an unresolvable coverage question must allow, never deny.
 # Requires: jq
@@ -17,11 +18,14 @@ jq_str() {
     tr -d '\r'
 }
 
-# repos.json location — mirrors src/db_discovery/repos.rs `config_path()`:
-# CODESEARCH_REPOS_CONFIG override > ~/.codesearch/repos.json.
+# repos.json location — mirrors src/db_discovery/repos.rs `config_path()`
+# and constants.rs `codesearch_home()`:
+# CODESEARCH_REPOS_CONFIG > $CODESEARCH_HOME/repos.json > ~/.codesearch/repos.json.
 repos_config_file() {
     if [ -n "${CODESEARCH_REPOS_CONFIG:-}" ]; then
         printf '%s' "$CODESEARCH_REPOS_CONFIG"
+    elif [ -n "${CODESEARCH_HOME:-}" ]; then
+        printf '%s' "${CODESEARCH_HOME%/}/repos.json"
     else
         printf '%s' "${HOME:-}/.codesearch/repos.json"
     fi

@@ -59,8 +59,9 @@ path=$(echo "$raw" | jq -r '.tool_input.path // empty' | jq_str)
 # every absolute path.
 #
 # Coverage signal (#199): the target's git root is REGISTERED with the
-# local serve hub (~/.codesearch/repos.json — the same registration list
-# the hub itself resolves queries by). A `.codesearch.db` directory at
+# local serve hub (~/.codesearch/repos.json, honoring the
+# CODESEARCH_REPOS_CONFIG / CODESEARCH_HOME overrides — the same
+# registration list the hub itself resolves queries by). A `.codesearch.db` directory at
 # the git root was only ever a proxy for that and is wrong in both
 # directions: a stale db from a since-unregistered repo denied Grep while
 # the hub could not actually answer for it (unknown alias), and a

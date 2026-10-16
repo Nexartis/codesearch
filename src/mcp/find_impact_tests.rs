@@ -7,7 +7,10 @@
 //! resolution is tested separately against `resolve_find_impact_budget_secs`
 //! with `#[serial]` + `EnvRestore` per the repo rule for env mutation.
 
-use super::{find_impact_with_budget, resolve_find_impact_budget_secs, ImpactLookupOutcome};
+use super::{
+    find_impact_with_budget, missing_index_warning, resolve_find_impact_budget_secs,
+    ImpactLookupOutcome, SymbolIndexHeal,
+};
 use crate::constants::{DEFAULT_FIND_IMPACT_BUDGET_SECS, FIND_IMPACT_BUDGET_SECS_ENV};
 use crate::symbols::{SymbolLookupBusy, SymbolReference};
 use std::path::PathBuf;
@@ -253,6 +256,7 @@ fn fingerprint_fields_present_when_set_and_omitted_when_none() {
             scope: "project:p".to_string(),
             index_head_sha,
             current_head_sha,
+            symbol_index: Vec::new(),
         }
     };
     let all: serde_json::Value = serde_json::to_value(base(
@@ -281,6 +285,37 @@ fn fingerprint_fields_present_when_set_and_omitted_when_none() {
     assert!(!keys.contains(&"index_head_sha"), "keys: {keys:?}");
     assert!(!keys.contains(&"current_head_sha"), "keys: {keys:?}");
     assert!(!keys.contains(&"resolved_symbol"), "keys: {keys:?}");
+}
+
+#[test]
+fn index_age_sentinel_serializes_as_null_and_real_ages_as_numbers() {
+    use crate::symbols::{FindImpactResult, SymbolReference};
+
+    let result = |age: u64| FindImpactResult {
+        symbol: "FieldDefinition.Validate".to_string(),
+        resolved_symbol: None,
+        references: vec![SymbolReference {
+            file: PathBuf::from("a.cs"),
+            start_line: 1,
+            end_line: 1,
+            kind: "definition".to_string(),
+        }],
+        warnings: Vec::new(),
+        index_age_seconds: age,
+        language: "csharp".to_string(),
+        scope: "project:p".to_string(),
+        index_head_sha: None,
+        current_head_sha: None,
+        symbol_index: Vec::new(),
+    };
+
+    // u64::MAX is `index_age`'s unreadable-index sentinel; a consumer must
+    // see "unknown" (null), not 18446744073709551615 seconds.
+    let unknown: serde_json::Value = serde_json::to_value(result(u64::MAX)).unwrap();
+    assert_eq!(unknown["index_age_seconds"], serde_json::Value::Null);
+
+    let known: serde_json::Value = serde_json::to_value(result(12)).unwrap();
+    assert_eq!(known["index_age_seconds"], serde_json::json!(12));
 }
 
 #[test]
@@ -366,6 +401,15 @@ fn build_service() -> (CodesearchService, tempfile::TempDir) {
         std::sync::Arc::new(crate::index::SharedStores::new(&db, 2).expect("shared stores"));
     let service = CodesearchService::new_with_stores(Some(root.path().to_path_buf()), Some(stores))
         .expect("service");
+    (service, root)
+}
+
+/// [`build_service`] plus a solution file, so the csharp indexer is
+/// APPLICABLE and answers carry a real csharp `symbol_index` entry (the
+/// plain fixture repo has no entrypoints, so both languages filter out).
+fn build_applicable_service() -> (CodesearchService, tempfile::TempDir) {
+    let (service, root) = build_service();
+    std::fs::write(root.path().join("test.sln"), b"Solution File").expect("sln");
     (service, root)
 }
 
@@ -712,6 +756,24 @@ fn warnings_bytes(warnings: &[&str]) -> Vec<u8> {
     bytes
 }
 
+/// Persist index-level rebuild warnings the way a C# rebuild does (meta
+/// key, JSON array) — the fixture for answers served from an index built
+/// out of a partially loaded solution.
+fn write_index_warnings_meta(db_path: &std::path::Path, warnings: &[String]) {
+    let env = crate::symbols::get_shared_scip_env(db_path).expect("shared env");
+    let mut wtxn = env.write_txn().expect("wtxn");
+    let meta: heed::Database<heed::types::Str, heed::types::Str> = env
+        .create_database(&mut wtxn, Some(crate::constants::SCIP_META_DB_NAME))
+        .unwrap();
+    meta.put(
+        &mut wtxn,
+        crate::constants::SCIP_INDEX_WARNINGS_KEY,
+        serde_json::to_string(warnings).unwrap().as_str(),
+    )
+    .unwrap();
+    wtxn.commit().unwrap();
+}
+
 /// One resolved symbol with persisted warnings, one without.
 fn populate_warnings_fixture(db_path: &std::path::Path) -> (String, String) {
     let warned_key = "csharp Ns . W#Warned().".to_string();
@@ -784,6 +846,52 @@ async fn resolved_answer_surfaces_persisted_warnings() {
     );
 }
 
+/// Every EMPTY answer carries the per-language symbol-index status of the
+/// repo it came from — the check an agent needs before reading
+/// `references: []` as "verified no callers". A name that matches nothing
+/// is the canonical empty answer: LMDB-only, no helper spawn. Applicable
+/// languages only: a repo without a tsconfig must not list typescript as
+/// absent-with-blame.
+#[tokio::test]
+#[serial_test::serial]
+async fn answers_carry_the_symbol_index_status() {
+    let helper_root = tempfile::tempdir().unwrap();
+    let _guard = make_helper_available(&helper_root);
+    let (service, root) = build_applicable_service();
+    populate_warnings_fixture(&root.path().join(".codesearch.db"));
+
+    let out = tool_text(
+        &service,
+        FindImpactRequest {
+            symbol_name: Some("NoSuchSymbol".to_string()),
+            ..find_impact_request()
+        },
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        v["references"],
+        serde_json::json!([]),
+        "the name must not match the fixture's symbols: {out}"
+    );
+
+    let statuses = v["symbol_index"]
+        .as_array()
+        .expect("symbol_index present on an empty answer");
+    let csharp = statuses
+        .iter()
+        .find(|s| s["language"] == "csharp")
+        .expect("csharp status entry present");
+    assert_eq!(
+        csharp["state"], "absent",
+        "the fixture has symbol tables but no key-format stamp, so has_index refuses it: {out}"
+    );
+    assert!(
+        statuses.iter().all(|s| s["language"] != "typescript"),
+        "non-applicable languages must be filtered out of find_impact answers: {out}"
+    );
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn clean_resolved_answer_omits_the_warnings_field() {
@@ -809,5 +917,230 @@ async fn clean_resolved_answer_omits_the_warnings_field() {
     assert!(
         v.get("warnings").is_none(),
         "a clean answer must OMIT warnings (skip_serializing_if), got: {out}"
+    );
+}
+
+/// The missing-index warning is what keeps a never-built symbol index's
+/// empty reference list from passing for "no callers": whatever the heal
+/// status, it must name the language and state UNKNOWN explicitly. The
+/// wording per status must also stay honest — "a background rebuild was
+/// started" is only allowed when one actually was.
+#[test]
+fn missing_index_warning_names_language_and_marks_answer_unknown() {
+    let warning = missing_index_warning("csharp", SymbolIndexHeal::BackgroundStarted);
+    assert!(
+        warning.contains("csharp"),
+        "must name the language, got: {warning}"
+    );
+    assert!(
+        warning.contains("UNKNOWN"),
+        "must mark the empty list as UNKNOWN, got: {warning}"
+    );
+    assert!(
+        warning.contains("retry"),
+        "must tell the caller to retry after the rebuild, got: {warning}"
+    );
+}
+
+#[test]
+fn missing_index_warning_manual_names_the_build_command() {
+    let warning = missing_index_warning("typescript", SymbolIndexHeal::Manual);
+    assert!(warning.contains("UNKNOWN"), "got: {warning}");
+    assert!(
+        warning.contains("codesearch index symbol"),
+        "must tell the caller how to build the index, got: {warning}"
+    );
+    assert!(
+        !warning.contains("rebuild was started"),
+        "nothing was started — must not claim it, got: {warning}"
+    );
+}
+
+#[test]
+fn missing_index_warning_not_applicable_explains_why_and_promises_nothing() {
+    let reason = "the scip-typescript adapter requires a top-level tsconfig.json (monorepo layouts are not resolved yet)";
+    let warning = missing_index_warning("typescript", SymbolIndexHeal::NotApplicable(reason));
+    assert!(warning.contains("UNKNOWN"), "got: {warning}");
+    assert!(
+        warning.contains("tsconfig.json"),
+        "must surface the indexer's own reason, got: {warning}"
+    );
+    assert!(
+        !warning.contains("rebuild was started"),
+        "a non-applicable repo can never be rebuilt here — must not claim a rebuild, got: {warning}"
+    );
+}
+
+/// A never-built index must not answer "no references" silently: the empty
+/// NotFound answer carries the self-heal warning. Fails without the fix —
+/// the pre-fix answer is byte-identical to a genuine "no callers", the exact
+/// trap that reads as "safe to remove" (observed live on a runtime-registered
+/// worktree whose SCIP index was never built).
+#[tokio::test]
+#[serial_test::serial]
+async fn never_built_index_warns_on_the_empty_answer() {
+    let helper_root = tempfile::tempdir().unwrap();
+    let _guard = make_helper_available(&helper_root);
+    // No fixture population: a valid-but-empty store — neither symbols nor a
+    // rebuild timestamp. This is the never-built state.
+    let (service, _root) = build_service();
+
+    let out = tool_text(
+        &service,
+        FindImpactRequest {
+            symbol_name: Some("ResolveLinkedActivityAsync".to_string()),
+            ..find_impact_request()
+        },
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(
+        v["references"].as_array().is_some_and(|a| a.is_empty()),
+        "the never-built index answers with empty references, got: {out}"
+    );
+    let warnings = v["warnings"].as_array().expect("self-heal warning present");
+    assert_eq!(
+        warnings.len(),
+        1,
+        "exactly the missing-index warning, got: {out}"
+    );
+    assert!(
+        warnings[0].as_str().is_some_and(|w| w.contains("UNKNOWN")),
+        "the warning must mark the answer UNKNOWN, got: {out}"
+    );
+}
+
+/// A POSITION query that misses the index must answer a loud typed failure,
+/// never the empty-references shape: an agent copying (file, line) from a
+/// `find` result on a stale index read the silent empty answer as "zero
+/// callers" (observed live: a method with 8 call sites "had" 0 because the
+/// position query missed by a line convention drift). Name queries keep the
+/// historical empty answer.
+#[tokio::test]
+#[serial_test::serial]
+async fn position_miss_answers_loud_failure_not_empty_references() {
+    let helper_root = tempfile::tempdir().unwrap();
+    let _guard = make_helper_available(&helper_root);
+    let (service, project) = build_service();
+    let db = project.path().join(".codesearch.db");
+    let (_warned_key, clean_key) = populate_warnings_fixture(&db);
+    // Index-level warnings must ride on the FAILURE shape too — a position
+    // miss from a partially loaded index must not hide that the whole
+    // index's answers may be incomplete.
+    write_index_warnings_meta(
+        &db,
+        &["The symbol index was built while the C# workspace reported 2 distinct failure(s) — cross-project references may be missing from every answer."
+            .to_string()],
+    );
+
+    // A real position index with one entry: a miss below is genuinely
+    // "nothing at that position", not a missing DB.
+    {
+        let env = crate::symbols::get_shared_scip_env(&db).expect("shared env");
+        let mut wtxn = env.write_txn().expect("wtxn");
+        let positions: heed::Database<heed::types::Str, heed::types::Bytes> = env
+            .create_database(&mut wtxn, Some(crate::constants::SCIP_POSITION_DB_NAME))
+            .unwrap();
+        let mut entry = vec![1u8];
+        entry.extend_from_slice(&bincode::serialize(&vec![clean_key]).unwrap());
+        positions.put(&mut wtxn, "src/w.cs:5", &entry).unwrap();
+        wtxn.commit().unwrap();
+    }
+
+    let out = tool_text(
+        &service,
+        FindImpactRequest {
+            file: Some("src/w.cs".to_string()),
+            line: Some(999),
+            ..find_impact_request()
+        },
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(
+        v.get("references").is_none(),
+        "a position miss must not answer the empty-references shape, got: {out}"
+    );
+    assert_eq!(v["class"], "failed", "typed failure, got: {out}");
+    assert!(
+        v["hint_for_agent"]
+            .as_str()
+            .is_some_and(|h| h.contains("1-based")),
+        "the hint must explain the line convention, got: {out}"
+    );
+    let failure_warnings = v["warnings"]
+        .as_array()
+        .expect("index-level warnings ride the failure");
+    assert!(
+        failure_warnings.iter().any(|w| w
+            .as_str()
+            .is_some_and(|w| w.contains("cross-project references"))),
+        "the partial-index warning must not be hidden by the failure, got: {out}"
+    );
+}
+
+/// Index-level rebuild warnings must ride on EVERY answer from an index
+/// built out of a partially loaded solution — resolved answers AND empty
+/// NotFound answers. This pins the live defect reported on a customer
+/// worktree: MSBuild project-load failures (broken NuGet restore) produced
+/// an index with definitions but no cross-project references, and every
+/// answer passed as clean while an orphan-check read the empty lists as
+/// "no callers".
+#[tokio::test]
+#[serial_test::serial]
+async fn index_level_rebuild_warnings_ride_on_resolved_and_empty_answers() {
+    let helper_root = tempfile::tempdir().unwrap();
+    let _guard = make_helper_available(&helper_root);
+    let (service, project) = build_service();
+    let db = project.path().join(".codesearch.db");
+    let (_warned_key, clean_key) = populate_warnings_fixture(&db);
+    let index_warnings = vec![
+        "The symbol index was built while the C# workspace reported 2 distinct failure(s) — cross-project references may be missing from every answer. Failures `dotnet build` also reports are real and fixable in the repo (often a missing dotnet restore); failures only scip-csharp reports are tool-side — please report them and reindex."
+            .to_string(),
+        "App.Dam.csproj: depends on Analyzer.X (>= 1.2.3) but it was not found".to_string(),
+    ];
+    write_index_warnings_meta(&db, &index_warnings);
+
+    // A RESOLVED answer from the partial index carries the index warnings.
+    let out = tool_text(
+        &service,
+        FindImpactRequest {
+            symbol_key: Some(clean_key.clone()),
+            ..find_impact_request()
+        },
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        v["resolved_symbol"], clean_key,
+        "the fixture query must resolve, got: {out}"
+    );
+    let warnings = v["warnings"].as_array().expect("warnings present");
+    assert_eq!(
+        serde_json::to_value(warnings).unwrap(),
+        serde_json::to_value(&index_warnings).unwrap(),
+        "a resolved answer from a partially built index carries exactly the index warnings: {out}"
+    );
+
+    // The EMPTY NotFound answer carries them too — an empty reference list
+    // out of a partial index must never pass for "no callers".
+    let out = tool_text(
+        &service,
+        FindImpactRequest {
+            symbol_name: Some("NotARealSymbolAnywhere".to_string()),
+            ..find_impact_request()
+        },
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(
+        v["references"].as_array().is_some_and(|a| a.is_empty()),
+        "unknown symbol answers empty, got: {out}"
+    );
+    assert!(
+        v["warnings"].as_array().is_some_and(
+            |w| !w.is_empty() && w[0].as_str().is_some_and(|s| s.contains("cross-project"))
+        ),
+        "the empty answer must carry the index-level warning, got: {out}"
     );
 }

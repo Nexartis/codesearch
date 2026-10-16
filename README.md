@@ -233,7 +233,7 @@ If your agent skips codesearch and falls back to grep/glob too often, paste this
 
 > Prefer codesearch for semantic, cross-file, or symbol-oriented lookup ("where is X implemented", "find usages of Y", "how does Z flow"). Use plain grep/glob for a single known file, trivial one-line edits, or exact literal searches. In remote-serve mode, returned paths are from the **server's** filesystem — read content via `get_chunk` rather than opening paths locally, and unindexed dirs (`.venv`, `node_modules`, `build/`) simply return nothing.
 
-OpenCode: put this in the user-level `~/.config/opencode/AGENTS.md` (applies across all projects). Claude Code reads a project-level `AGENTS.md`, so add it per-project (or symlink a shared one).
+OpenCode: put this in the user-level `~/.config/opencode/AGENTS.md` (applies across all projects), or install the [OpenCode plugin](integrations/opencode/README.md), which injects this guidance with the resolved project scope automatically. Claude Code reads a project-level `AGENTS.md`, so add it per-project (or symlink a shared one).
 
 **Claude Code specifically** tends to ignore this advice more than other clients — its MCP tool schemas are deferred (an extra `ToolSearch` call is needed before codesearch tools are even callable), while Grep/Glob are always fully loaded and zero-friction, and spawned subagents don't inherit `AGENTS.md` or the MCP `initialize` instructions at all.
 
@@ -253,7 +253,9 @@ codesearch hooks claude install --project  # project scope (./.claude)
 
 The native command embeds the hook scripts in the binary (no source tree needed) and merges the registrations into `settings.json`. The equivalent from-source installers still live in [`integrations/claude-code/`](integrations/claude-code/) (`install.ps1` / `install.sh`) if you'd rather run them directly.
 
-Note: the grep-guard detects "codesearch is available **for this repo**" via that repo's registration with the serve hub (`~/.codesearch/repos.json`, honoring the `CODESEARCH_REPOS_CONFIG` override) or `CODESEARCH_SERVER` — **not** by checking whether a `codesearch` process is running (that runs almost constantly as a multi-repo hub and would false-fire in every directory), and **not** via a local `.codesearch.db` directory (a stale db from a since-unregistered repo used to deny Grep even though the hub could not answer for it). For a remote-serve setup with no local registration, set `CODESEARCH_SERVER` to opt back into enforcement.
+**OpenCode** gets the same structural treatment through the OpenCode v2 plugin in [`integrations/opencode/`](integrations/opencode/README.md): it resolves the session directory to an indexed project, injects scope-aware guidance once per session, rescues empty greps with index hits, optionally prunes or blocks `grep`/`glob`, keeps the serve hub healthy (with optional auto-start), and adds `/codesearch*` commands, a `codesearch_scope` tool, a skill and compaction assistance. Install by copying `codesearch.ts` into `~/.config/opencode/plugins/` — see the [integration README](integrations/opencode/README.md).
+
+Note: the grep-guard detects "codesearch is available **for this repo**" via that repo's registration with the serve hub (`~/.codesearch/repos.json`, honoring the `CODESEARCH_REPOS_CONFIG` / `CODESEARCH_HOME` overrides) or `CODESEARCH_SERVER` — **not** by checking whether a `codesearch` process is running (that runs almost constantly as a multi-repo hub and would false-fire in every directory), and **not** via a local `.codesearch.db` directory (a stale db from a since-unregistered repo used to deny Grep even though the hub could not answer for it). For a remote-serve setup with no local registration, set `CODESEARCH_SERVER` to opt back into enforcement.
 
 ## MCP Tools Reference
 
@@ -444,12 +446,12 @@ When using `git worktree add` to create parallel working directories, codesearch
 codesearch hooks git install
 ```
 
-This installs a `post-checkout` hook that POSTs the worktree path to the running serve instance whenever a new worktree is checked out. The hook reads the serve URL from `~/.codesearch/serve_url` (automatically managed by `codesearch serve`).
+This installs a `post-checkout` hook that POSTs the worktree path to the running serve instance whenever a new worktree is checked out. The hook reads the serve URL from `~/.codesearch/serve_url` (`$CODESEARCH_HOME/serve_url` when the global root is relocated; automatically managed by `codesearch serve`).
 
 The install target is resolved with `git rev-parse --git-path hooks`, so it honours `core.hooksPath` (and, inside a linked worktree, the shared common-dir hooks) rather than assuming `.git/hooks/`. An existing `post-checkout` is not overwritten — codesearch's logic is chained in as a marker-delimited block.
 
 **How it works:**
-1. `codesearch serve` writes its URL to `~/.codesearch/serve_url` on startup (deletes on shutdown)
+1. `codesearch serve` writes its URL to `~/.codesearch/serve_url` (`$CODESEARCH_HOME/serve_url` when relocated) on startup (deletes on shutdown)
 2. The `post-checkout` hook reads that file and POSTs the working directory to `POST /repos`
 3. Serve registers the worktree path and begins indexing (deduped — won't re-register existing paths)
 
@@ -573,14 +575,62 @@ In the `codesearch serve` TUI, mounts appear in **italic/cyan**, distinguishing 
 | `CODESEARCH_ALLOWED_HOSTS` | Comma-separated hostname allowlist for the MCP streamable-HTTP transport (unset = loopback only: `localhost`, `127.0.0.1`, `::1`). Set this to your container/service hostname when serve runs behind a container network or reverse proxy — see [Security](#security). |
 | `CODESEARCH_DISABLE_HOST_VALIDATION` | `1`/`true` disables the MCP transport's Host-header allowlist entirely (DNS-rebinding protection off). Only safe behind a reverse proxy/firewall that already restricts inbound Host headers — see [Security](#security). |
 | `CODESEARCH_MCP_MODE` | MCP mode: auto, client, local |
+| `CODESEARCH_HOME` | Relocate the entire global root (`repos.json`, models cache, logs, `serve_url`, global ignore/extension files) away from `~/.codesearch`. Must be an absolute path; unset = `~/.codesearch`. Per-file overrides like `CODESEARCH_REPOS_CONFIG` still win |
 | `CODESEARCH_REPOS_CONFIG` | Path to repos.json |
 | `CODESEARCH_REPO_IDLE_TIMEOUT_SECS` | Idle eviction timeout (default: 1800) |
 | `CODESEARCH_CACHE_MAX_MEMORY` | Embedding cache MB (default: 500) |
 | `CODESEARCH_MAX_LMDB_MAP_SIZE_MB` | Hard cap (MB) for LMDB auto-resize on `MDB_MAP_FULL`, applied to both the vector store and the persistent embedding cache (default: 16384 = 16GB; clamped to at least 1024). Raise this for very large corpora (millions of chunks) that legitimately exceed the default cap — see #189. |
 | `CODESEARCH_BATCH_SIZE` | Embedding batch size |
+| `CODESEARCH_INCREMENTAL_BATCH_SIZE` | Files read/chunked per incremental-refresh batch (default: 200) |
+| `CODESEARCH_INDEX_JOBS` | Max concurrent heavy repo jobs — refresh / reindex / HNSW build — in one serve process (default: 1; queries are never gated). See [Indexing limits](#indexing-limits) |
+| `CODESEARCH_EMBED_THREADS` | ONNX intra-op threads per embedding session (unset = ONNX default, all cores) |
+| `CODESEARCH_EMBED_PAUSE_MS` | Pause (ms) between background embedding mini-batches, a duty cycle for shared machines (default: 0) |
+| `CODESEARCH_MIN_FREE_MB` | Free-memory floor (MB) a heavy job waits for (max 30 s, then proceeds with a warning) before starting (default: 0 = disabled) |
+| `CODESEARCH_MAX_CHUNKS_PER_BATCH` | Hard cap on chunks held in memory per refresh batch; splits the batch early (default: 0 = disabled) |
 | `CODESEARCH_SCIP_CSHARP` | Override path to `scip-csharp` helper |
 | `CODESEARCH_EXTENSION_MAP` | Path to the extension→language map (default: `~/.codesearch/extensions.json`) — see [Extension map](#extension-map) |
 | `RUST_LOG` | Log level (e.g. `codesearch=debug`) |
+
+### Indexing limits
+
+A serve hub with many repos used to start one full refresh/reindex/HNSW-build
+pass per repo as soon as that repo had work. A mass `git pull`, a burst of
+first queries, or several `POST /repos/:alias/reindex` calls therefore ran
+many CPU-heavy passes at once, held many file/chunk windows in memory, and
+queued the (already serialised) ONNX inference behind all of them. These knobs
+bound that work; they are read at startup, so a shell or systemd unit can set
+them without editing anything:
+
+| Knob | Default | Effect |
+|------|---------|--------|
+| `CODESEARCH_INDEX_JOBS` | `1` | Max repos doing a refresh / reindex / HNSW build at once. Queries never take this slot. |
+| `CODESEARCH_EMBED_THREADS` | unset (all cores) | ONNX intra-op threads per embedding session. |
+| `CODESEARCH_INCREMENTAL_BATCH_SIZE` | `200` | Files read/chunked per refresh batch. |
+| `CODESEARCH_MAX_CHUNKS_PER_BATCH` | `0` (off) | Split a batch early once it reaches this many chunks (a few huge files can produce more memory than many small ones). |
+| `CODESEARCH_EMBED_PAUSE_MS` | `0` | Sleep this long between background embedding mini-batches (duty cycle). |
+| `CODESEARCH_MIN_FREE_MB` | `0` (off) | A job waits (bounded to 30 s, then proceeds with a warning) until this much memory is free. |
+
+`codesearch serve` also accepts `--index-jobs`, `--embed-threads`,
+`--embed-pause-ms` and `--min-free-mb`, which set the corresponding variable
+for that process (flags win over the environment). Standalone `codesearch
+index` and `codesearch mcp` runs have no job gate and keep their previous
+behaviour; the embedding and batching variables still apply to them.
+
+Example for a large shared machine (128 cores, ~30 repos, dozens of repos
+indexed at once are the failure mode):
+
+```ini
+# ~/.config/systemd/user/codesearch.service.d/limits.conf
+[Service]
+Environment=CODESEARCH_INDEX_JOBS=1
+Environment=CODESEARCH_EMBED_THREADS=8
+Environment=CODESEARCH_INCREMENTAL_BATCH_SIZE=100
+Environment=CODESEARCH_MAX_CHUNKS_PER_BATCH=5000
+Environment=CODESEARCH_EMBED_PAUSE_MS=25
+Environment=CODESEARCH_MIN_FREE_MB=4096
+# C# SCIP helpers are bounded separately; lower it for the same reason.
+Environment=CSHARP_SCIP_CONCURRENCY=1
+```
 
 ### `.codesearchignore`
 
