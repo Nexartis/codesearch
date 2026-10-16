@@ -950,7 +950,12 @@ async fn add_repo_handler_registers_brand_new_repo_without_rollback() {
 /// serve-wide default's dimension (`codesearch serve --model X`), not the
 /// built-in 384-dim default. This is the write-side counterpart of the per-repo
 /// query-model contract.
+///
+/// `#[serial]`: the handler reads `CODESEARCH_ALLOWED_ROOTS`, so this test
+/// must exclude the mutating `allowed_roots_tests` group — the 403 flake
+/// named in that module's comment is a serial-vs-non-serial race.
 #[tokio::test]
+#[serial]
 async fn add_repo_handler_uses_serve_default_model_for_new_index() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_path = tmp.path().join("defaulted");
@@ -997,8 +1002,10 @@ async fn add_repo_handler_uses_serve_default_model_for_new_index() {
 
 /// The serve-wide default must NOT override an index that already records its
 /// own model: re-adding a repo whose `.codesearch.db` is still on disk keeps the
-/// recorded model and dimension.
+/// recorded model and dimension. `#[serial]` for the same allowed-roots read
+/// as its sibling above.
 #[tokio::test]
+#[serial]
 async fn add_repo_handler_keeps_recorded_model_over_serve_default() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_path = tmp.path().join("existing");
@@ -2744,6 +2751,73 @@ fn evicting_idle_repo_clears_frozen_csharp_error_state() {
     );
 }
 
+/// A build longer than the idle timeout must not leave the repo "idle" the
+/// instant it finishes: the reaper skips an indexing repo AND restarts its idle
+/// clock, so the first sweep after the build still finds it fresh.
+///
+/// Regression guard: the reaper used to skip indexing repos without touching
+/// `last_access`, so a 30+ minute SCIP/index run ended with the repo already
+/// past the timeout and the very next sweep evicted it.
+#[tokio::test]
+#[serial]
+async fn idle_reaper_restarts_the_idle_clock_of_an_indexing_repo() {
+    let _env = crate::testing::EnvRestore::set(&[
+        (crate::constants::REPO_IDLE_TIMEOUT_ENV, "60"),
+        (crate::constants::MAX_INDEXING_SECS_ENV, "600"),
+    ]);
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = crate::cache::safe_canonicalize(tmp.path())
+        .unwrap()
+        .join(DB_DIR_NAME);
+    let OpenedStores::Write(stores) = state
+        .try_open_stores("longbuild", &db_path, true, false, None)
+        .expect("open must succeed")
+    else {
+        panic!("brand-new repo must open Write");
+    };
+    state
+        .repos
+        .insert("longbuild".to_string(), RepoState::Warm { stores });
+    let long_ago = || {
+        Instant::now()
+            .checked_sub(Duration::from_secs(120))
+            .expect("monotonic clock at least 2 minutes old")
+    };
+    state
+        .last_access
+        .insert("longbuild".to_string(), long_ago());
+    assert!(state.begin_indexing("longbuild", IndexingOwner::Reindex));
+
+    state.evict_idle_repos();
+    assert!(
+        state.repos.contains_key("longbuild"),
+        "a repo past the idle timeout must not be evicted while it is indexing"
+    );
+    let age = state.last_access.get("longbuild").unwrap().elapsed();
+    assert!(
+        age < Duration::from_secs(60),
+        "a sweep that sees the repo indexing must restart its idle clock, age was {age:?}"
+    );
+
+    state.end_indexing("longbuild", IndexingOwner::Reindex);
+    state.evict_idle_repos();
+    assert!(
+        state.repos.contains_key("longbuild"),
+        "the first sweep after the build must find the repo fresh, not idle"
+    );
+
+    // Control: once the idle period really passes, the reaper still evicts.
+    state
+        .last_access
+        .insert("longbuild".to_string(), long_ago());
+    state.evict_idle_repos();
+    assert!(
+        !state.repos.contains_key("longbuild"),
+        "a repo idle past the timeout with no build running must still be evicted"
+    );
+}
+
 /// The model a serve query is embedded with is read from the routed repo's own
 /// index metadata — never assumed to be the hub-wide default.
 ///
@@ -3246,6 +3320,80 @@ async fn indexing_marker_heartbeat_survives_past_max() {
 
 #[tokio::test]
 #[serial]
+async fn symbol_marker_guard_keeps_the_marker_alive_until_dropped() {
+    // Regression: the SCIP rebuild is one opaque blocking call with no
+    // per-batch heartbeat, so its Symbol marker aged out at MAX_INDEXING_SECS
+    // and the reaper evicted the repo mid-build. The guard renews it for the
+    // whole run and ends it (and the heartbeat) on drop.
+    let _env = crate::testing::EnvRestore::set(&[(crate::constants::MAX_INDEXING_SECS_ENV, "1")]);
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+
+    // Control: a bare Symbol marker expires at the threshold.
+    assert!(state.begin_indexing("ctrl", IndexingOwner::Symbol));
+    let guard = IndexingMarkerGuard::begin(
+        &state,
+        "guarded",
+        IndexingOwner::Symbol,
+        Duration::from_millis(100),
+    );
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        !state.is_indexing("ctrl"),
+        "an unrenewed Symbol marker must expire at the threshold"
+    );
+    assert!(
+        state.is_indexing("guarded"),
+        "the guard's heartbeat must keep the marker alive past the threshold"
+    );
+
+    drop(guard);
+    assert!(
+        !state.is_indexing("guarded"),
+        "dropping the guard must end the marker"
+    );
+    // A heartbeat tick racing the drop must not resurrect the marker.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !state.active_reindexes.contains_key("guarded"),
+        "the heartbeat must stop with the guard"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn symbol_marker_guard_is_inert_while_another_owner_holds_the_alias() {
+    // Nested rebuilds run under the Reindex marker: the guard must neither
+    // add a Symbol marker nor end anyone else's on drop.
+    let _env = crate::testing::EnvRestore::set(&[(crate::constants::MAX_INDEXING_SECS_ENV, "600")]);
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+
+    assert!(state.begin_indexing("nested", IndexingOwner::Reindex));
+    let guard = IndexingMarkerGuard::begin(
+        &state,
+        "nested",
+        IndexingOwner::Symbol,
+        Duration::from_millis(50),
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let owners: Vec<IndexingOwner> = state
+        .active_reindexes
+        .get("nested")
+        .unwrap()
+        .keys()
+        .copied()
+        .collect();
+    assert_eq!(owners, vec![IndexingOwner::Reindex]);
+
+    drop(guard);
+    assert!(
+        state.is_indexing("nested"),
+        "an inert guard must leave the holder's marker alone"
+    );
+    state.end_indexing("nested", IndexingOwner::Reindex);
+}
+
+#[tokio::test]
+#[serial]
 async fn fsw_callback_end_cannot_clear_a_concurrent_reindex_marker() {
     // Regression: the FSW completion callback cleared the whole alias entry
     // with a plain bool, so a watcher refresh finishing mid-run erased a
@@ -3522,6 +3670,36 @@ fn csharp_success_outcome_partial_when_warnings_survived() {
     );
 }
 
+/// A running build wins over a cached (stale) Ready and over the probe, and
+/// skips the probe entirely; idle falls back cache → probe.
+#[test]
+fn resolve_csharp_status_precedence() {
+    use CSharpIndexStatus as S;
+    // (cached, indexing, probe result, expected, probe expected to run)
+    let cases = [
+        (Some(S::Ready), true, S::Ready, S::Indexing, false),
+        (None, true, S::Ready, S::Indexing, false),
+        (Some(S::Ready), false, S::None, S::Ready, false),
+        (None, false, S::Ready, S::Ready, true),
+        (None, false, S::None, S::None, true),
+    ];
+    for (cached, indexing, probe_result, expected, probe_runs) in cases {
+        let mut probed = false;
+        let got = resolve_csharp_status(cached, indexing, || {
+            probed = true;
+            probe_result
+        });
+        assert_eq!(
+            got, expected,
+            "cached={cached:?} indexing={indexing} probe={probe_result:?}"
+        );
+        assert_eq!(
+            probed, probe_runs,
+            "probe invocation for cached={cached:?} indexing={indexing}"
+        );
+    }
+}
+
 /// The watcher notifier must apply the SAME status contract as
 /// trigger_symbol_rebuild's success arm: Succeeded-with-warnings → Partial
 /// (red C#⚠) with bounded detail — never green — and a clean Succeeded →
@@ -3572,6 +3750,84 @@ fn csharp_notifier_partial_on_succeeded_with_warnings() {
     );
 }
 
+/// A rebuild abandoned because `dotnet restore` never finished within the
+/// retry cap leaves the previous index live — so the notifier must render
+/// a WARNING (Partial, yellow `C#⚠`, with the abandonment detail), never a
+/// red Error: a hung restore is an environment condition, not a broken
+/// index.
+#[test]
+fn csharp_notifier_renders_restore_exhaustion_as_partial_not_error() {
+    let state = ServeState::new(ReposConfig::default(), None);
+    let notifier = state.make_csharp_notifier("bayr");
+
+    notifier(SymbolRebuildSignal::Started);
+    notifier(SymbolRebuildSignal::Abandoned(
+        "dotnet restore for this solution did not finish within 3 attempts \
+         (backoff 60s + 120s) — rebuild abandoned, the previous index stays live (issue #225)"
+            .to_string(),
+    ));
+    assert_eq!(
+        state.csharp_index_status.get("bayr").map(|e| *e.value()),
+        Some(CSharpIndexStatus::Partial),
+        "restore exhaustion is a warning — the previous index stays live"
+    );
+    let detail = state
+        .csharp_index_error
+        .get("bayr")
+        .map(|e| e.value().clone())
+        .expect("the abandonment reason must be the info-panel detail");
+    assert!(
+        detail.contains("did not finish within 3 attempts"),
+        "{detail}"
+    );
+
+    // A later clean rebuild clears the warning again.
+    notifier(SymbolRebuildSignal::Succeeded {
+        index_warnings: Vec::new(),
+    });
+    assert_eq!(
+        state.csharp_index_status.get("bayr").map(|e| *e.value()),
+        Some(CSharpIndexStatus::Ready)
+    );
+    assert!(!state.csharp_index_error.contains_key("bayr"));
+}
+
+/// The failure classifier must keep the three outcomes apart — and check
+/// restore-exhaustion FIRST: the typed error carries its own contract
+/// (LMDB untouched, previous index live) that the corruption matcher must
+/// not override. Reordering the checks or flipping the restore arm back to
+/// Error ships the red-error regression with a green suite.
+#[test]
+fn symbol_rebuild_failure_classification_keeps_restore_exhaustion_a_warning() {
+    let exhausted: anyhow::Error = csharp::RestoreExhaustedError {
+        attempts: 3,
+        backoff: "60s + 120s".to_string(),
+    }
+    .into();
+    assert_eq!(
+        classify_symbol_rebuild_failure(&format!("{exhausted:#}"), &exhausted, true),
+        SymbolRebuildFailureKind::RestoreExhausted,
+        "a C# restore-exhausted rebuild must classify as the warning path"
+    );
+    // Not C#: the restore gate is C#-only, the same error falls through.
+    assert_eq!(
+        classify_symbol_rebuild_failure(&format!("{exhausted:#}"), &exhausted, false),
+        SymbolRebuildFailureKind::Generic
+    );
+    // Corruption keeps its own path for a non-exhausted error.
+    let corrupt: anyhow::Error = anyhow::anyhow!("heed -> MDB_BAD_VALSIZE");
+    assert_eq!(
+        classify_symbol_rebuild_failure(&format!("{corrupt:#}"), &corrupt, true),
+        SymbolRebuildFailureKind::LmdbCorruption
+    );
+    // Everything else stays a red Error.
+    let generic: anyhow::Error = anyhow::anyhow!("helper exited with 1");
+    assert_eq!(
+        classify_symbol_rebuild_failure(&format!("{generic:#}"), &generic, true),
+        SymbolRebuildFailureKind::Generic
+    );
+}
+
 /// `repo_statuses_lightweight()` must carry the Partial status AND its
 /// detail message — that pair is what renders the red `C#⚠` and the info
 /// panel's failure line.
@@ -3597,6 +3853,186 @@ fn repo_statuses_lightweight_carries_partial_with_detail() {
         info.csharp_error.as_deref(),
         Some("summary | A.csproj: failure one"),
         "the detail message must ride on the status row"
+    );
+}
+
+/// Owner-scoped status: a TEXT reindex lights the general `Indexing` label
+/// and never the symbol columns; a SYMBOL marker lights the applicable
+/// language column only and leaves the general label on the repo's resting
+/// state. A Rust-only repo keeps `None` in both symbol columns either way.
+#[test]
+#[serial]
+fn indexing_labels_are_owner_scoped_in_status() {
+    let (_tmp, repo_path, bare) = state_with_repo("langrepo");
+    let state = std::sync::Arc::new(bare);
+    assert!(state.begin_indexing("langrepo", IndexingOwner::Reindex));
+
+    let row = |state: &ServeState| {
+        state
+            .repo_statuses_lightweight()
+            .into_iter()
+            .find(|(alias, _)| alias == "langrepo")
+            .expect("langrepo row")
+            .1
+    };
+
+    let info = row(&state);
+    assert_eq!(info.status, RepoStateLabel::Indexing);
+    assert_eq!(info.csharp_index, CSharpIndexStatus::None);
+    assert_eq!(info.typescript_index, CSharpIndexStatus::None);
+
+    // A .sln alone does not make a text reindex a C# rebuild: the C# column
+    // lights only when a symbol marker is present.
+    std::fs::write(repo_path.join("App.sln"), "").unwrap();
+    assert_eq!(row(&state).csharp_index, CSharpIndexStatus::None);
+
+    state.end_indexing("langrepo", IndexingOwner::Reindex);
+    // An on-disk db makes the resting state Idle (not NoIndex).
+    std::fs::create_dir_all(repo_path.join(DB_DIR_NAME)).unwrap();
+    assert!(state.begin_indexing("langrepo", IndexingOwner::Symbol));
+    let info = row(&state);
+    assert_eq!(info.csharp_index, CSharpIndexStatus::Indexing);
+    assert_eq!(
+        info.status,
+        RepoStateLabel::Idle,
+        "a pure SCIP rebuild must not light the general Indexing label"
+    );
+
+    state.end_indexing("langrepo", IndexingOwner::Symbol);
+}
+
+/// TS twin of the owner-scoping test above: with a resolvable helper env
+/// override, a SYMBOL marker lights the TS column while the general label
+/// rests; a TEXT reindex never lights the TS column, tsconfig or not.
+/// `#[serial]` + `EnvRestore`: the helper override is process env.
+#[test]
+#[serial]
+fn typescript_column_is_symbol_owner_scoped() {
+    let (_tmp, repo_path, bare) = state_with_repo("tsrepo");
+    let state = std::sync::Arc::new(bare);
+    std::fs::create_dir_all(repo_path.join(DB_DIR_NAME)).unwrap();
+    std::fs::write(repo_path.join("tsconfig.json"), "{}").unwrap();
+    // The env override must point at a regular file; content is never run.
+    let helper = repo_path.join("fake-scip-typescript");
+    std::fs::write(&helper, "").unwrap();
+    let helper_env = crate::constants::SCIP_TYPESCRIPT_HELPER_ENV;
+    let helper_path = helper.display().to_string();
+
+    let row = |state: &ServeState| {
+        state
+            .repo_statuses_lightweight()
+            .into_iter()
+            .find(|(alias, _)| alias == "tsrepo")
+            .expect("tsrepo row")
+            .1
+    };
+
+    assert!(state.begin_indexing("tsrepo", IndexingOwner::Reindex));
+    {
+        let _env = crate::testing::EnvRestore::set(&[(helper_env, helper_path.as_str())]);
+        let info = row(&state);
+        assert_eq!(info.status, RepoStateLabel::Indexing);
+        assert_eq!(
+            info.typescript_index,
+            CSharpIndexStatus::None,
+            "a text reindex must not light the TS column"
+        );
+    }
+    state.end_indexing("tsrepo", IndexingOwner::Reindex);
+
+    assert!(state.begin_indexing("tsrepo", IndexingOwner::Symbol));
+    let _env = crate::testing::EnvRestore::set(&[(helper_env, helper_path.as_str())]);
+    let info = row(&state);
+    assert_eq!(info.typescript_index, CSharpIndexStatus::Indexing);
+    assert_eq!(
+        info.status,
+        RepoStateLabel::Idle,
+        "a pure SCIP rebuild must not light the general Indexing label"
+    );
+    state.end_indexing("tsrepo", IndexingOwner::Symbol);
+}
+
+/// A queued phase-2 rebuild holds no active_reindexes marker yet: the C#
+/// cache pre-mark alone must light the C# COLUMN (queued work stays visible)
+/// while the general label stays on the repo's resting state — a pure SCIP
+/// pass never made the text index busy.
+#[test]
+fn queued_rebuild_pre_mark_shows_in_the_csharp_column_only() {
+    let (_tmp, repo_path, bare) = state_with_repo("queuedrepo");
+    let state = std::sync::Arc::new(bare);
+    std::fs::create_dir_all(repo_path.join(DB_DIR_NAME)).unwrap();
+
+    // The phase-2 queue pre-mark — no begin_indexing, the task hasn't started.
+    state
+        .csharp_index_status
+        .insert("queuedrepo".to_string(), CSharpIndexStatus::Indexing);
+
+    let row = || {
+        state
+            .repo_statuses_lightweight()
+            .into_iter()
+            .find(|(alias, _)| alias == "queuedrepo")
+            .expect("queuedrepo row")
+            .1
+    };
+
+    let info = row();
+    assert_eq!(info.csharp_index, CSharpIndexStatus::Indexing);
+    assert_eq!(
+        info.status,
+        RepoStateLabel::Idle,
+        "a queued symbol rebuild must not light the general Indexing label"
+    );
+
+    // Completed rebuilds overwrite the cache; without pending work the same
+    // closed repo reads Idle again.
+    state.csharp_index_status.remove("queuedrepo");
+    assert_eq!(row().status, RepoStateLabel::Idle);
+}
+
+/// The `!applies` skip in trigger_symbol_rebuild must drop a queued pre-mark:
+/// applicability can change while the task waits for its semaphore slot, and
+/// no rebuild will start to overwrite the mark.
+#[tokio::test]
+async fn trigger_symbol_rebuild_clears_a_pre_mark_when_not_applicable() {
+    let (_tmp, repo_path, bare) = state_with_repo("naq");
+    let state = std::sync::Arc::new(bare);
+    // No .sln written → C# does not apply to this repo.
+    state
+        .csharp_index_status
+        .insert("naq".to_string(), CSharpIndexStatus::Indexing);
+
+    trigger_symbol_rebuild(
+        "naq",
+        &repo_path,
+        &repo_path.join(DB_DIR_NAME),
+        &state,
+        LANG_CSHARP,
+    )
+    .await;
+
+    assert!(
+        state.csharp_index_status.get("naq").is_none(),
+        "a skipped rebuild must not leave the queue pre-mark behind"
+    );
+}
+
+/// A repo whose directory is gone by the time phase-2 runs must never show
+/// indexing: either candidacy filtering skips it or the task's skip guard
+/// drops the pre-mark. No helper env is set (applicability gates before
+/// availability, so a missing dir is decided without probing a helper) —
+/// env-mutating variants of this test must stay `#[serial]`.
+#[tokio::test]
+async fn phase_2_never_marks_a_missing_repo_indexing() {
+    let (_tmp, repo_path, bare) = state_with_repo("gone");
+    std::fs::remove_dir_all(&repo_path).unwrap();
+    let state = std::sync::Arc::new(bare);
+
+    state.run_phase_2_symbols().await;
+
+    assert!(
+        state.csharp_index_status.get("gone").is_none(),
+        "a missing repo must not end up marked indexing"
     );
 }
 
@@ -3648,6 +4084,360 @@ fn build_info_overlay_reads_symbol_warnings_from_meta() {
         }
         other => panic!("expected Info overlay, got {other:?}"),
     }
+}
+
+/// A failed first build must KEEP the registration and release the marker:
+/// the old rollback unregistered the alias and let self-cleanup delete the
+/// DB dir — the vanishing-repo defect (a 202 was the operator's last
+/// word). A registered half-built store heals via reindex.
+#[test]
+fn note_add_index_failure_keeps_the_repo_registered() {
+    let (_tmp, repo_path, state) = state_with_repo("addfail");
+    let alias = "addfail";
+    // The add handler begins indexing before spawning the build task.
+    assert!(state.begin_indexing(alias, IndexingOwner::Reindex));
+
+    state.note_add_index_failure(
+        alias,
+        &repo_path,
+        &anyhow::anyhow!("FTS commit failed: Access is denied. (os error 5)"),
+    );
+
+    assert!(
+        state.config_snapshot().resolve(alias).is_some(),
+        "the repo must stay registered after a failed first build"
+    );
+    assert!(
+        state.begin_indexing(alias, IndexingOwner::Reindex),
+        "the failed marker must be released so a retry can start immediately"
+    );
+}
+
+/// The symbol-index status collector reads plain meta (never a helper):
+/// stale without a current builder stamp, ready with one, degraded with
+/// warnings — and a repo without entrypoints reads not-applicable instead
+/// of blaming an absent index.
+#[test]
+#[serial]
+fn symbol_index_status_reflects_the_on_disk_meta() {
+    use crate::constants::{INDEX_BUILDER_VERSION, SCIP_INDEX_BUILDER_VERSION_KEY};
+
+    let (_tmp, repo_path, state) = state_with_repo("syminfo");
+    let db = repo_path.join(DB_DIR_NAME);
+    let registry = state.symbol_registry();
+
+    // No entrypoints at all: both languages are explicitly not-applicable.
+    let statuses = crate::symbols::symbol_index_status(&registry, &repo_path, &db);
+    assert!(
+        statuses.iter().all(|s| s.not_applicable),
+        "a repo without entrypoints must not blame an absent index: {statuses:?}"
+    );
+
+    // Applicable from here on: a solution file.
+    std::fs::write(repo_path.join("test.sln"), b"Solution File").unwrap();
+
+    // Key-format stamp only (no builder stamp): has_index accepts it, the
+    // builder check reads stale — the inherited-index class.
+    seed_scip_meta(&db, &[]);
+    let csharp = crate::symbols::symbol_index_status(&registry, &repo_path, &db)
+        .into_iter()
+        .find(|s| s.language == "csharp")
+        .expect("csharp status entry");
+    assert_eq!(csharp.state, "stale", "{csharp:?}");
+
+    // A rebuild by THIS binary (current stamp): ready.
+    seed_scip_meta(
+        &db,
+        &[(SCIP_INDEX_BUILDER_VERSION_KEY, INDEX_BUILDER_VERSION)],
+    );
+    let csharp = crate::symbols::symbol_index_status(&registry, &repo_path, &db)
+        .into_iter()
+        .find(|s| s.language == "csharp")
+        .expect("csharp status entry");
+    assert_eq!(csharp.state, "ready", "{csharp:?}");
+    assert!(!csharp.not_applicable);
+
+    // Survived build failures in meta: degraded — serving but incomplete.
+    seed_scip_meta(
+        &db,
+        &[
+            (SCIP_INDEX_BUILDER_VERSION_KEY, INDEX_BUILDER_VERSION),
+            (
+                crate::constants::SCIP_INDEX_WARNINGS_KEY,
+                r#"["Broken.csproj: Msbuild failed when processing the file"]"#,
+            ),
+        ],
+    );
+    let csharp = crate::symbols::symbol_index_status(&registry, &repo_path, &db)
+        .into_iter()
+        .find(|s| s.language == "csharp")
+        .expect("csharp status entry");
+    assert_eq!(csharp.state, "degraded", "{csharp:?}");
+}
+
+/// The overlay's age renderer must turn the unknown-age sentinel into
+/// words — a consumer must never read "18446744073709551615" as an age.
+#[test]
+fn human_age_seconds_renders_the_unknown_sentinel_as_words() {
+    assert_eq!(crate::serve::tui::human_age_seconds(0), "0s");
+    assert_eq!(crate::serve::tui::human_age_seconds(59), "59s");
+    assert_eq!(crate::serve::tui::human_age_seconds(120), "2m");
+    assert_eq!(crate::serve::tui::human_age_seconds(3 * 3600), "3h");
+    assert_eq!(crate::serve::tui::human_age_seconds(72 * 3600), "3d");
+    assert_eq!(
+        crate::serve::tui::human_age_seconds(u64::MAX),
+        "unknown age"
+    );
+}
+
+/// `c` copies the warnings of an Info overlay — and nothing else: other
+/// overlays ignore the key, Esc still dismisses everywhere.
+#[test]
+fn overlay_copy_key_only_fires_on_info_overlays() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let info = crate::serve::tui_common::OverlayState::Info {
+        alias: "demo.app".to_string(),
+        path: String::new(),
+        chunks: 0,
+        files: 0,
+        max_chunk_id: 0,
+        db_size_human: String::new(),
+        model: String::new(),
+        dims: 0,
+        lock: "write".to_string(),
+        index_age: String::new(),
+        symbol_warnings: vec!["w1".to_string()],
+        symbol_index: Vec::new(),
+        copy_feedback: None,
+    };
+    let copy_key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
+    assert!(matches!(
+        crate::serve::tui_common::handle_overlay_key(copy_key, &info),
+        Some(crate::serve::tui_common::OverlayKeyAction::CopyWarnings)
+    ));
+
+    let doctor = crate::serve::tui_common::OverlayState::Doctor {
+        alias: "x".to_string(),
+        results: vec![],
+    };
+    assert!(
+        crate::serve::tui_common::handle_overlay_key(copy_key, &doctor).is_none(),
+        "'c' must not fire outside the Info overlay"
+    );
+    let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    assert!(matches!(
+        crate::serve::tui_common::handle_overlay_key(esc, &doctor),
+        Some(crate::serve::tui_common::OverlayKeyAction::Dismiss)
+    ));
+}
+
+/// The clipboard text is the full record: alias header naming the subject,
+/// then every stored warning line verbatim.
+#[test]
+fn symbol_warnings_copy_text_heads_with_alias_and_carries_every_line() {
+    let text = crate::serve::tui_common::symbol_warnings_copy_text(
+        "acme-web",
+        &["summary line".to_string(), "A.csproj: boom".to_string()],
+    );
+    assert!(text.starts_with("acme-web — symbol index warnings (2):"));
+    assert!(text.contains("\nsummary line\nA.csproj: boom"));
+}
+
+/// An empty warnings list must report honestly instead of copying a bare
+/// header — a silent "success" would read as copied content.
+#[test]
+fn apply_copy_warnings_reports_when_nothing_is_recorded() {
+    let mut info = crate::serve::tui_common::OverlayState::Info {
+        alias: "acme-web".to_string(),
+        path: String::new(),
+        chunks: 0,
+        files: 0,
+        max_chunk_id: 0,
+        db_size_human: String::new(),
+        model: String::new(),
+        dims: 0,
+        lock: "write".to_string(),
+        index_age: String::new(),
+        symbol_warnings: vec![],
+        symbol_index: Vec::new(),
+        copy_feedback: None,
+    };
+    crate::serve::tui_common::apply_copy_warnings(&mut info);
+    match info {
+        crate::serve::tui_common::OverlayState::Info { copy_feedback, .. } => {
+            assert_eq!(
+                copy_feedback.as_deref(),
+                Some("no symbol warnings recorded")
+            );
+        }
+        other => panic!("expected Info overlay, got {other:?}"),
+    }
+}
+
+/// Both clipboard outcomes surface as the overlay's feedback line: success
+/// confirms the copy, failure names the reason. The clipboard write is
+/// injected so the test pins the feedback contract, not the OS clipboard.
+#[test]
+fn apply_copy_warnings_feedback_covers_success_and_failure() {
+    fn info() -> crate::serve::tui_common::OverlayState {
+        crate::serve::tui_common::OverlayState::Info {
+            alias: "acme-web".to_string(),
+            path: String::new(),
+            chunks: 0,
+            files: 0,
+            max_chunk_id: 0,
+            db_size_human: String::new(),
+            model: String::new(),
+            dims: 0,
+            lock: "write".to_string(),
+            index_age: String::new(),
+            symbol_warnings: vec!["summary".to_string()],
+            symbol_index: Vec::new(),
+            copy_feedback: None,
+        }
+    }
+
+    let mut overlay = info();
+    let seen_text = std::cell::RefCell::new(String::new());
+    crate::serve::tui_common::apply_copy_warnings_with(&mut overlay, |text| {
+        *seen_text.borrow_mut() = text.to_string();
+        Ok(())
+    });
+    match &overlay {
+        crate::serve::tui_common::OverlayState::Info { copy_feedback, .. } => {
+            assert_eq!(
+                copy_feedback.as_deref(),
+                Some("✓ symbol warnings copied to clipboard")
+            );
+        }
+        other => panic!("expected Info overlay, got {other:?}"),
+    }
+    assert_eq!(
+        seen_text.into_inner(),
+        "acme-web — symbol index warnings (1):\nsummary"
+    );
+
+    let mut overlay = info();
+    crate::serve::tui_common::apply_copy_warnings_with(&mut overlay, |_| {
+        Err("powershell: not found".to_string())
+    });
+    match overlay {
+        crate::serve::tui_common::OverlayState::Info { copy_feedback, .. } => {
+            assert_eq!(
+                copy_feedback.as_deref(),
+                Some("copy failed: powershell: not found")
+            );
+        }
+        other => panic!("expected Info overlay, got {other:?}"),
+    }
+}
+
+/// Greedy word-wrap row estimate: words that do not fit start a new row, a
+/// word longer than the row hard-splits, every line takes at least one row.
+/// A char-based ceiling would undershoot the URL case (break lands just
+/// before the row end) and clip the modal's last content row.
+#[test]
+fn estimate_wrapped_height_counts_multi_row_lines() {
+    use ratatui::text::Line;
+    let lines = vec![Line::raw("short"), Line::raw("x".repeat(120))];
+    assert_eq!(
+        crate::serve::tui_common::estimate_wrapped_height(&lines, 56),
+        4
+    );
+    assert_eq!(
+        crate::serve::tui_common::estimate_wrapped_height(&lines, 200),
+        2
+    );
+    // Word wrap: "aaa" + "bbb" does not fit side by side in 5 columns.
+    assert_eq!(
+        crate::serve::tui_common::estimate_wrapped_height(&[Line::raw("aaa bbb")], 5),
+        2
+    );
+    // Hard split: a 60-char URL word across 58 columns takes 2 rows on its
+    // own even though ceil(60/58) would also say 2 — the pinned case is the
+    // prose line that leaves the URL to start a fresh row.
+    assert_eq!(
+        crate::serve::tui_common::estimate_wrapped_height(
+            &[Line::raw(
+                "src index for source https://pkgs/nuget/v3/index.json"
+            )],
+            50
+        ),
+        2
+    );
+    // trim: false keeps the warning line's 4-space indent on the first row,
+    // so an indent-width word that would fit on its own needs two rows.
+    assert_eq!(
+        crate::serve::tui_common::estimate_wrapped_height(
+            &[Line::raw(format!("    {}", "a".repeat(58)))],
+            58
+        ),
+        2
+    );
+    // A mid-line separator run is real columns: "a  b" fits exactly in 4,
+    // wraps in 3.
+    assert_eq!(
+        crate::serve::tui_common::estimate_wrapped_height(&[Line::raw("a  b")], 4),
+        1
+    );
+    assert_eq!(
+        crate::serve::tui_common::estimate_wrapped_height(&[Line::raw("a  b")], 3),
+        2
+    );
+}
+
+/// Long warning lines must WRAP inside the modal, not clip at the border:
+/// the tail of the failure text (the feed URL) stays readable, and the
+/// key-hint footer survives on the border's bottom title.
+#[test]
+fn modal_wraps_long_warning_lines_instead_of_clipping() {
+    use ratatui::backend::TestBackend;
+    use ratatui::text::{Line, Span};
+    use ratatui::Terminal;
+
+    let warning = "Sample.Web.csproj: Unable to load the service index for source https://pkgs.example.com/private-feed/nuget/v3/index.json";
+    let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+    terminal
+        .draw(|f| {
+            let lines = vec![Line::from(Span::raw(format!("    {warning}")))];
+            crate::serve::tui_common::render_centered_modal_with_footer(
+                f,
+                f.area(),
+                " acme-web — Index Info ",
+                Some(" [Esc] close · [c] copy warnings "),
+                lines,
+                ratatui::style::Color::Cyan,
+            );
+        })
+        .unwrap();
+
+    let buffer = terminal.backend().buffer().clone();
+    let mut rendered = String::new();
+    for y in 0..buffer.area.height {
+        for x in 0..buffer.area.width {
+            rendered.push_str(buffer[(x, y)].symbol());
+        }
+        rendered.push('\n');
+    }
+    // Wrapping splits the text at arbitrary columns and the modal border
+    // characters sit between the wrapped segments, so compare with all
+    // whitespace and box-drawing characters stripped: every character of
+    // the warning must be rendered somewhere in order — with clipping (the
+    // old behaviour) the tail past the modal edge is simply gone.
+    let flat: String = rendered
+        .chars()
+        .filter(|c| !c.is_whitespace() && !matches!(c, '│' | '┌' | '┐' | '└' | '┘' | '─'))
+        .collect();
+    let want: String = warning.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains(&want),
+        "the full warning must wrap inside the modal, got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("[c] copy warnings"),
+        "the copy-hint footer must stay visible, got:\n{rendered}"
+    );
 }
 
 /// The serve-mode find_impact self-heal spawn must reach

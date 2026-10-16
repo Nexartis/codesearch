@@ -6,7 +6,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use crate::constants::FILE_META_DB_NAME;
+use crate::constants::{
+    FILE_META_DB_NAME, FILE_META_SAVE_RENAME_ATTEMPTS, FILE_META_SAVE_RENAME_DELAY_MS,
+};
 
 // ─── CANONICAL PATH POLICY ────────────────────────────────────────────────────
 //
@@ -271,6 +273,15 @@ pub struct FileMetaStore {
     pub last_full_index: Option<u64>,
     /// Version for format compatibility
     version: u32,
+    /// The codesearch build that produced these records. A mismatch on load
+    /// (deploy, or a store from before this field existed) wipes the
+    /// records: the chunker's output convention can change without a single
+    /// source byte changing (observed live: 0-based → 1-based chunk start
+    /// lines), and every content signal — mtime, hash, HEAD — then
+    /// wrongly reports "fresh". Same invalidation policy as the
+    /// model-name check below.
+    #[serde(default)]
+    builder_version: String,
 }
 
 impl FileMetaStore {
@@ -285,6 +296,7 @@ impl FileMetaStore {
             dimensions,
             last_full_index: None,
             version: Self::CURRENT_VERSION,
+            builder_version: crate::constants::INDEX_BUILDER_VERSION.to_string(),
         }
     }
 
@@ -297,11 +309,30 @@ impl FileMetaStore {
             let mut store: FileMetaStore = serde_json::from_str(&content)
                 .map_err(|e| anyhow!("Failed to parse file metadata: {}", e))?;
 
-            // Check if model changed - if so, invalidate everything
+            // Check if model changed - if so, invalidate everything.
+            // warn_print!: stderr + quiet-aware — a raw println would
+            // corrupt the serve TUI's screen (observed live when the
+            // builder-version wipe below fired for the whole fleet).
             if store.model_name != model_name || store.dimensions != dimensions {
-                println!(
+                crate::warn_print!(
                     "⚠️  Model changed ({} -> {}), full re-index required",
-                    store.model_name, model_name
+                    store.model_name,
+                    model_name
+                );
+                store = Self::new(model_name.to_string(), dimensions);
+            }
+
+            // Check if another build produced these records — its chunker
+            // conventions (line bases, key shapes) are not ours.
+            if store.builder_version != crate::constants::INDEX_BUILDER_VERSION {
+                crate::warn_print!(
+                    "⚠️  Indexer version changed ({} -> {}), full re-index required",
+                    if store.builder_version.is_empty() {
+                        "pre-stamp".to_string()
+                    } else {
+                        store.builder_version.clone()
+                    },
+                    crate::constants::INDEX_BUILDER_VERSION
                 );
                 store = Self::new(model_name.to_string(), dimensions);
             }
@@ -320,8 +351,29 @@ impl FileMetaStore {
     pub fn save(&self, db_path: &Path) -> Result<()> {
         let meta_path = db_path.join(Self::FILENAME);
         let content = serde_json::to_string_pretty(self)?;
-        fs::write(meta_path, content)?;
-        Ok(())
+        // Atomic replace (tmp + rename): the store is now saved once per
+        // index batch, so a crash mid-write must never leave a truncated
+        // file — a truncated store parses as broken on the next open and
+        // would trip the empty-meta wipe guard.
+        let tmp_path = db_path.join(format!("{}.tmp", Self::FILENAME));
+        fs::write(&tmp_path, content)?;
+        // Windows: an indexer can briefly hold the target (os error 5/32).
+        let mut attempt = 1;
+        loop {
+            match fs::rename(&tmp_path, &meta_path) {
+                Ok(()) => return Ok(()),
+                Err(e) if attempt >= FILE_META_SAVE_RENAME_ATTEMPTS => {
+                    let _ = fs::remove_file(&tmp_path);
+                    return Err(e.into());
+                }
+                Err(_) => {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        FILE_META_SAVE_RENAME_DELAY_MS,
+                    ));
+                }
+            }
+        }
     }
 
     /// Migrate stored paths to normalized format.

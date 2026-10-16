@@ -282,6 +282,11 @@ async fn run_tui_loop(
                     if let Some(action) = tui_common::handle_overlay_key(key, ov) {
                         match action {
                             OverlayKeyAction::Dismiss => overlay = None,
+                            OverlayKeyAction::CopyWarnings => {
+                                if let Some(ov) = overlay.as_mut() {
+                                    tui_common::apply_copy_warnings(ov);
+                                }
+                            }
                             OverlayKeyAction::ConfirmRemove => {
                                 if let Some(OverlayState::ConfirmRemove { alias }) = overlay.take()
                                 {
@@ -738,6 +743,27 @@ fn cpu_usage_str(sys_system: &mut Option<sysinfo::System>) -> String {
 // Info overlay builder
 // ---------------------------------------------------------------------------
 
+/// Humanize a symbol-index age (seconds) for the Info overlay; the
+/// `u64::MAX` sentinel `index_age` returns for an unreadable index renders
+/// as "unknown age", never as a number.
+pub(crate) fn human_age_seconds(secs: u64) -> String {
+    if secs == u64::MAX {
+        return "unknown age".to_string();
+    }
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{mins}m");
+    }
+    let hours = mins / 60;
+    if hours < 48 {
+        return format!("{hours}h");
+    }
+    format!("{}d", hours / 24)
+}
+
 /// Build an `OverlayState::Info` by gathering live stats from SharedStores or metadata.
 /// pub(crate) so the serve test module can pin the symbol-warnings wiring.
 pub(crate) fn build_info_overlay(
@@ -814,6 +840,9 @@ pub(crate) fn build_info_overlay(
     // Durable symbol-index warnings, read fresh from the on-disk meta
     // (shared with the REST info surface so the two cannot drift).
     let symbol_warnings = state.collect_symbol_warnings(&db_path);
+    // Per-language symbol-index status — the shared collector, so the TUI,
+    // REST info and find_impact answers cannot disagree.
+    let symbol_index = state.collect_symbol_index_status(&project_path, &db_path);
 
     Some(OverlayState::Info {
         alias: alias.clone(),
@@ -827,6 +856,8 @@ pub(crate) fn build_info_overlay(
         lock,
         index_age,
         symbol_warnings,
+        symbol_index,
+        copy_feedback: None,
     })
 }
 

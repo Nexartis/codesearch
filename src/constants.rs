@@ -16,6 +16,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// is honoured within a few seconds even during heavy CPU work.
 pub static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// Grace for blocking tasks after serve returns; anything still running is
+/// abandoned with the process.
+pub const RUNTIME_SHUTDOWN_GRACE_SECS: u64 = 5;
+
 /// Check whether a graceful shutdown has been requested (CTRL-C).
 #[inline]
 pub fn is_shutdown_requested() -> bool {
@@ -40,6 +44,12 @@ pub const CONFIG_DIR_NAME: &str = ".codesearch";
 
 /// Name of the file metadata database
 pub const FILE_META_DB_NAME: &str = "file_meta.json";
+
+/// Rename attempts when publishing the file metadata (AV/Search indexer can hold the file)
+pub const FILE_META_SAVE_RENAME_ATTEMPTS: u32 = 5;
+
+/// Delay between file metadata rename attempts, in milliseconds
+pub const FILE_META_SAVE_RENAME_DELAY_MS: u64 = 100;
 
 /// Subdirectory name for embedding models within the global config dir
 const MODELS_SUBDIR: &str = "models";
@@ -560,6 +570,11 @@ pub const MAX_INDEXING_SECS: u64 = 30 * 60; // 30 minutes
 /// Environment variable to override the maximum indexing duration.
 pub const MAX_INDEXING_SECS_ENV: &str = "CODESEARCH_MAX_INDEXING_SECS";
 
+/// How often a flow without its own progress callback (the SCIP symbol
+/// rebuild) renews its indexing marker so it never ages out at
+/// `MAX_INDEXING_SECS` mid-run. Must stay well below that threshold.
+pub const INDEXING_MARKER_HEARTBEAT_SECS: u64 = 60;
+
 /// How long an MCP handler may wait for the vector-store read lock before
 /// giving up with a "store busy" error.
 ///
@@ -676,6 +691,27 @@ pub const HELPERS_SUBDIR: &str = "helpers";
 /// Debounce time in milliseconds for .cs file changes triggering a symbol rebuild.
 pub const SCIP_CSHARP_DEBOUNCE_MS: u64 = 60_000; // 60 seconds
 
+/// Environment variable overriding the restore-pending retry interval in
+/// seconds (issue #225). Values ≤ 0 or unparseable fall back to the
+/// built-in interval (a zero interval would hot-spin the helper); tests
+/// use 1 to exercise the retry loop in seconds instead of minutes.
+pub const SCIP_RESTORE_RETRY_INTERVAL_SECS_ENV: &str = "CODESEARCH_RESTORE_RETRY_INTERVAL_SECS";
+
+/// File names whose change invalidates NuGet restore state: the serve file
+/// watcher fires a FULL C# symbol rebuild when any of these changes, not
+/// just the per-project incremental (.cs) rebuild — a central-package-
+/// management bump invalidates every project at once (issue #225). Must
+/// stay in sync with the C# helper's `RestoreInputs` (helpers/csharp/
+/// RestorePolicy.cs), which gates the workspace load on the same names.
+/// Compared case-insensitively by the watcher.
+pub const CSHARP_RESTORE_INPUT_FILES: &[&str] = &[
+    "Directory.Packages.props",
+    "Directory.Build.props",
+    "Directory.Build.targets",
+    "NuGet.config",
+    "global.json",
+];
+
 /// LMDB database name for the SCIP symbols table.
 pub const SCIP_SYMBOLS_DB_NAME: &str = "scip_symbols";
 
@@ -704,15 +740,26 @@ pub const SCIP_KEY_FORMAT_KEY: &str = "key_format";
 /// list out of a partially loaded solution may be missing callers.
 pub const SCIP_INDEX_WARNINGS_KEY: &str = "index_warnings";
 
-/// LMDB metadata key stamping which codesearch build produced the symbol
-/// index (full `CARGO_PKG_VERSION_FULL`, so every rebuilt binary differs).
-/// The C# rebuild gate treats an index whose stamp is absent or differs from
-/// [`INDEX_BUILDER_VERSION`] as stale: after a deploy, serve rebuilds the
-/// indexes itself at startup instead of waiting for a manual command.
+/// LMDB metadata key stamping which index-builder generation produced the
+/// index (chunk file-meta cache and SCIP symbol meta alike).
+/// The rebuild gates treat an index whose stamp is absent or differs from
+/// [`INDEX_BUILDER_VERSION`] as stale: after a conventions change, serve
+/// rebuilds the indexes itself at startup instead of waiting for a manual
+/// command.
 pub const SCIP_INDEX_BUILDER_VERSION_KEY: &str = "index_builder_version";
 
 /// The value written for [`SCIP_INDEX_BUILDER_VERSION_KEY`] by this binary.
-pub const INDEX_BUILDER_VERSION: &str = env!("CARGO_PKG_VERSION_FULL");
+///
+/// A HAND-BUMPED generation marker, deliberately NOT tied to the package
+/// version: the patch version bumps on every merged PR, and a per-build
+/// stamp wiped every repo's chunk cache and symbol indexes at each binary
+/// swap (field incident 14–15 Oct 2026: ten patch bumps in one day meant a
+/// full fleet re-embed per restart, and the long commit windows let the
+/// Windows AV/Search-Indexer lock race kill builds, leaving repos
+/// registered with 0 chunks). Bump this ONLY when the chunker or SCIP
+/// conventions change shape — not for code or dependency changes that do
+/// not alter what gets written.
+pub const INDEX_BUILDER_VERSION: &str = "2026-10.1";
 
 /// Current value written for [`SCIP_KEY_FORMAT_KEY`]. Bump whenever the
 /// canonical SCIP symbol key format produced by a language helper changes

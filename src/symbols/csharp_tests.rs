@@ -1,8 +1,13 @@
 //! Helper stderr routing tests (`csharp.rs`). Sibling `_tests.rs` file
 //! per repo convention.
 
-use super::csharp::{drain_pipe_to_tracing, is_helper_warning_line};
+use super::csharp::{
+    drain_pipe_to_tracing, is_helper_warning_line, is_restore_pending, kill_live_helper_children,
+    restore_pending_flag_clear, restore_pending_flag_set, LiveHelperChild, RestorePendingError,
+    HELPER_RESTORE_PENDING_EXIT,
+};
 use std::io::Cursor;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 fn drained(input: &[u8]) -> Vec<String> {
@@ -82,7 +87,7 @@ fn drain_retries_after_transient_interrupted_read() {
 
 #[test]
 fn helper_warning_classification_table() {
-    let cases: [(&str, bool); 10] = [
+    let cases: [(&str, bool); 12] = [
         // Helper's own workspace-failure warnings (WorkspaceFailed handler).
         (
             "[WARN] Workspace error: [Failure] Msbuild failed when processing the file 'C:\\r\\p.csproj' with message: Dependency specified was X but ended up with X 1.2.3",
@@ -106,6 +111,19 @@ fn helper_warning_classification_table() {
         (
             "[INFO] Skipping unsupported project type: C:\\r\\x.shproj",
             false,
+        ),
+        // A helper-demoted note renders the bare diagnostic MESSAGE: it must
+        // not be captured. The trap this pins: a demotion that renders the
+        // full diagnostic re-embeds "[Failure]" and re-enters this channel.
+        (
+            "[INFO] Workspace note: Msbuild failed when processing the file 'C:\\r\\p.csproj' with message: Grpc.Net.ClientFactory 2.63.0 or earlier could cause issues when used together with Microsoft.Extensions.Http.Resilience.",
+            false,
+        ),
+        // The buggy shape, documented: the tag alone keeps the line captured
+        // regardless of the [INFO] prefix.
+        (
+            "[INFO] Workspace note: [Failure] Msbuild failed when processing the file 'C:\\r\\p.csproj'",
+            true,
         ),
         ("Loading solution: C:\\r\\x.sln", false),
         ("Loaded 13 project(s) from filtered solution", false),
@@ -171,6 +189,40 @@ fn summarize_index_warnings_normalizes_dedupes_and_skips_noise() {
     // persisted entry can never blow up the warnings array on answers.
     let msg = out[0].split_once(": ").expect("normalized shape").1;
     assert!(msg.chars().count() <= 160, "message must be capped");
+}
+
+/// The passthrough cap must cut at whitespace, never mid-word: a hard
+/// 220-char cut landed inside the quoted CS0103 specimen name at the tail
+/// edge of the line even after the helper trimmed its own specimen.
+#[test]
+fn normalize_passthrough_caps_at_whitespace_boundary() {
+    let prefix = "[WARN] Compilation errors in Very.Long.Project.Name.Catalog: 12 error(s) — dominant CS0103 x10; first: C:\\src\\Cat\\ViewModels\\CustomerAccountViewModel.cs(42,17): error CS0103: The name '";
+    let identifier = "CustomerOrderViewModelFactoryProviderCache";
+    let line = format!("{prefix}{identifier}' does not exist in the current context");
+    assert!(
+        line.chars().count() > 220,
+        "test setup: line must exceed the cap"
+    );
+
+    let out = super::csharp::normalize_index_warning_line(&line).expect("warning line");
+
+    assert!(
+        out.chars().count() <= 220,
+        "cap must hold, got {}",
+        out.chars().count()
+    );
+    assert_ne!(
+        out.chars().count(),
+        220,
+        "a whitespace boundary exists before the cap — cut there, not at the hard cap"
+    );
+    // `out` is a byte-prefix of `line` (the cut lands on a char boundary),
+    // so this checks the cut position in the original line directly.
+    assert!(
+        line[out.len()..].starts_with(' '),
+        "cut must land on the original line's whitespace boundary, tail: ...{}",
+        &line[out.len().saturating_sub(40)..]
+    );
 }
 
 /// The cap kicks in with an explicit overflow entry — the list rides on
@@ -253,6 +305,55 @@ fn index_warnings_roundtrip_and_clean_absence() {
 // execute on Windows: the validated filename must be a real PE, not a
 // script. Deleting the stamp write must fail this test, or every serve
 // start churns all inherited C# indexes (absent stamp reads as stale).
+
+/// The C# freshness override mirrors the rebuild gate exactly: a current
+/// stamp matches, an absent or foreign stamp does not — while adapters
+/// without stamping take the trait default (`true`) and never read stale.
+#[test]
+fn index_matches_builder_mirrors_the_rebuild_gate() {
+    use crate::constants::{INDEX_BUILDER_VERSION, SCIP_INDEX_BUILDER_VERSION_KEY};
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = dir.path().join("db");
+    let indexer = super::csharp::CSharpSymbolIndexer::new();
+    use crate::symbols::SymbolIndexer as _;
+
+    // No meta at all: absent stamp reads as stale (the pre-stamp class).
+    assert!(
+        !indexer.index_matches_builder(&db),
+        "an index with no builder stamp must not count as this build's"
+    );
+
+    // A foreign binary's stamp: stale.
+    let env = crate::symbols::get_shared_scip_env(&db).unwrap();
+    let mut wtxn = env.write_txn().unwrap();
+    let meta_db: heed::Database<heed::types::Str, heed::types::Str> = env
+        .create_database(&mut wtxn, Some(crate::constants::SCIP_META_DB_NAME))
+        .unwrap();
+    meta_db
+        .put(&mut wtxn, SCIP_INDEX_BUILDER_VERSION_KEY, "v0.0.0+1")
+        .unwrap();
+    wtxn.commit().unwrap();
+    assert!(
+        !indexer.index_matches_builder(&db),
+        "another build's stamp must not count as this build's"
+    );
+
+    // A rebuild by THIS binary: the meta write stamps the current version.
+    let env = crate::symbols::get_shared_scip_env(&db).unwrap();
+    let mut wtxn = env.write_txn().unwrap();
+    let meta_db: heed::Database<heed::types::Str, heed::types::Str> = env
+        .open_database(&wtxn, Some(crate::constants::SCIP_META_DB_NAME))
+        .unwrap()
+        .unwrap();
+    super::csharp::CSharpSymbolIndexer::write_rebuild_meta(&meta_db, &mut wtxn, &[])
+        .expect("meta write must succeed");
+    wtxn.commit().unwrap();
+    assert!(
+        indexer.index_matches_builder(&db),
+        "a rebuild by this binary must match (stamped {INDEX_BUILDER_VERSION})"
+    );
+}
 
 #[test]
 fn rebuild_meta_write_stamps_version_and_writes_or_clears_warnings() {
@@ -374,4 +475,118 @@ fn extract_simple_name_strips_fqn_parameters_before_segmenting() {
             "key: {key}"
         );
     }
+}
+
+// ── Restore-pending gate (issue #225) ────────────────────────────────
+
+#[test]
+fn helper_version_line_parses_to_the_version_token() {
+    use super::csharp::parse_helper_version;
+
+    let cases = [
+        ("scip-csharp 1.5.4", "1.5.4"),
+        ("scip-csharp 0.0.0-fake", "0.0.0-fake"),
+        ("scip-csharp 1.5.4+1352", "1.5.4+1352"),
+        // Unparseable → "unknown": the startup entry still logs (as a
+        // mismatch) instead of silently skipping.
+        ("", "unknown"),
+        ("garbage", "unknown"),
+        ("scip-csharp", "unknown"),
+    ];
+    for (line, expected) in cases {
+        assert_eq!(parse_helper_version(line), expected, "line: {line:?}");
+    }
+}
+
+#[test]
+fn restore_pending_error_downcasts_from_anyhow() {
+    let pending = anyhow::Error::new(RestorePendingError);
+    assert!(is_restore_pending(&pending));
+
+    let generic = anyhow::anyhow!("Failed to read symbol index at /tmp/x.json");
+    assert!(!is_restore_pending(&generic));
+}
+
+#[test]
+fn restore_pending_flag_round_trips_through_the_trait_method() {
+    use super::SymbolIndexer as _;
+
+    let db_path = PathBuf::from(format!(
+        "{}cs-restore-flag-test-{}",
+        std::env::temp_dir().display(),
+        std::process::id()
+    ));
+    let indexer = super::csharp::CSharpSymbolIndexer::new();
+    restore_pending_flag_clear(&db_path); // isolate from concurrent tests
+    assert!(!indexer.restore_pending(&db_path));
+
+    restore_pending_flag_set(&db_path);
+    assert!(indexer.restore_pending(&db_path));
+
+    restore_pending_flag_clear(&db_path);
+    assert!(!indexer.restore_pending(&db_path));
+}
+
+#[test]
+fn helper_restore_pending_exit_matches_csharp_exit_codes() {
+    // A drifted exit code would demote restore-pending to a generic helper failure.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/helpers/csharp/RestoreGate.cs");
+    let source = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("cannot read {path} to check HELPER_RESTORE_PENDING_EXIT: {e}"));
+    let line = source
+        .lines()
+        .find(|l| l.contains("const int RestorePending"))
+        .unwrap_or_else(|| {
+            panic!("{path} has no `const int RestorePending` line to compare with HELPER_RESTORE_PENDING_EXIT")
+        });
+    let raw = line
+        .split_once('=')
+        .and_then(|(_, rhs)| rhs.split_once(';'))
+        .map(|(value, _)| value.trim())
+        .unwrap_or_else(|| {
+            panic!(
+                "cannot find `= <value>;` in {line:?} to compare with HELPER_RESTORE_PENDING_EXIT"
+            )
+        });
+    let parsed: i32 = raw.parse().unwrap_or_else(|e| {
+        panic!("C# RestorePending value {raw:?} is not an integer ({e}); compare with HELPER_RESTORE_PENDING_EXIT")
+    });
+    assert_eq!(
+        parsed, HELPER_RESTORE_PENDING_EXIT,
+        "C# ExitCodes.RestorePending ({parsed}) and Rust HELPER_RESTORE_PENDING_EXIT ({HELPER_RESTORE_PENDING_EXIT}) must stay in sync"
+    );
+}
+
+/// serve shutdown must kill in-flight helper children: an orphaned
+/// scip-csharp holds the helper exe locked for minutes (deploy blocker).
+/// The registry is PID-generic, so a stand-in long-running child verifies
+/// the real kill path (taskkill /T /F on Windows, kill -9 elsewhere).
+#[test]
+fn shutdown_kills_registered_helper_children() {
+    #[cfg(windows)]
+    let mut child = std::process::Command::new("cmd")
+        .args(["/c", "ping", "-n", "30", "127.0.0.1"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("stand-in child spawned");
+    #[cfg(not(windows))]
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("stand-in child spawned");
+
+    let pid = child.id();
+    {
+        let _live = LiveHelperChild::register(&child);
+        kill_live_helper_children();
+    }
+
+    let status = child.wait().expect("child waited");
+    assert!(
+        !status.success(),
+        "a killed helper child must not report success (pid {pid})"
+    );
 }
