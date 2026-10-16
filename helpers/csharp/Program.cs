@@ -86,7 +86,7 @@ public static class Program
         var parsed = ParseServeArgs(args);
         if (parsed is null) return 1;
 
-        if (!TryRegisterMsBuild(out var regErr)) { await Console.Error.WriteLineAsync(regErr).ConfigureAwait(false); return 1; }
+        if (!TryRegisterMsBuild(parsed, out var regErr)) { await Console.Error.WriteLineAsync(regErr).ConfigureAwait(false); return 1; }
 
         // A resident workspace must not come up mid-restore: the host CACHES
         // its find-refs answers, so degraded answers from a workspace loaded
@@ -167,7 +167,7 @@ public static class Program
         var parsed = ParseIndexArgs(args);
         if (parsed is null) return 1;
 
-        if (!TryRegisterMsBuild(out var regErr)) { await Console.Error.WriteLineAsync(regErr).ConfigureAwait(false); return 1; }
+        if (!TryRegisterMsBuild(parsed.Value.SolutionPath, out var regErr)) { await Console.Error.WriteLineAsync(regErr).ConfigureAwait(false); return 1; }
 
         using var workspace = CreateTolerantWorkspace();
 
@@ -238,7 +238,7 @@ public static class Program
         var parsed = ParseFindRefsArgs(args);
         if (parsed is null) return 1;
 
-        if (!TryRegisterMsBuild(out var regErr)) { await Console.Error.WriteLineAsync(regErr).ConfigureAwait(false); return 1; }
+        if (!TryRegisterMsBuild(parsed.Value.SolutionPath, out var regErr)) { await Console.Error.WriteLineAsync(regErr).ConfigureAwait(false); return 1; }
 
         using var workspace = CreateTolerantWorkspace();
 
@@ -299,7 +299,7 @@ public static class Program
         var parsed = ParseBatchFindRefsArgs(args);
         if (parsed is null) return 1;
 
-        if (!TryRegisterMsBuild(out var regErr)) { await Console.Error.WriteLineAsync(regErr).ConfigureAwait(false); return 1; }
+        if (!TryRegisterMsBuild(parsed.Value.SolutionPath, out var regErr)) { await Console.Error.WriteLineAsync(regErr).ConfigureAwait(false); return 1; }
 
         using var workspace = CreateTolerantWorkspace();
 
@@ -534,8 +534,51 @@ public static class Program
             {
                 return [];
             }
-            var stderr = stderrDrain.GetAwaiter().GetResult();
-            var nuDetail = RestorePolicy.ExtractRestoreErrors(stderr);
+            // NETSDK1045 and friends print to STDOUT on current dotnet hosts
+            // (NU11xx detail may land on either stream) — classify over both.
+            var restoreOutput = stderrDrain.GetAwaiter().GetResult()
+                + Environment.NewLine + stdoutDrain.GetAwaiter().GetResult();
+            var nuDetail = RestorePolicy.ExtractRestoreErrors(restoreOutput);
+            if (MsbuildRestore.IsSdkResolutionFailure(restoreOutput))
+            {
+                // The CLI SDK set cannot even target this solution — packages
+                // were never the problem, so the per-project fallback (same
+                // dotnet, same SDK wall) can only re-fail per project. A
+                // Visual Studio install ships its own MSBuild + SDK targets
+                // and can restore the full solution in one go.
+                var vsMsbuild = MsbuildRestore.LocateVsMsbuild();
+                if (vsMsbuild is null)
+                {
+                    Console.Error.WriteLine(
+                        "[INFO] no VS MSBuild found via vswhere — the CLI SDK gap cannot be worked around.");
+                }
+                else
+                {
+                    Console.Error.WriteLine(
+                        "[INFO] the CLI .NET SDK set cannot target this solution — retrying the restore " +
+                        $"with VS MSBuild at '{vsMsbuild}'.");
+                    switch (TryRestoreSolutionWithVsMsbuild(
+                        vsMsbuild, solutionPath, timeoutSeconds, gateRestorePending))
+                    {
+                        case VsRestoreOutcome.Restored:
+                            Console.Error.WriteLine(
+                                "[INFO] VS MSBuild restore succeeded — full solution assets restored.");
+                            return [];
+                        case VsRestoreOutcome.StillRunningUngated:
+                            // The VS restore keeps writing obj/ in the
+                            // background; per-project dotnet restores would
+                            // race those writes, so degrade with an honest
+                            // per-project reason instead.
+                            return loadable.Select(e => new ProjectRestoreFailure(
+                                Path.GetFileNameWithoutExtension(e.RelativePath),
+                                e.RelativePath,
+                                "not attempted — a VS MSBuild restore is still running")).ToList();
+                    }
+                    // Failed → the per-project fallback below still runs: in a
+                    // mixed-TFM solution it recovers the projects the CLI CAN
+                    // target.
+                }
+            }
             var fallback = RestorePerProjectFallback(
                 solutionPath, solutionDir: Path.GetDirectoryName(solutionPath) ?? ".",
                 loadable, timeoutSeconds, gateRestorePending);
@@ -576,6 +619,83 @@ public static class Program
             Console.Error.WriteLine(
                 $"[INFO] dotnet restore could not start ({ex.GetType().Name}: {ex.Message}) — continuing without it.");
             return [];
+        }
+    }
+
+    /// <summary>Outcome of the one-shot VS-MSBuild solution restore.</summary>
+    private enum VsRestoreOutcome
+    {
+        Restored,
+        Failed,
+        /// <summary>Timed out ungated: the restore keeps running, serve degrades.</summary>
+        StillRunningUngated,
+    }
+
+    /// <summary>
+    /// One bounded attempt to restore the solution with a VS MSBuild instead
+    /// of the CLI dotnet — the fallback for SDK-resolution failures, where
+    /// the machine's Visual Studio can do what its CLI SDK set cannot. Same
+    /// contract as the dotnet restore above: never killed on timeout (the
+    /// marker gates later runs), gated commands exit
+    /// <see cref="ExitCodes.RestorePending"/> instead of building a degraded
+    /// index. <c>-nr:false</c> because the helper is a short-lived subprocess
+    /// on a hot serve loop and must not leave MSBuild worker nodes behind.
+    /// </summary>
+    private static VsRestoreOutcome TryRestoreSolutionWithVsMsbuild(
+        string msbuildPath,
+        string solutionPath,
+        int timeoutSeconds,
+        bool gateRestorePending)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = msbuildPath,
+                Arguments = $"\"{solutionPath}\" -t:restore -nologo -v:q -nr:false",
+                RedirectStandardError = true,
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+            };
+            using var process = Process.Start(psi);
+            if (process is null)
+            {
+                return VsRestoreOutcome.Failed;
+            }
+            _ = process.StandardOutput.ReadToEndAsync();
+            var stderrDrain = process.StandardError.ReadToEndAsync();
+            if (!process.WaitForExit(timeoutSeconds * 1000))
+            {
+                RestorePendingMarker.Write(
+                    solutionPath, process.Id, process.StartTime.ToUniversalTime());
+                if (gateRestorePending)
+                {
+                    Console.Error.WriteLine(
+                        "[RESTORE-PENDING] the VS MSBuild restore is still running — exiting " +
+                        $"{ExitCodes.RestorePending} without building an index; retry when it finishes.");
+                    throw new RestorePendingException();
+                }
+                Console.Error.WriteLine(RestorePolicy.StillRunningWarning(timeoutSeconds, "VS MSBuild restore"));
+                return VsRestoreOutcome.StillRunningUngated;
+            }
+            if (process.ExitCode == 0)
+            {
+                return VsRestoreOutcome.Restored;
+            }
+            Console.Error.WriteLine(
+                "[INFO] VS MSBuild restore failed" +
+                RestorePolicy.ExtractRestoreErrors(stderrDrain.GetAwaiter().GetResult()));
+            return VsRestoreOutcome.Failed;
+        }
+        catch (RestorePendingException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(
+                $"[INFO] VS MSBuild restore could not start ({ex.GetType().Name}: {ex.Message}).");
+            return VsRestoreOutcome.Failed;
         }
     }
 
@@ -1015,10 +1135,19 @@ public static class Program
     // ── MSBuild registration ─────────────────────────────────────────
 
     /// <summary>
-    /// Register the highest available MSBuild instance.
-    /// Returns true on success; sets <paramref name="errorMessage"/> on failure.
+    /// Register the MSBuild instance the workspace will evaluate through.
+    /// Capability-aware since the 2026-10-15 net10 incident: when every
+    /// CLI-visible .NET SDK is older than the repo's target frameworks
+    /// (raw <c>TargetFramework</c> scan + global.json floor via
+    /// <see cref="MsbuildRestore.RequiredSdkMajorFloor"/>), an SDK instance
+    /// would fail every project with NETSDK1045 during evaluation — in that
+    /// case the highest VS instance wins instead, because VS bundles its own
+    /// SDK targets and can evaluate TFMs the CLI cannot. Returns true on
+    /// success; sets <paramref name="errorMessage"/> on failure.
     /// </summary>
-    private static bool TryRegisterMsBuild([System.Diagnostics.CodeAnalysis.NotNullWhen(false)] out string? errorMessage)
+    private static bool TryRegisterMsBuild(
+        string? solutionPath,
+        [System.Diagnostics.CodeAnalysis.NotNullWhen(false)] out string? errorMessage)
     {
         // Guard against double-registration in case the function is ever called twice
         // in the same process lifetime (e.g. future test harnesses, daemon mode).
@@ -1045,10 +1174,22 @@ public static class Program
 
             // Prefer .NET SDK instances over Visual Studio instances.
             // The VS BuildHost (net472) crashes with TypeInitializationException
-            // when loading solutions that contain certain project types.
-            var sdkInstance = instances
-                .FirstOrDefault(i => i.DiscoveryType == DiscoveryType.DotNetSdk);
-            var instance = sdkInstance ?? instances.OrderByDescending(i => i.Version).First();
+            // when loading solutions that contain certain project types — so the
+            // VS instance is only chosen when no SDK instance can even target
+            // the repo (certain NETSDK1045 load failure either way).
+            var requiredMajor = MsbuildRestore.RequiredSdkMajorFloor(solutionPath);
+            var candidates = instances
+                .Select(i => new MsbuildCandidate(i.Version, i.DiscoveryType == DiscoveryType.DotNetSdk))
+                .ToList();
+            var (index, isSdk) = MsbuildRestore.ChooseMsBuildInstance(candidates, requiredMajor);
+            var instance = instances[index];
+            if (!isSdk)
+            {
+                Console.Error.WriteLine(
+                    $"[INFO] no CLI .NET SDK instance can target net{requiredMajor} projects of " +
+                    $"'{solutionPath}' — registering the VS MSBuild '{instance.Name}' v{instance.Version} " +
+                    "instead (VS-bundled SDK targets).");
+            }
 
             Console.Error.WriteLine(
                 $"MSBuild: registering '{instance.Name}' v{instance.Version} at {instance.MSBuildPath}");
