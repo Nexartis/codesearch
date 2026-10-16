@@ -3011,3 +3011,28 @@ fn single_index_status_requires_a_built_graph_to_report_ready() {
     let (status, _) = super::single_index_status(0, false);
     assert_eq!(status, "building");
 }
+
+#[test]
+fn test_unknown_project_error_is_classified() {
+    // P1 (codesearch tuning round 2026-10-16): a bad `project=` alias must be a
+    // NAMED refusal carrying the available-project list, not a bare
+    // `Unknown alias 'x'` string (NEE-P-CONSISTENT: a refusal names its class
+    // and remedy so the agent corrects without a guessing round-trip).
+    let mut project_groups = std::collections::HashMap::new();
+    project_groups.insert(
+        "nexartis".to_string(),
+        vec!["alpha".to_string(), "beta".to_string()],
+    );
+    let json = super::unknown_project_error_json(
+        "nope",
+        vec!["alpha".to_string(), "beta".to_string()],
+        vec!["all".to_string(), "nexartis".to_string()],
+        project_groups,
+    );
+    let v: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+    assert_eq!(v["error_code"], "project_unresolved");
+    assert_eq!(v["available_projects"][0], "alpha");
+    assert_eq!(v["available_projects"][1], "beta");
+    assert_eq!(v["available_groups"][1], "nexartis");
+    assert!(v["hint_for_agent"].as_str().unwrap().contains("nope"));
+}

@@ -37,6 +37,29 @@ fn store_lock_wait() -> std::time::Duration {
         .unwrap_or_else(|| std::time::Duration::from_secs(crate::constants::STORE_LOCK_WAIT_SECS))
 }
 
+/// Build the structured `project_unresolved` refusal JSON for an unknown
+/// `project=` alias (NEE-P-CONSISTENT: a refusal names its class and remedy).
+/// Pure + unit-testable; the caller supplies the serve hub's enumeration.
+fn unknown_project_error_json(
+    alias: &str,
+    projects: Vec<String>,
+    groups: Vec<String>,
+    project_groups: std::collections::HashMap<String, Vec<String>>,
+) -> String {
+    let payload = serde_json::json!({
+        "error_code": "project_unresolved",
+        "message": format!("Unknown project alias '{}'.", alias),
+        "available_projects": projects,
+        "available_groups": groups,
+        "project_groups": project_groups,
+        "hint_for_agent": format!(
+            "'{}' is not a registered project. Re-call with one of available_projects, or ask the user which repository to search. project_groups maps each project to its group(s) — prefer group= when the target is listed there.",
+            alias
+        )
+    });
+    payload.to_string()
+}
+
 /// Acquire the vector-store read lock with a bounded wait.
 ///
 /// A handler queued on this lock keeps its `Arc<SharedStores>` — and with it
@@ -1145,8 +1168,16 @@ impl CodesearchService {
         types::validate_project_group(project, group, true)?;
 
         if let Some(ref alias) = project {
-            let stores = serve_state.get_or_open_stores(alias, true).await?;
-            return Ok(Some((vec![stores], vec![alias.clone()])));
+            // A bad alias is a NAMED refusal, not a bare string: surface the same
+            // available-projects envelope the unscoped case uses (P1, codesearch
+            // tuning round 2026-10-16) so an agent corrects without guessing.
+            return match serve_state.get_or_open_stores(alias, true).await {
+                Ok(stores) => Ok(Some((vec![stores], vec![alias.clone()]))),
+                Err(e) if e.contains("Unknown alias") => {
+                    Err(self.format_unknown_project_error(alias))
+                }
+                Err(e) => Err(e),
+            };
         }
 
         if let Some(ref group_name) = group {
@@ -1258,25 +1289,7 @@ impl CodesearchService {
     /// that picking a single project would miss sibling repos in the same group
     /// (e.g. a separate config / import-data repo).
     fn format_scope_error(&self) -> String {
-        let (projects, mut groups, project_groups) = if let Some(ref serve_state) = self.serve_state
-        {
-            let cfg = serve_state.config_snapshot();
-            let mut projects: Vec<String> = cfg.repos.keys().cloned().collect();
-            // Include opt-in mounted remote projects so an agent can discover and
-            // route to them by name (they are first-class `project=` targets).
-            projects.extend(
-                cfg.mounted_remote_projects()
-                    .into_iter()
-                    .map(|(name, _)| name),
-            );
-            projects.sort();
-            projects.dedup();
-            let mut groups: Vec<String> = cfg.groups.keys().cloned().collect();
-            groups.sort();
-            (projects, groups, cfg.project_groups())
-        } else {
-            (vec![], vec![], std::collections::HashMap::new())
-        };
+        let (projects, mut groups, project_groups) = self.project_scope_payload();
         // The "all" virtual group is always available when there are projects to
         // search — advertise it so agents discover the cross-repo shortcut.
         // (scope_required only fires when >1 repo is registered, so this is safe.)
@@ -1295,6 +1308,45 @@ impl CodesearchService {
             "hint_for_agent": "If the user has not indicated which repository to search, ask them to choose. Show available_projects and available_groups as options. IMPORTANT: project_groups maps each project to the group(s) it belongs to — if the project you would pick is listed there, prefer group= over project= so related repos (e.g. a separate config or import-data repo) are searched too."
         });
         payload.to_string()
+    }
+
+    /// The `(available_projects, available_groups, project_groups)` triple for the
+    /// active serve hub (empty in local mode). One home for the enumeration shared
+    /// by the scope and unknown-project refusals.
+    fn project_scope_payload(
+        &self,
+    ) -> (
+        Vec<String>,
+        Vec<String>,
+        std::collections::HashMap<String, Vec<String>>,
+    ) {
+        if let Some(ref serve_state) = self.serve_state {
+            let cfg = serve_state.config_snapshot();
+            let mut projects: Vec<String> = cfg.repos.keys().cloned().collect();
+            // Include opt-in mounted remote projects so an agent can discover and
+            // route to them by name (they are first-class `project=` targets).
+            projects.extend(
+                cfg.mounted_remote_projects()
+                    .into_iter()
+                    .map(|(name, _)| name),
+            );
+            projects.sort();
+            projects.dedup();
+            let mut groups: Vec<String> = cfg.groups.keys().cloned().collect();
+            groups.sort();
+            (projects, groups, cfg.project_groups())
+        } else {
+            (vec![], vec![], std::collections::HashMap::new())
+        }
+    }
+
+    /// Build a structured `project_unresolved` error JSON for an unknown
+    /// `project=` alias (NEE-P-CONSISTENT: a refusal names its class and remedy).
+    /// Previously a bare `Unknown alias 'x'` string reached the agent with no
+    /// valid-project list — the exact shape that forces a guessing round-trip.
+    fn format_unknown_project_error(&self, alias: &str) -> String {
+        let (projects, groups, project_groups) = self.project_scope_payload();
+        unknown_project_error_json(alias, projects, groups, project_groups)
     }
 
     /// Execute a read-only action against the vector store with an explicit store override.
