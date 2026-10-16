@@ -194,21 +194,22 @@ impl JobGate {
                 self.index_jobs
             );
         }
-        if self.min_free_mb > 0 {
-            self.wait_for_memory().await;
-        }
-        // The memory wait above is bounded; a cancellation that lands during
-        // it still wins — release the slot rather than start cancelled work.
-        if cancel.is_cancelled() {
+        if self.min_free_mb > 0 && !self.wait_for_memory(cancel).await {
+            // A cancellation that lands during the memory wait aborts at once,
+            // releasing the slot rather than starting cancelled work.
             return None;
         }
         Some(JobPermit { _permit: permit })
     }
 
-    async fn wait_for_memory(&self) {
+    /// Wait, bounded, for the free-memory floor, aborting as soon as `cancel`
+    /// fires. Returns `false` when cancelled — the caller must release its slot
+    /// — and `true` when the floor is met, the wait times out, or no floor is
+    /// set (so a never-cancelled token can never abort the acquire).
+    async fn wait_for_memory(&self, cancel: &CancellationToken) -> bool {
         let free = available_memory_mb();
         if free >= self.min_free_mb {
-            return;
+            return true;
         }
         tracing::info!(
             "⏳ Free memory is {} MB, below the {} MB floor (CODESEARCH_MIN_FREE_MB); \
@@ -219,10 +220,14 @@ impl JobGate {
         );
         let deadline = Instant::now() + self.memory_wait;
         loop {
-            tokio::time::sleep(MEMORY_POLL_INTERVAL).await;
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return false,
+                _ = tokio::time::sleep(MEMORY_POLL_INTERVAL) => {}
+            }
             let free = available_memory_mb();
             if free >= self.min_free_mb {
-                return;
+                return true;
             }
             if Instant::now() >= deadline {
                 tracing::warn!(
@@ -231,7 +236,7 @@ impl JobGate {
                     free,
                     self.min_free_mb
                 );
-                return;
+                return true;
             }
         }
     }

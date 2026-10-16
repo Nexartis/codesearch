@@ -176,3 +176,32 @@ async fn uncancelled_token_proceeds_through_the_gate() {
     assert!(gate.acquire_or_cancel(&token).await.is_some());
     assert!(gate.acquire_or_cancel(&token).await.is_some());
 }
+
+#[tokio::test]
+async fn cancelled_token_aborts_the_memory_wait() {
+    // Regression: with the memory floor enabled and unmet, a cancellation that
+    // lands AFTER the semaphore is acquired must abort the memory wait at once,
+    // not after the whole bounded wait. Otherwise a removed/cancelled job keeps
+    // its slot and store handles for up to the full wait — the locked/double-open
+    // window `acquire_or_cancel` exists to prevent.
+    let gate = JobGate::with_config_and_wait(1, u64::MAX, Duration::from_secs(3600));
+    let token = CancellationToken::new();
+    let canceller = token.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        canceller.cancel();
+    });
+
+    let start = Instant::now();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), gate.acquire_or_cancel(&token))
+        .await
+        .expect("cancellation must wake the memory wait instead of hanging it");
+    assert!(
+        outcome.is_none(),
+        "a waiter cancelled during the memory wait must not receive a permit"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "the memory wait must abort promptly on cancellation, not run its full bound"
+    );
+}

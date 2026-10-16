@@ -1259,8 +1259,13 @@ export default {
       warn,
     )
 
-    // Startup probe + first status refresh, off the critical path.
-    void health.probe().then(() => void refreshStatus())
+    // Startup probe + first status refresh, off the critical path. Gated on
+    // `health.enabled` so a disabled health runner performs no `/healthz`
+    // probe and opens no MCP `status` session at startup — the periodic
+    // status timer below is gated the same way.
+    if (settings.health.enabled) {
+      void health.probe().then(() => void refreshStatus())
+    }
 
     /* ---------------- freshness (file edits) ---------------- */
 
@@ -1393,7 +1398,10 @@ export default {
               editedPaths.clear()
             }
           }
-          const prelude = buildScopePrelude(scope, extra)
+          // Scope text is opt-out via `scope.enabled`; guidance is injected
+          // independently below, so disabling scope must silence the prelude
+          // even while guidance stays on.
+          const prelude = settings.scope.enabled ? buildScopePrelude(scope, extra) : ""
           const text = [prelude, guidanceText].filter(Boolean).join("\n\n")
           if (text) {
             system.push({ type: "text", text })

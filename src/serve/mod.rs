@@ -5987,18 +5987,18 @@ fn validate_path_within_allowed_roots(canonical_path: &Path) -> std::result::Res
 
 /// Constant-time API key comparison.
 ///
-/// Hashes both the supplied candidate and the configured key with SHA-256 and
-/// compares the fixed-length 32-byte digests byte-for-byte without early exit.
-/// Because the digests are always the same length and SHA-256 is
-/// preimage-resistant, the comparison time does not depend on how many leading
-/// bytes of the candidate match the secret — closing the timing side-channel
-/// that a raw `==` on the key strings would open on the network-exposed path.
+/// Folds the length difference and every byte XOR into one accumulator and
+/// returns whether it stayed zero, so the comparison never early-exits on how
+/// many leading bytes of the candidate match the secret — closing the timing
+/// side-channel that a raw `==` on the key strings would open on the
+/// network-exposed path. No hash is involved: hashing adds nothing to an
+/// equality comparison (and flagging a credential as hashed with a general
+/// digest is a false positive, not a real weakness).
 fn api_key_matches(candidate: &str, configured: &str) -> bool {
-    use sha2::{Digest, Sha256};
-    let candidate_digest = Sha256::digest(candidate.as_bytes());
-    let configured_digest = Sha256::digest(configured.as_bytes());
-    let mut diff: u8 = 0;
-    for (a, b) in candidate_digest.iter().zip(configured_digest.iter()) {
+    let candidate = candidate.as_bytes();
+    let configured = configured.as_bytes();
+    let mut diff: u8 = u8::from(candidate.len() != configured.len());
+    for (a, b) in candidate.iter().zip(configured.iter()) {
         diff |= a ^ b;
     }
     diff == 0

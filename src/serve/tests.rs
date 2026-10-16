@@ -35,7 +35,7 @@ fn test_api_key_matches() {
     assert!(!api_key_matches("secret-key", "secret-keX"));
     assert!(!api_key_matches("secret", "secret-key")); // different length
     assert!(!api_key_matches("", "secret-key"));
-    assert!(api_key_matches("", "")); // both empty digests are equal
+    assert!(api_key_matches("", "")); // both empty keys compare equal
                                       // Case-sensitive and exact.
     assert!(!api_key_matches("Secret-Key", "secret-key"));
 }

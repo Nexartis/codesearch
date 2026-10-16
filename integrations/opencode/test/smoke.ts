@@ -72,6 +72,7 @@ function startMockServer(): Promise<{ url: string; close: () => Promise<void>; c
     req.on("data", (chunk) => (body += chunk))
     req.on("end", () => {
       if (req.url === "/healthz") {
+        calls.push({ name: "healthz" })
         res.writeHead(200, { "content-type": "application/json" })
         res.end('{"status":"ok"}')
         return
@@ -304,6 +305,16 @@ async function main(): Promise<void> {
   assert.equal(one.app.skills.length, 1, "skill registered")
   assert.equal(one.app.skills[0].id, "codesearch")
 
+  // The startup probe is gated on `health.enabled`: with health probing
+  // disabled (CODESEARCH_PLUGIN_HEALTH=0 above) setup must make no `/healthz`
+  // request (the periodic status timer is gated the same way).
+  await new Promise((resolve) => setTimeout(resolve, 100))
+  assert.equal(
+    mock.calls.filter((c) => c.name === "healthz").length,
+    0,
+    "health disabled: setup performs no /healthz probe",
+  )
+
   // Guidance + scope injection, once per session.
   const first = userMessage("s1", "m1", "Where is the upload retried after a failure?")
   await one.app.hooks.context[0](first)
@@ -388,8 +399,32 @@ async function main(): Promise<void> {
 
   await one.cleanup()
 
+  /* ---------------- scope.enabled=false silences the scope prelude ---------------- */
+
+  const scopeOffPath = join(tmp, "codesearch-scope-off.json")
+  writeFileSync(
+    scopeOffPath,
+    JSON.stringify({
+      url: "",
+      scope: { enabled: false },
+      log: { guards: false, rescue: false, health: false, commands: false, scope: false, recall: false },
+    }),
+  )
+  process.env.CODESEARCH_CONFIG = scopeOffPath
+  const scopeOff = await setupPlugin("/work/my-service")
+  const scopeOffEvent = userMessage("s6", "o1", "Where is the upload retried after a failure?")
+  await scopeOff.app.hooks.context[0](scopeOffEvent)
+  const scopeOffText = scopeOffEvent.system.map((p: Loose) => p.text).join("\n")
+  assert.doesNotMatch(scopeOffText, /codesearch scope:/, "scope.enabled=false silences the scope prelude")
+  assert.match(scopeOffText, /codesearch/, "guidance is still injected when only scope is disabled")
+  await scopeOff.cleanup()
+  process.env.CODESEARCH_CONFIG = configPath
+
   /* ---------------- prune mode ---------------- */
 
+  // The prune scenarios assert on `health.state`, so the startup probe must be
+  // enabled here (the global PLUGIN_HEALTH=0 above is for the no-probe guard).
+  process.env.CODESEARCH_PLUGIN_HEALTH = "1"
   process.env.CODESEARCH_PLUGIN_GUARDS = "prune"
   const pruned = await setupPlugin("/work/my-service")
   // Prune only engages once the startup health probe has confirmed the hub is
