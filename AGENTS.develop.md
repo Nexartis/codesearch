@@ -236,7 +236,6 @@ Never `unwrap_or_default()` a store error on a search path — "no results" and 
 
 | Branch | Description |
 |---|---|
-| `fix/scip-restore-vs-msbuild-fallback` | scip-csharp: VS-MSBuild restore fallback + capability-aware MSBuild registration when the CLI SDK set cannot target the repo TFM |
 
 ---
 

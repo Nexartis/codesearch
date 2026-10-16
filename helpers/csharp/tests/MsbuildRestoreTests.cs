@@ -50,8 +50,8 @@ public class MsbuildRestoreTests : IDisposable
     }
 
     [Theory]
-    [InlineData("error NU1101: Unable to find package Dlw.Net.Standard. No packages exist with this id in source(s): platina-dlwr.")]
-    [InlineData("Dlw.Aprimo.Dam.csproj: error NU1301: Unable to load the service index for source https://pkgs.dev.azure.com.")]
+    [InlineData("error NU1101: Unable to find package Vendor.Internal.Base. No packages exist with this id in source(s): private-feed.")]
+    [InlineData("App.Core.csproj: error NU1301: Unable to load the service index for source https://pkgs.dev.azure.com/org/_packaging/private-feed/nuget/v3/index.json.")]
     [InlineData("")]
     public void FeedAndAuthFailuresDoNotTrigger(string line)
     {
